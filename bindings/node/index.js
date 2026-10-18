@@ -109,6 +109,16 @@ class Auth {
   async signIn(login, password) { try { return await this._n.signIn(this.table, String(login), String(password)); } catch (e) { throw wrap(e); } }
   /** Set a user's password (by primary key; no old password is asked for) and end all their sessions. */
   async setPassword(key, password) { try { await this._n.setPassword(this.table, key, String(password)); } catch (e) { throw wrap(e); } }
+  /**
+   * Begin a sign-in with an OAuth provider configured as auth.oauth.<provider> (google, github, or any OpenID Connect
+   * provider): send the browser to `url`; the provider redirects it to `redirectUri` with `code` and `state`.
+   * With `{ link: token }`, the provider account is linked to that signed-in user instead.
+   */
+  oauthStart(provider, redirectUri, opts) {
+    try { return this._n.oauthStart(this.table, String(provider), String(redirectUri), opts && opts.link ? String(opts.link) : null); } catch (e) { throw wrap(e); }
+  }
+  /** Finish it with the code and state from the redirect: resolves to { token, user, created }, or rejects with AUTH. */
+  async oauthFinish(provider, code, state) { try { return await this._n.oauthFinish(this.table, String(provider), String(code), String(state)); } catch (e) { throw wrap(e); } }
   /** End one session. An unknown token is not an error. */
   signOut(token) { try { this._n.signOut(String(token)); } catch (e) { throw wrap(e); } }
   /** End every session of a user (by primary key). */

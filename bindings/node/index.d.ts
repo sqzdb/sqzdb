@@ -82,7 +82,7 @@ export class Database {
   close(): void;
 }
 
-export interface SignedIn { token: string; user: Row; }
+export interface SignedIn { token: string; user: Row; /** this sign-in made the user (sign-up, or a first provider sign-in) */ created: boolean; }
 export class Auth {
   readonly table: string;
   /** Insert a user (fields must include the login column) and set their password. */
@@ -91,6 +91,11 @@ export class Auth {
   signIn(login: string, password: string): Promise<SignedIn>;
   /** Set a user's password by primary key and end all their sessions. */
   setPassword(key: Value, password: string): Promise<void>;
+  /** Begin a sign-in with an OAuth provider (auth.oauth.<provider>): send the browser to `url`. With `link`, the
+   *  provider account is linked to that signed-in user. */
+  oauthStart(provider: string, redirectUri: string, opts?: { link?: string }): { url: string; state: string };
+  /** Finish it with the code and state from the provider's redirect. */
+  oauthFinish(provider: string, code: string, state: string): Promise<SignedIn>;
   /** End one session; an unknown token is not an error. */
   signOut(token: string): void;
   /** End every session of a user, by primary key. */

@@ -38,7 +38,7 @@ schema changes without downtime, and backup to any S3-compatible bucket.
 | **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT(n)`, `BYTES(n)`, `TIMESTAMP`, `UUID`. A value of the wrong type is rejected, never stored. |
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
-| **Sign-in** | Email and password sign-up and sign-in for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
+| **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
 | **Online schema changes** | `ALTER TABLE` adds, drops, renames or retypes a column while reads and writes continue. |
 | **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`. |
@@ -110,7 +110,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.4.2` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.5.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -457,8 +457,53 @@ s := db.Session(); err = s.UseToken(in.Token)
   5 failures for one login, each further attempt waits 1 s, then 2, 4 and so on, up to 15 minutes.
 - **Deleting a user** ends their sessions. A new row that reuses a deleted user's key starts without a
   password.
-- **Not built yet:** OAuth sign-in, email verification and password reset, and sign-in over the TCP
-  listener and the web console.
+- **Not built yet:** email verification and password reset, and sign-in over the TCP listener and the
+  web console.
+
+#### Google, GitHub and other OAuth providers
+
+Configure each provider with your app's client id and secret. `google` and `github` know their
+endpoints; any other name is an OpenID Connect provider with `kind = "oidc"`, `authUrl`, `tokenUrl`,
+`jwksUrl` and `issuer`.
+
+```toml
+[auth.oauth.google]
+clientId = "123.apps.googleusercontent.com"
+clientSecret = "${GOOGLE_CLIENT_SECRET}"
+
+[auth.oauth.github]
+clientId = "Iv1.abc"
+clientSecret = "${GITHUB_CLIENT_SECRET}"
+```
+
+Your app sends the browser to the provider and takes the code back:
+
+```js
+app.get('/auth/google', (req, res) => {
+  const { url, state } = db.auth('users').oauthStart('google', 'https://app.example/auth/google/callback')
+  res.cookie('oauth_state', state, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 600_000 })
+  res.redirect(url)
+})
+app.get('/auth/google/callback', async (req, res) => {
+  if (req.query.state !== req.cookies.oauth_state) return res.status(400).end()   // this browser started it
+  const { token, user, created } = await db.auth('users').oauthFinish('google', req.query.code, req.query.state)
+  res.cookie('session', token, { httpOnly: true, secure: true, sameSite: 'lax' }).redirect('/')
+})
+```
+
+- The engine makes a single-use `state` (10 minutes), a PKCE challenge, and for OpenID Connect a
+  nonce. It checks a Google ID token's RS256 signature against Google's keys, and its issuer, audience,
+  expiry, nonce and verified email. A GitHub sign-in needs a verified primary email.
+- The cookie in the example is the app's part: it ties the sign-in to the browser that started it.
+- A first sign-in makes a user whose login is the verified email (`created: true`). Later sign-ins find
+  that user by the provider's account id, even if the email changes.
+- If a user with that email already has a password, the sign-in is refused: without email verification
+  here, that account may have been made by someone else. The owner links the provider while signed in,
+  with `oauthStart('google', redirectUri, { link: token })`.
+- A user made through a provider has no password until `setPassword`.
+- In Python, `auth.oauth_start(provider, redirect_uri, link=None)` returns `(url, state)`, and
+  `auth.oauth_finish(provider, code, state)` returns `(token, user, created)`. In Go, use
+  `Auth.OAuthStart` and `Auth.OAuthFinish`, configured with `Options.Auth`.
 
 ### Backup, restore and replication
 
@@ -553,6 +598,7 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `log.threadsIdleAfter` | off | Let log threads exit when idle; for many idle databases in one process. |
 | `auth.sessionTtl` | `30d` | How long a session from sign-in lasts. At least `60s`. |
 | `auth.passwordMin` | `8` | The shortest password `signUp` and `setPassword` accept, in characters. |
+| `auth.oauth.<name>` | none | An OAuth provider: `clientId`, `clientSecret`; for providers other than `google` and `github`, `kind = "oidc"`, `authUrl`, `tokenUrl`, `jwksUrl` and `issuer`. Optional `scopes`. See [sign-in](#sign-in). |
 | `log.syncDelay` | off | With `durable: false`, hold the background fsync up to this long so one fsync covers more writes. For hosts with thousands of small databases (one per tenant or agent) on one disk. A machine crash can then lose up to this much; a process crash still loses nothing, and anything that waits for durability syncs at once. At most `60s`. |
 
 Durations are written as `'5ms'`, `'1s'`, `'2m'`, `'1h'`, `'7d'` or a number of milliseconds. Sizes are
@@ -731,7 +777,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.4.2`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.5.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

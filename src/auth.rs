@@ -38,13 +38,14 @@ pub fn is_system(name: &str) -> bool { name.len() >= 6 && name[..6].eq_ignore_as
 /// A table users sign in to: its UNIQUE text column is the login.
 #[derive(Clone, Debug)] pub struct AuthTable { pub login: usize, pub role: RoleSrc }
 
-/// A successful sign-up or sign-in: the session token and the user's row as (column, value) pairs.
-#[derive(Debug, Clone)] pub struct SignedIn { pub token: String, pub user: Vec<(String, Value)> }
+/// A successful sign-up or sign-in: the session token, the user's row as (column, value) pairs, and whether this
+/// sign-in made the user (sign-up, or a first sign-in with a provider).
+#[derive(Debug, Clone)] pub struct SignedIn { pub token: String, pub user: Vec<(String, Value)>, pub created: bool }
 
 /// Per database: failed sign-ins by login, and when expired sessions were last swept.
 /// Per database: failed sign-ins by login, when expired sessions were last swept, and the sign-in state counter that
 /// the users table and the auth system tables bump on every write (`Table::watch`).
-#[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64> }
+#[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>, create_lock: Mutex<()> }
 
 fn hasher() -> Argon2<'static> { Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(19_456, 2, 1, None).expect("argon2 parameters")) }
 /// At most this many hashes at once: each holds 19 MiB.
@@ -77,9 +78,12 @@ fn token_id(token: &str) -> Option<[u8; 32]> {
 }
 fn normalize(login: &str) -> String { login.trim().to_lowercase() }
 const WRONG: &str = "sign-in failed: wrong login or password";
+/// The hash stored for a user who signs in only through a provider: no password matches it.
+const NO_PASSWORD: &str = "!";
 
 impl Sql {
     fn system(&self, name: &str) -> Result<Arc<Table>, String> { self.db.table(name).ok_or_else(|| format!("no table {name}: ENABLE AUTH on a table first")) }
+    pub(crate) fn auth_table_of(&self, table: &str) -> Result<(Arc<Table>, AuthTable), String> { self.auth_table(table) }
     fn auth_table(&self, table: &str) -> Result<(Arc<Table>, AuthTable), String> {
         let cfg = self.acl.read().unwrap().auth.get(&table.to_lowercase()).cloned().ok_or_else(|| format!("{table} is not a table users sign in to (ALTER TABLE {table} ENABLE AUTH)"))?;
         Ok((self.db.table(table).ok_or_else(|| format!("no such table {table}"))?, cfg))
@@ -132,7 +136,7 @@ impl Sql {
             Ok((enc, token))
         };
         match run(&mut sess) {
-            Ok((row, token)) => { self.exec_s(&mut sess, "COMMIT", &[])?; Ok(SignedIn { token, user: user_pairs(&t, &row) }) }
+            Ok((row, token)) => { self.exec_s(&mut sess, "COMMIT", &[])?; Ok(SignedIn { token, user: user_pairs(&t, &row), created: true }) }
             Err(e) => { let _ = self.exec_s(&mut sess, "ROLLBACK", &[]); Err(e) }
         }
     }
@@ -155,13 +159,13 @@ impl Sql {
         let user = if password.len() > PASSWORD_MAX || encode_value(ty, &Value::Text(login.clone()), &mut key).is_err() { None } else { t.with_unique(&key, |r| r.to_vec()) };
         let secrets = self.system(SECRETS)?;
         let stored = user.as_ref().and_then(|r| secrets.with_pk(Self::text_pk(&secrets, &Self::secret_id(&t, r)).ok()?, |r| r.to_vec()));
-        let ok = match &stored { Some(sr) => match decode_col(&secrets.schema, sr, 1) { Value::Text(h) => verify_password(password, &h), _ => false }, None => { let _ = verify_password(password, dummy_hash()); false } };
+        let ok = match stored.as_ref().map(|sr| decode_col(&secrets.schema, sr, 1)) { Some(Value::Text(h)) if PasswordHash::new(&h).is_ok() => verify_password(password, &h), _ => { let _ = verify_password(password, dummy_hash()); false } };
         if !ok { return Err(WRONG.into()); }
         self.auth.failures.lock().unwrap().remove(&fkey);
         let user = user.unwrap(); let sr = stored.unwrap();
         let token = self.new_session(&secrets, &Self::secret_id(&t, &user), &sr)?;
         self.sweep_sessions();
-        Ok(SignedIn { token, user: user_pairs(&t, &user) })
+        Ok(SignedIn { token, user: user_pairs(&t, &user), created: false })
     }
 
     /// Make `sess` act as the user the token belongs to: the row's role and its columns as session attributes.
@@ -228,9 +232,97 @@ impl Sql {
     /// dropped in the same transaction, so a new row never inherits an old password or session.
     pub(crate) fn forget_secret(&self, txn: &mut Txn, table: &Table, row: &[u8]) -> Result<(), String> {
         if !self.acl.read().unwrap().auth.contains_key(&table.schema.name.to_lowercase()) { return Ok(()); }
-        let secrets = self.system(SECRETS)?; let k = Self::text_pk(&secrets, &Self::secret_id(table, row))?;
+        let secrets = self.system(SECRETS)?; let id = Self::secret_id(table, row); let k = Self::text_pk(&secrets, &id)?;
         if secrets.txn_get(txn, k).is_some() { secrets.txn_delete(txn, k).map_err(|e| e.to_string())?; }
+        if let Some(ids) = self.db.table(crate::oauth::IDENTITIES) {
+            let ix = ids.index_on(1).ok_or("the identities table has no index")?;
+            let mut gone = vec![]; ids.index_lookup(&ix, crate::table::text_key(id.as_bytes()), |r| { gone.push(ids.pk_of(r)); true });
+            for g in gone { ids.txn_delete(txn, g).map_err(|e| e.to_string())?; }
+        }
         Ok(())
+    }
+    /// The password-row id of the user a valid session token belongs to.
+    pub(crate) fn token_secret(&self, token: &str) -> Result<String, String> {
+        let mut s = Session::default(); self.session_from_token(&mut s, token)?;
+        let id = token_id(token).ok_or("session: not a session token")?;
+        let sessions = self.system(SESSIONS)?;
+        match sessions.with_pk(sessions.schema.key_from_value(&Value::Bytes(id.to_vec()))?, |r| decode_col(&sessions.schema, r, 1)) { Some(Value::Text(t)) => Ok(t), _ => Err("session: unknown or signed out; sign in again".into()) }
+    }
+    /// The identities table (provider accounts linked to users), made on first use with an index on the user.
+    fn identities(&self) -> Result<Arc<Table>, String> {
+        if let Some(t) = self.db.table(crate::oauth::IDENTITIES) { return Ok(t); }
+        let _g = self.auth.create_lock.lock().unwrap();
+        if let Some(t) = self.db.table(crate::oauth::IDENTITIES) { return Ok(t); }
+        self.create_system_table("CREATE TABLE _auth_identities (id VARCHAR(400) PRIMARY KEY, secret VARCHAR(160) NOT NULL, email VARCHAR(255), created TIMESTAMP NOT NULL)")?;
+        let ix = "CREATE INDEX _auth_identities_secret ON _auth_identities (secret)";
+        self.apply_admin(ix)?; self.log_admin(ix);
+        self.system(crate::oauth::IDENTITIES)
+    }
+    /// The user a password-row id names, if that row and the user still exist.
+    fn user_of_secret(&self, secret: &str) -> Option<(Arc<Table>, Vec<u8>)> {
+        let (tname, key) = secret.split_once(':')?; let (t, _) = self.auth_table(tname).ok()?;
+        let pk = t.schema.key_from_value(&key_value(&t.schema.columns[t.schema.pk].ty, key).ok()?).ok()?;
+        let row = t.with_pk(pk, |r| r.to_vec())?; Some((t, row))
+    }
+    /// Sign in (or up) with a provider identity: an identity already linked signs in its user; a new one links to
+    /// `link` (a signed-in user's password-row id), or to a user with this login and no password, or makes a user.
+    pub(crate) fn oauth_sign_in(&self, table: &str, provider: &str, who: crate::oauth::Identity, link: Option<&str>) -> Result<SignedIn, String> {
+        let (t, cfg) = self.auth_table(table)?; let ids = self.identities()?; let secrets = self.system(SECRETS)?;
+        let email = normalize(&who.email); let id = format!("{provider}:{}", who.subject);
+        if id.len() > 400 { return Err("sign-in failed: the provider's account id is too long".into()); }
+        let ik = Self::text_pk(&ids, &id)?;
+        let linked = ids.with_pk(ik, |r| decode_col(&ids.schema, r, 1)).and_then(|v| if let Value::Text(s) = v { Some(s) } else { None });
+        let linked_user = linked.as_deref().and_then(|s| self.user_of_secret(s).map(|u| (s.to_string(), u)));
+        let ident_row = |secret: &str| encode_row(&ids.schema, &[Value::Text(id.clone()), Value::Text(secret.to_string()), Value::Text(email.clone()), Value::Int(now_micros())]);
+        // the user to sign in, the identity row to write (None: already linked), whether the user is new
+        let mut txn = Txn::new();
+        let (user_t, user_row, created) = if let Some(target) = link {
+            let (ut, ur) = self.user_of_secret(target).ok_or("session: the user no longer exists")?;
+            if let Some((s, _)) = &linked_user { if s != target { return Err(format!("sign-in failed: this {provider} account is linked to another user")); } }
+            else { if linked.is_some() { ids.txn_delete(&mut txn, ik).map_err(|e| e.to_string())?; } ids.txn_insert(&mut txn, &ident_row(target)?).map_err(|e| e.to_string())?; }
+            (ut, ur, false)
+        } else if let Some((s, (ut, ur))) = linked_user.filter(|(_, (ut, _))| ut.schema.name.eq_ignore_ascii_case(&t.schema.name)) { let _ = s; (ut, ur, false) }
+        else {
+            if linked.is_some() { ids.txn_delete(&mut txn, ik).map_err(|e| e.to_string())?; }   // it pointed at a user who is gone
+            let ty = &t.schema.columns[cfg.login].ty; let mut key = vec![0u8; ty.width()];
+            let existing = if encode_value(ty, &Value::Text(email.clone()), &mut key).is_ok() { t.with_unique(&key, |r| r.to_vec()) } else { None };
+            match existing {
+                Some(ur) => {
+                    let has_password = secrets.with_pk(Self::text_pk(&secrets, &Self::secret_id(&t, &ur))?, |r| decode_col(&secrets.schema, r, 1)).map(|h| matches!(&h, Value::Text(h) if PasswordHash::new(h).is_ok())).unwrap_or(false);
+                    if has_password { return Err(format!("sign-in failed: an account with this email already has a password; sign in with it, then link {provider} from that account")); }
+                    ids.txn_insert(&mut txn, &ident_row(&Self::secret_id(&t, &ur))?).map_err(|e| e.to_string())?;
+                    (t.clone(), ur, false)
+                }
+                None => {
+                    // a new user whose login is the verified email: inserted through SQL (defaults, automatic ids, the
+                    // insert hook), then the identity, a password row without a password, and the session
+                    let mut sess = Session::default(); self.exec_s(&mut sess, "BEGIN", &[])?;
+                    let run = |sess: &mut Session| -> Result<(Vec<u8>, String), String> {
+                        let sql = format!("INSERT INTO \"{}\" (\"{}\") VALUES (?) RETURNING *", t.schema.name, t.schema.columns[cfg.login].name);
+                        let row = self.exec_s(sess, &sql, &[Value::Text(email.clone())])?.pop().ok_or("sign-in inserted no row")?;
+                        let enc = encode_row(&t.schema, &row)?; let tx = sess.txn.as_mut().unwrap();
+                        ids.txn_insert(tx, &ident_row(&Self::secret_id(&t, &enc))?).map_err(|e| e.to_string())?;
+                        let token = self.write_secret_and_session(tx, &t, &enc, Some(NO_PASSWORD))?;
+                        Ok((enc, token))
+                    };
+                    return match run(&mut sess) {
+                        Ok((row, token)) => { self.exec_s(&mut sess, "COMMIT", &[])?; Ok(SignedIn { token, user: user_pairs(&t, &row), created: true }) }
+                        Err(e) => { let _ = self.exec_s(&mut sess, "ROLLBACK", &[]); Err(e) }
+                    };
+                }
+            }
+        };
+        // a session for that user (a user without a password row gets one without a password, for its generation)
+        let sid = Self::secret_id(&user_t, &user_row);
+        let has_row = secrets.txn_get(&mut txn, Self::text_pk(&secrets, &sid)?).is_some();
+        let token = if has_row {
+            let sr = secrets.txn_get(&mut txn, Self::text_pk(&secrets, &sid)?).unwrap();
+            let sessions = self.system(SESSIONS)?;
+            let (token, row) = self.session_row(&sessions, &sid, &decode_col(&secrets.schema, &sr, 2))?;
+            sessions.txn_insert(&mut txn, &row).map_err(|e| e.to_string())?; token
+        } else { self.write_secret_and_session(&mut txn, &user_t, &user_row, Some(NO_PASSWORD))? };
+        self.db.commit(txn).map_err(|e| e.to_string())?;
+        Ok(SignedIn { token, user: user_pairs(&user_t, &user_row), created })
     }
 
     fn check_password(&self, pw: &str) -> Result<(), String> {

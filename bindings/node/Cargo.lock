@@ -1567,16 +1567,19 @@ dependencies = [
 
 [[package]]
 name = "sqweezdb"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "base64 0.22.1",
  "futures-util",
  "getrandom 0.3.4",
  "libc",
  "memmap2",
  "mimalloc",
  "object_store",
+ "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1588,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "sqweezdb_node"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "napi",
  "napi-build",

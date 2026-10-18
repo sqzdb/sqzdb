@@ -107,7 +107,7 @@ fn json_value(v: &serde_json::Value) -> Result<Value, String> {
 }
 fn signed_in_json(si: crate::auth::SignedIn) -> *mut c_char {
     let user: serde_json::Map<String, serde_json::Value> = si.user.into_iter().map(|(k, v)| (k, match v { Value::Null => serde_json::Value::Null, Value::Int(i) => i.into(), Value::Float(f) => serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null), Value::Bool(b) => b.into(), Value::Text(s) => s.into(), Value::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>().into() })).collect();
-    CString::new(serde_json::json!({ "token": si.token, "user": user }).to_string()).unwrap().into_raw()
+    CString::new(serde_json::json!({ "token": si.token, "user": user, "created": si.created }).to_string()).unwrap().into_raw()
 }
 fn auth_result(db: &Db, r: Result<crate::auth::SignedIn, String>) -> *mut c_char { match r { Ok(si) => signed_in_json(si), Err(e) => { set_err(db, e); std::ptr::null_mut() } } }
 fn auth_status(db: &Db, r: Result<(), String>) -> c_int { match r { Ok(()) => 0, Err(e) => { set_err(db, e); 1 } } }
@@ -138,5 +138,16 @@ fn auth_status(db: &Db, r: Result<(), String>) -> c_int { match r { Ok(()) => 0,
 }
 /// Make the session act as the user a token belongs to (0), or 1 (see sqweezdb_last_error).
 #[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_use_token(db: *mut Db, s: *mut Sess, token: *const c_char) -> c_int { let (db, s) = unsafe { (&*db, &mut *s) }; auth_status(db, db.sql.session_from_token(&mut s.s, &unsafe { cstr(token) })) }
+/// Begin a sign-in with an OAuth provider; `link` is a session token or null. Returns a JSON string `{"url": …,
+/// "state": …}` to free with sqweezdb_free_string, or null on error.
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_oauth_start(db: *mut Db, table: *const c_char, provider: *const c_char, redirect: *const c_char, link: *const c_char) -> *mut c_char {
+    let db = unsafe { &*db }; let l = if link.is_null() { None } else { Some(unsafe { cstr(link) }) };
+    match db.sql.oauth_start(&unsafe { cstr(table) }, &unsafe { cstr(provider) }, &unsafe { cstr(redirect) }, l.as_deref().filter(|s| !s.is_empty())) {
+        Ok(st) => CString::new(serde_json::json!({ "url": st.url, "state": st.state }).to_string()).unwrap().into_raw(), Err(e) => { set_err(db, e); std::ptr::null_mut() } }
+}
+/// Finish it with the code and state from the provider's redirect; the result is as for sqweezdb_sign_up.
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_oauth_finish(db: *mut Db, table: *const c_char, provider: *const c_char, code: *const c_char, state: *const c_char) -> *mut c_char {
+    let db = unsafe { &*db }; auth_result(db, db.sql.oauth_finish(&unsafe { cstr(table) }, &unsafe { cstr(provider) }, &unsafe { cstr(code) }, &unsafe { cstr(state) }))
+}
 /// Free a string this library returned.
 #[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_free_string(p: *mut c_char) { if !p.is_null() { drop(unsafe { CString::from_raw(p) }); } }

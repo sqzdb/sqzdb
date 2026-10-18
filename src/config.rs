@@ -92,8 +92,15 @@ pub struct Listen { pub socket: Option<PathBuf>, pub tcp: Option<String>, pub ht
 pub struct LivePolicy { pub debounce: Duration, pub queue: usize }
 impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Duration::from_millis(5), queue: 65536 } } }
 /// Sign-in (see `auth.rs`): how long a session lasts, and the shortest password `signUp` and `setPassword` accept.
-#[derive(Clone, Debug)] pub struct AuthPolicy { pub session_ttl: Duration, pub password_min: usize }
-impl Default for AuthPolicy { fn default() -> AuthPolicy { AuthPolicy { session_ttl: Duration::from_secs(30 * 24 * 3600), password_min: 8 } } }
+#[derive(Clone, Debug)] pub struct AuthPolicy { pub session_ttl: Duration, pub password_min: usize, /// sign-in providers by name (see `oauth.rs`)
+    pub oauth: std::collections::BTreeMap<String, OAuthProvider> }
+impl Default for AuthPolicy { fn default() -> AuthPolicy { AuthPolicy { session_ttl: Duration::from_secs(30 * 24 * 3600), password_min: 8, oauth: Default::default() } } }
+/// How a provider tells who signed in: an OpenID Connect ID token (Google and others), or GitHub's user API.
+#[derive(Clone, Debug, PartialEq)] pub enum OAuthKind { Oidc, Github }
+/// An OAuth2 provider: the application's client id and secret, the provider's endpoints, and what to ask for.
+#[derive(Clone, Debug)] pub struct OAuthProvider { pub kind: OAuthKind, pub client_id: String, pub client_secret: String, pub auth_url: String, pub token_url: String,
+    /// OpenID Connect: the signing keys and the accepted issuers. GitHub: the user and email APIs.
+    pub jwks_url: String, pub issuers: Vec<String>, pub user_url: String, pub emails_url: String, pub scopes: String }
 #[derive(Clone, Debug, Default)]
 pub struct LogPolicy { /// Log threads leave after this long without writes and return on the next one (many idle databases per process).
     pub threads_idle_after: Option<Duration>,
@@ -139,7 +146,39 @@ pub struct ListenFile { pub socket: Option<String>, pub tcp: Option<String>, pub
 pub struct LiveFile { pub debounce: Option<Dur>, pub queue: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AuthFile { #[serde(alias = "session_ttl")] pub session_ttl: Option<Dur>, #[serde(alias = "password_min")] pub password_min: Option<usize> }
+pub struct AuthFile { #[serde(alias = "session_ttl")] pub session_ttl: Option<Dur>, #[serde(alias = "password_min")] pub password_min: Option<usize>, pub oauth: Option<std::collections::BTreeMap<String, OAuthFile>> }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OAuthFile { pub kind: Option<String>, #[serde(alias = "client_id")] pub client_id: Option<String>, #[serde(alias = "client_secret")] pub client_secret: Option<String>,
+    #[serde(alias = "auth_url")] pub auth_url: Option<String>, #[serde(alias = "token_url")] pub token_url: Option<String>, #[serde(alias = "jwks_url")] pub jwks_url: Option<String>,
+    pub issuer: Option<String>, #[serde(alias = "user_url")] pub user_url: Option<String>, #[serde(alias = "emails_url")] pub emails_url: Option<String>, pub scopes: Option<String> }
+impl OAuthFile { fn overlay(self, o: OAuthFile) -> OAuthFile { OAuthFile { kind: pick(self.kind, o.kind), client_id: pick(self.client_id, o.client_id), client_secret: pick(self.client_secret, o.client_secret), auth_url: pick(self.auth_url, o.auth_url), token_url: pick(self.token_url, o.token_url), jwks_url: pick(self.jwks_url, o.jwks_url), issuer: pick(self.issuer, o.issuer), user_url: pick(self.user_url, o.user_url), emails_url: pick(self.emails_url, o.emails_url), scopes: pick(self.scopes, o.scopes) } } }
+/// A provider's settings: `google` and `github` come with their endpoints; any other name is an OpenID Connect
+/// provider whose endpoints and issuer are given. Endpoints are https (http only on this machine, for tests).
+fn resolve_oauth(name: &str, f: OAuthFile) -> Result<OAuthProvider, String> {
+    let key = format!("auth.oauth.{name}");
+    let need = |v: Option<String>, k: &str| v.filter(|s| !s.is_empty()).ok_or_else(|| format!("{key}.{k} is required"));
+    let (client_id, client_secret) = (need(f.client_id.clone(), "clientId")?, need(f.client_secret.clone(), "clientSecret")?);
+    let kind = match (name, f.kind.as_deref()) { ("github", None | Some("github")) => OAuthKind::Github, (_, Some("github")) => OAuthKind::Github, ("google", None | Some("oidc")) | (_, Some("oidc")) => OAuthKind::Oidc, (_, None) => return Err(format!("{key}.kind: \"oidc\" or \"github\" (only google and github are known by name)")), (_, Some(k)) => return Err(format!("{key}.kind: \"oidc\" or \"github\", not {k:?}")) };
+    let preset = |g: &str, h: &str| -> Option<String> { match (name, &kind) { ("google", OAuthKind::Oidc) => Some(g.to_string()), ("github", OAuthKind::Github) => Some(h.to_string()), _ => None }.filter(|s| !s.is_empty()) };
+    let url = |v: Option<String>, p: Option<String>, k: &str| -> Result<String, String> {
+        let u = v.filter(|s| !s.is_empty()).or(p).ok_or_else(|| format!("{key}.{k} is required"))?;
+        let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"].iter().any(|h| u.starts_with(h) && matches!(u.as_bytes().get(h.len()), Some(b':') | Some(b'/') | None));
+        if !u.starts_with("https://") && !local { return Err(format!("{key}.{k}: an https URL")); }
+        Ok(u)
+    };
+    let p = OAuthProvider {
+        auth_url: url(f.auth_url, preset("https://accounts.google.com/o/oauth2/v2/auth", "https://github.com/login/oauth/authorize"), "authUrl")?,
+        token_url: url(f.token_url, preset("https://oauth2.googleapis.com/token", "https://github.com/login/oauth/access_token"), "tokenUrl")?,
+        jwks_url: if kind == OAuthKind::Oidc { url(f.jwks_url, preset("https://www.googleapis.com/oauth2/v3/certs", ""), "jwksUrl")? } else { String::new() },
+        issuers: if kind == OAuthKind::Oidc { match f.issuer.filter(|s| !s.is_empty()) { Some(i) => vec![i], None if name == "google" => vec!["https://accounts.google.com".into(), "accounts.google.com".into()], None => return Err(format!("{key}.issuer is required")) } } else { vec![] },
+        user_url: if kind == OAuthKind::Github { url(f.user_url, preset("", "https://api.github.com/user"), "userUrl")? } else { String::new() },
+        emails_url: if kind == OAuthKind::Github { url(f.emails_url, preset("", "https://api.github.com/user/emails"), "emailsUrl")? } else { String::new() },
+        scopes: f.scopes.filter(|s| !s.is_empty()).unwrap_or_else(|| if kind == OAuthKind::Github { "read:user user:email".into() } else { "openid email profile".into() }),
+        kind, client_id, client_secret,
+    };
+    Ok(p)
+}
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LogFile { #[serde(alias = "threads_idle_after")] pub threads_idle_after: Option<Dur>, #[serde(alias = "sync_delay")] pub sync_delay: Option<Dur> }
@@ -158,7 +197,7 @@ impl ConfigFile {
             listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
             log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
-            auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min) }),
+            auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min), oauth: nest(a.oauth, b.oauth, |mut x, y| { for (k, v) in y { let merged = match x.remove(&k) { Some(old) => old.overlay(v), None => v }; x.insert(k, merged); } x }) }),
         }
     }
     /// Defaults, validation, and typed values. Errors name the key.
@@ -197,6 +236,7 @@ impl ConfigFile {
         if let Some(a) = self.auth {
             if let Some(d) = a.session_ttl { let d = dur_of(d, "auth.sessionTtl")?; if d < Duration::from_secs(60) { return Err("auth.sessionTtl: at least 60s".into()); } c.auth.session_ttl = d; }
             if let Some(n) = a.password_min { if !(1..=256).contains(&n) { return Err("auth.passwordMin: between 1 and 256".into()); } c.auth.password_min = n; }
+            for (name, f) in a.oauth.unwrap_or_default() { if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') { return Err(format!("auth.oauth: provider names are letters, digits, - and _ (got {name:?})")); } c.auth.oauth.insert(name.clone(), resolve_oauth(&name, f)?); }
         }
         Ok(c)
     }

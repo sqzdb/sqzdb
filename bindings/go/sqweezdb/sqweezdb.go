@@ -11,6 +11,7 @@ Db* sqweezdb_open(const char* path, int durable); long long sqweezdb_last_insert
 Sess* sqweezdb_session(Db*); void sqweezdb_session_free(Sess*); int sqweezdb_login(Db*, Sess*, const char*); int sqweezdb_assume(Db*, Sess*, const char*);
 char* sqweezdb_sign_up(Db*, const char*, const char*, const char*); char* sqweezdb_sign_in(Db*, const char*, const char*, const char*); int sqweezdb_sign_out(Db*, const char*);
 int sqweezdb_set_password(Db*, const char*, const char*, const char*); int sqweezdb_sign_out_everywhere(Db*, const char*, const char*); int sqweezdb_use_token(Db*, Sess*, const char*); void sqweezdb_free_string(char*);
+char* sqweezdb_oauth_start(Db*, const char*, const char*, const char*, const char*); char* sqweezdb_oauth_finish(Db*, const char*, const char*, const char*, const char*);
 Stmt* sqweezdb_prepare(Db*, const char*); void sqweezdb_finalize(Stmt*);
 Rows* sqweezdb_exec(Db*, Sess*, Stmt*, const CValue*, int); Rows* sqweezdb_exec_text(Db*, Sess*, const char*, const CValue*, int);
 int sqweezdb_rows_count(Rows*); int sqweezdb_rows_cols(Rows*); int sqweezdb_rows_get(Rows*, int, int, CValue*); int sqweezdb_rows_all(Rows*, CValue*, int); void sqweezdb_rows_free(Rows*);
@@ -35,15 +36,38 @@ type Session struct {
 // Options mirror the engine's configuration keys (see src/config.rs). Durations are strings like "500ms", "1s", "2m";
 // sizes like "256MB". Zero values are omitted, so an empty Options means the defaults.
 type Options struct {
-	ConfigFile string    `json:"configFile,omitempty"` // a TOML file with these keys, read first and overridden by the options
-	Durable    any       `json:"durable,omitempty"`    // false, true, or "cloud"
-	Create     *bool     `json:"create,omitempty"`
-	Backup     *Backup   `json:"backup,omitempty"`
-	Follow     *Follow   `json:"follow,omitempty"`
-	Snapshot   *Snapshot `json:"snapshot,omitempty"`
-	Listen     *Listen   `json:"listen,omitempty"`
-	Live       *Live     `json:"live,omitempty"`
-	Log        *Log      `json:"log,omitempty"`
+	ConfigFile string       `json:"configFile,omitempty"` // a TOML file with these keys, read first and overridden by the options
+	Durable    any          `json:"durable,omitempty"`    // false, true, or "cloud"
+	Create     *bool        `json:"create,omitempty"`
+	Backup     *Backup      `json:"backup,omitempty"`
+	Follow     *Follow      `json:"follow,omitempty"`
+	Snapshot   *Snapshot    `json:"snapshot,omitempty"`
+	Listen     *Listen      `json:"listen,omitempty"`
+	Live       *Live        `json:"live,omitempty"`
+	Log        *Log         `json:"log,omitempty"`
+	Auth       *AuthOptions `json:"auth,omitempty"`
+}
+
+// AuthOptions configures sign-in: session length, the shortest password, and OAuth providers by name ("google",
+// "github", or any OpenID Connect provider with its endpoints and issuer).
+type AuthOptions struct {
+	SessionTTL  string                   `json:"sessionTtl,omitempty"`
+	PasswordMin int                      `json:"passwordMin,omitempty"`
+	OAuth       map[string]OAuthProvider `json:"oauth,omitempty"`
+}
+
+// OAuthProvider is one provider's settings. google and github need only ClientID and ClientSecret.
+type OAuthProvider struct {
+	Kind         string `json:"kind,omitempty"` // "oidc" or "github"; implied for google and github
+	ClientID     string `json:"clientId,omitempty"`
+	ClientSecret string `json:"clientSecret,omitempty"`
+	AuthURL      string `json:"authUrl,omitempty"`
+	TokenURL     string `json:"tokenUrl,omitempty"`
+	JwksURL      string `json:"jwksUrl,omitempty"`
+	Issuer       string `json:"issuer,omitempty"`
+	UserURL      string `json:"userUrl,omitempty"`
+	EmailsURL    string `json:"emailsUrl,omitempty"`
+	Scopes       string `json:"scopes,omitempty"`
 }
 type Backup struct {
 	Endpoint     string `json:"endpoint,omitempty"`
@@ -168,10 +192,12 @@ type Auth struct {
 	table string
 }
 
-// SignedIn is a new session: its token, and the user's row by column name (integers as int64).
+// SignedIn is a new session: its token, the user's row by column name (integers as int64), and whether this
+// sign-in made the user (a sign-up, or a first sign-in with a provider).
 type SignedIn struct {
-	Token string
-	User  map[string]any
+	Token   string
+	User    map[string]any
+	Created bool
 }
 
 // Auth returns the sign-in functions for a table marked ALTER TABLE <table> ENABLE AUTH.
@@ -183,8 +209,9 @@ func (a *Auth) result(p *C.char) (SignedIn, error) {
 	}
 	defer C.sqweezdb_free_string(p)
 	var out struct {
-		Token string                     `json:"token"`
-		User  map[string]json.RawMessage `json:"user"`
+		Token   string                     `json:"token"`
+		User    map[string]json.RawMessage `json:"user"`
+		Created bool                       `json:"created"`
 	}
 	if err := json.Unmarshal([]byte(C.GoString(p)), &out); err != nil {
 		return SignedIn{}, err
@@ -204,7 +231,45 @@ func (a *Auth) result(p *C.char) (SignedIn, error) {
 		_ = json.Unmarshal(raw, &v)
 		user[k] = v
 	}
-	return SignedIn{Token: out.Token, User: user}, nil
+	return SignedIn{Token: out.Token, User: user, Created: out.Created}, nil
+}
+
+// OAuthStart begins a sign-in with an OAuth provider configured as auth.oauth.<provider> (google, github, or any
+// OpenID Connect provider): send the browser to url; the provider redirects it to redirectURI with a code and the
+// state. With linkToken (a session token, or ""), the provider account is linked to that signed-in user.
+func (a *Auth) OAuthStart(provider, redirectURI, linkToken string) (url, state string, err error) {
+	ct, cp, cr := C.CString(a.table), C.CString(provider), C.CString(redirectURI)
+	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(cp))
+	defer C.free(unsafe.Pointer(cr))
+	var cl *C.char
+	if linkToken != "" {
+		cl = C.CString(linkToken)
+		defer C.free(unsafe.Pointer(cl))
+	}
+	p := C.sqweezdb_oauth_start(a.db.p, ct, cp, cr, cl)
+	if p == nil {
+		return "", "", a.db.lastError()
+	}
+	defer C.sqweezdb_free_string(p)
+	var out struct {
+		URL   string `json:"url"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(p)), &out); err != nil {
+		return "", "", err
+	}
+	return out.URL, out.State, nil
+}
+
+// OAuthFinish finishes it with the code and state from the provider's redirect.
+func (a *Auth) OAuthFinish(provider, code, state string) (SignedIn, error) {
+	ct, cp, cc, cs := C.CString(a.table), C.CString(provider), C.CString(code), C.CString(state)
+	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(cp))
+	defer C.free(unsafe.Pointer(cc))
+	defer C.free(unsafe.Pointer(cs))
+	return a.result(C.sqweezdb_oauth_finish(a.db.p, ct, cp, cc, cs))
 }
 
 // SignUp inserts a user (fields must include the login column) and sets their password.

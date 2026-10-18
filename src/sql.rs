@@ -1532,6 +1532,8 @@ pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Pre
     pub cfg: crate::config::Config, services: Mutex<Option<Services>>,
     /// Sign-in bookkeeping (failed attempts, the session sweep): see `auth.rs`.
     pub(crate) auth: crate::auth::AuthState,
+    /// Provider sign-ins in progress and cached signing keys: see `oauth.rs`.
+    pub(crate) oauth: crate::oauth::OAuthState,
     /// `<dir>/.lock`, held while open. Declared last: fields drop in order, so the lock is released only after `db`
     /// (and with it the log threads) has gone.
     dir_lock: Mutex<Option<std::fs::File>> }
@@ -1597,7 +1599,7 @@ pub struct Follower { pub applied: Arc<std::sync::atomic::AtomicU64>, stop: Arc<
 impl Follower { pub fn applied(&self) -> u64 { self.applied.load(std::sync::atomic::Ordering::Acquire) } }
 impl Drop for Follower { fn drop(&mut self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); if let Some(h) = self.thread.take() { h.join().ok(); } } }
 impl Sql {
-    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), dir_lock: Mutex::new(None) } }
+    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), dir_lock: Mutex::new(None) } }
     /// Build the new schema and the old-row -> new-row converter for a list of ALTER operations.
     fn alter_schema(old: &Schema, ops: &[AlterOp]) -> Result<(Schema, Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>), String> {
         // working list: (column, source: Some(old index) | None, default, retyped from old type)
@@ -1825,6 +1827,9 @@ impl Sql {
             Plan::Alter { table, ops } => { let old = self.db.table(&table).ok_or(format!("no such table {table}"))?; let (schema, convert) = Self::alter_schema(&old.schema, &ops)?; self.db.alter_start(&table, schema, convert)?; Ok(()) }  // the copy resumes in open_arc
             _ => Err(format!("not a catalog statement: {text}")) }
     }
+    /// An admin statement the engine makes itself (on its own tables), applied and logged like the application's.
+    pub(crate) fn apply_admin(&self, sql: &str) -> Result<(), String> { self.admin(&Session::default(), sql) }
+    pub(crate) fn log_admin(&self, sql: &str) { self.log_meta(sql) }
     /// Create one of the engine's own tables (see `auth.rs`) and log the CREATE, so a restart replays it first.
     pub(crate) fn create_system_table(&self, ddl: &str) -> Result<(), String> {
         let stmts = Parser::parse_sql(&GenericDialect {}, ddl).map_err(|e| e.to_string())?;
@@ -1878,7 +1883,6 @@ impl Sql {
             let cfg = self.enable_auth(&table, role)?;
             self.acl.write().unwrap().auth.insert(table, cfg); self.auth_changed(); return Ok(());
         }
-        if let Some(n) = t.iter().find(|x| crate::auth::is_system(x)) { return Err(format!("{n} is a system table")); }
         let mut acl = self.acl.write().unwrap();
         let at = |i: usize| -> Result<&String, String> { t.get(i).ok_or(format!("unexpected end of statement: {sql}")) };
         match (up[0].as_str(), up.get(1).map(|x| x.as_str())) {
@@ -1964,7 +1968,7 @@ impl Sql {
         Ok(p)
     }
     pub fn exec(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { let p = self.prepare(sql)?; self.execute(&p, params) }
-    pub fn exec_s(&self, sess: &mut Session, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { if is_admin_stmt(sql) { self.admin(sess, sql)?; self.log_meta(sql); return Ok(vec![]); } let p = self.prepare(sql)?; self.execute_s(sess, &p, params) }
+    pub fn exec_s(&self, sess: &mut Session, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { if is_admin_stmt(sql) { if let Some(n) = tokens(sql).iter().find(|x| crate::auth::is_system(x)) { return Err(format!("{n} is a system table")); } self.admin(sess, sql)?; self.log_meta(sql); return Ok(vec![]); } let p = self.prepare(sql)?; self.execute_s(sess, &p, params) }
     pub fn execute(&self, p: &Prepared, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { let mut s = Session::default(); self.execute_s(&mut s, p, params) }
 
     fn resolve(&self, sess: &Session, e: &Expr, params: &[Value]) -> Result<Value, String> {

@@ -75,3 +75,28 @@ func TestAuth(t *testing.T) {
 	}
 	_ = os.RemoveAll(dir)
 }
+
+func TestOAuthStart(t *testing.T) {
+	db, err := OpenWith(t.TempDir()+"/db", Options{Auth: &AuthOptions{OAuth: map[string]OAuthProvider{"github": {ClientID: "cid", ClientSecret: "sec"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	app := db.Session()
+	for _, q := range []string{"CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member')", "CREATE ROLE member", "ALTER TABLE users ENABLE AUTH (ROLE FROM role)"} {
+		if _, err := app.ExecText(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	auth := db.Auth("users")
+	url, state, err := auth.OAuthStart("github", "https://app.example/cb", "")
+	if err != nil || !strings.HasPrefix(url, "https://github.com/login/oauth/authorize?") || !strings.Contains(url, "state="+state) || !strings.Contains(url, "code_challenge_method=S256") {
+		t.Fatalf("start: %q %q %v", url, state, err)
+	}
+	if _, err := auth.OAuthFinish("github", "code", "not-a-state"); err == nil || !strings.Contains(err.Error(), "state") {
+		t.Fatalf("an unknown state: %v", err)
+	}
+	if _, _, err := auth.OAuthStart("google", "https://app.example/cb", ""); err == nil {
+		t.Fatal("an unconfigured provider was accepted")
+	}
+}

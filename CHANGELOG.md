@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 — 2026-10-18
+
+### Added
+- **Sign-in with Google, GitHub and other OpenID Connect providers.** Configure `auth.oauth.google`,
+  `auth.oauth.github`, or any provider by its endpoints. `db.auth('users').oauthStart(provider,
+  redirectUri)` gives the URL to send the browser to, and `oauthFinish(provider, code, state)` returns a
+  session, like `signIn`. The engine makes a single-use state, a PKCE challenge and a nonce. It checks
+  Google's ID tokens (signature, issuer, audience, expiry, nonce, verified email) and needs a verified
+  primary email from GitHub. A first sign-in makes a user whose login is that email, and later ones find
+  the user by the provider's account id. An account that has a password is linked only by its owner,
+  while signed in (`{ link: token }`). In Python, `oauth_start` and `oauth_finish`; in Go,
+  `Auth.OAuthStart` and `Auth.OAuthFinish`.
+- Sign-in results include `created`: true when this sign-in made the user.
+- Go: `Options.Auth` for `sessionTtl`, `passwordMin` and `oauth`.
+
 ## 0.4.2 — 2026-10-17
 
 ### Fixed

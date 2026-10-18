@@ -6,6 +6,7 @@ pub mod engine;
 pub mod expr;
 pub mod live;
 pub mod net;
+pub mod oauth;
 pub mod sql;
 pub mod table;
 pub mod tenants;
