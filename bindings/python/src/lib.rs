@@ -34,16 +34,18 @@ fn signed_in<'py>(py: Python<'py>, si: sqweezdb::auth::SignedIn) -> PyResult<Bou
         let (sql, table, k, pw) = (self.sql.clone(), self.table.clone(), to_value(key)?, password.to_string());
         py.detach(|| sql.set_password(&table, &k, &pw)).map_err(auth_err)
     }
-    /// Begin a sign-in with an OAuth provider (auth.oauth.<provider>): returns (url, state); send the browser to url.
-    /// With `link` (a session token), the provider account is linked to that signed-in user.
+    /// Begin a sign-in with an OAuth provider (auth.oauth.<provider>): returns (url, state, cookie). Keep cookie in an
+    /// HttpOnly cookie of the browser and send the browser to url. With `link` (a session token), the provider account
+    /// is linked to that signed-in user.
     #[pyo3(signature = (provider, redirect_uri, link = None))]
-    fn oauth_start(&self, provider: &str, redirect_uri: &str, link: Option<&str>) -> PyResult<(String, String)> {
-        let st = self.sql.oauth_start(&self.table, provider, redirect_uri, link).map_err(auth_err)?; Ok((st.url, st.state))
+    fn oauth_start(&self, provider: &str, redirect_uri: &str, link: Option<&str>) -> PyResult<(String, String, String)> {
+        let st = self.sql.oauth_start(&self.table, provider, redirect_uri, link).map_err(auth_err)?; Ok((st.url, st.state, st.cookie))
     }
-    /// Finish it with the code and state from the provider's redirect: returns (token, user, created).
-    fn oauth_finish<'py>(&self, py: Python<'py>, provider: &str, code: &str, state: &str) -> PyResult<Bound<'py, PyTuple>> {
-        let (sql, table, p, c, st) = (self.sql.clone(), self.table.clone(), provider.to_string(), code.to_string(), state.to_string());
-        let r = py.detach(|| sql.oauth_finish(&table, &p, &c, &st)).map_err(auth_err)?;
+    /// Finish it with the code and state from the provider's redirect and the cookie read back from the browser:
+    /// returns (token, user, created).
+    fn oauth_finish<'py>(&self, py: Python<'py>, provider: &str, code: &str, state: &str, cookie: &str) -> PyResult<Bound<'py, PyTuple>> {
+        let (sql, table, p, c, st, ck) = (self.sql.clone(), self.table.clone(), provider.to_string(), code.to_string(), state.to_string(), cookie.to_string());
+        let r = py.detach(|| sql.oauth_finish(&table, &p, &c, &st, &ck)).map_err(auth_err)?;
         let created = r.created; let t = signed_in(py, r)?;
         PyTuple::new(py, [t.get_item(0)?, t.get_item(1)?, pyo3::types::PyBool::new(py, created).to_owned().into_any()])
     }

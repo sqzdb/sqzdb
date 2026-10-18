@@ -11,7 +11,7 @@ Db* sqweezdb_open(const char* path, int durable); long long sqweezdb_last_insert
 Sess* sqweezdb_session(Db*); void sqweezdb_session_free(Sess*); int sqweezdb_login(Db*, Sess*, const char*); int sqweezdb_assume(Db*, Sess*, const char*);
 char* sqweezdb_sign_up(Db*, const char*, const char*, const char*); char* sqweezdb_sign_in(Db*, const char*, const char*, const char*); int sqweezdb_sign_out(Db*, const char*);
 int sqweezdb_set_password(Db*, const char*, const char*, const char*); int sqweezdb_sign_out_everywhere(Db*, const char*, const char*); int sqweezdb_use_token(Db*, Sess*, const char*); void sqweezdb_free_string(char*);
-char* sqweezdb_oauth_start(Db*, const char*, const char*, const char*, const char*); char* sqweezdb_oauth_finish(Db*, const char*, const char*, const char*, const char*);
+char* sqweezdb_oauth_start(Db*, const char*, const char*, const char*, const char*); char* sqweezdb_oauth_finish(Db*, const char*, const char*, const char*, const char*, const char*);
 Stmt* sqweezdb_prepare(Db*, const char*); void sqweezdb_finalize(Stmt*);
 Rows* sqweezdb_exec(Db*, Sess*, Stmt*, const CValue*, int); Rows* sqweezdb_exec_text(Db*, Sess*, const char*, const CValue*, int);
 int sqweezdb_rows_count(Rows*); int sqweezdb_rows_cols(Rows*); int sqweezdb_rows_get(Rows*, int, int, CValue*); int sqweezdb_rows_all(Rows*, CValue*, int); void sqweezdb_rows_free(Rows*);
@@ -235,9 +235,10 @@ func (a *Auth) result(p *C.char) (SignedIn, error) {
 }
 
 // OAuthStart begins a sign-in with an OAuth provider configured as auth.oauth.<provider> (google, github, or any
-// OpenID Connect provider): send the browser to url; the provider redirects it to redirectURI with a code and the
-// state. With linkToken (a session token, or ""), the provider account is linked to that signed-in user.
-func (a *Auth) OAuthStart(provider, redirectURI, linkToken string) (url, state string, err error) {
+// OpenID Connect provider). Keep cookie in an HttpOnly cookie of the browser and send the browser to url; the
+// provider redirects it to redirectURI with a code and the state. With linkToken (a session token, or ""), the
+// provider account is linked to that signed-in user.
+func (a *Auth) OAuthStart(provider, redirectURI, linkToken string) (url, state, cookie string, err error) {
 	ct, cp, cr := C.CString(a.table), C.CString(provider), C.CString(redirectURI)
 	defer C.free(unsafe.Pointer(ct))
 	defer C.free(unsafe.Pointer(cp))
@@ -249,27 +250,30 @@ func (a *Auth) OAuthStart(provider, redirectURI, linkToken string) (url, state s
 	}
 	p := C.sqweezdb_oauth_start(a.db.p, ct, cp, cr, cl)
 	if p == nil {
-		return "", "", a.db.lastError()
+		return "", "", "", a.db.lastError()
 	}
 	defer C.sqweezdb_free_string(p)
 	var out struct {
-		URL   string `json:"url"`
-		State string `json:"state"`
+		URL    string `json:"url"`
+		State  string `json:"state"`
+		Cookie string `json:"cookie"`
 	}
 	if err := json.Unmarshal([]byte(C.GoString(p)), &out); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	return out.URL, out.State, nil
+	return out.URL, out.State, out.Cookie, nil
 }
 
-// OAuthFinish finishes it with the code and state from the provider's redirect.
-func (a *Auth) OAuthFinish(provider, code, state string) (SignedIn, error) {
-	ct, cp, cc, cs := C.CString(a.table), C.CString(provider), C.CString(code), C.CString(state)
+// OAuthFinish finishes it with the code and state from the provider's redirect and the cookie from OAuthStart, read
+// back from the browser: only the browser that started a sign-in can finish it.
+func (a *Auth) OAuthFinish(provider, code, state, cookie string) (SignedIn, error) {
+	ct, cp, cc, cs, ck := C.CString(a.table), C.CString(provider), C.CString(code), C.CString(state), C.CString(cookie)
 	defer C.free(unsafe.Pointer(ct))
 	defer C.free(unsafe.Pointer(cp))
 	defer C.free(unsafe.Pointer(cc))
 	defer C.free(unsafe.Pointer(cs))
-	return a.result(C.sqweezdb_oauth_finish(a.db.p, ct, cp, cc, cs))
+	defer C.free(unsafe.Pointer(ck))
+	return a.result(C.sqweezdb_oauth_finish(a.db.p, ct, cp, cc, cs, ck))
 }
 
 // SignUp inserts a user (fields must include the login column) and sets their password.

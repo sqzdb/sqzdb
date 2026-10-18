@@ -6,10 +6,12 @@
 //!   a PKCE verifier (S256), and for OpenID Connect a nonce the ID token must carry.
 //! - An ID token is accepted only with RS256 and a key from the provider's JWKS, the expected issuer, this client as
 //!   audience, an unexpired time, the nonce, and a verified email.
+//! - `oauth_start` also returns a secret for an HttpOnly cookie of the browser that started; `oauth_finish` needs it
+//!   back, so a code can't be finished in another browser (login CSRF, or linking someone's account to an attacker's).
 //! - A provider identity is filed under `<provider>:<subject>` in `_auth_identities`, pointing at the user's password
-//!   row. A first sign-in makes a user whose login is the verified email. If a user with that login already has a
-//!   password, the sign-in is refused: without email verification here, that account could belong to someone who
-//!   typed another person's email, so linking is done by the signed-in user (`oauth_start` with their token).
+//!   row. A first sign-in makes a user whose login is the verified email. A sign-in never attaches to an existing
+//!   user by email (that account may belong to someone who used another person's address, or came through a
+//!   provider that checks emails less strictly): its owner signs in and links (`oauth_start` with their token).
 use crate::auth::SignedIn;
 use crate::config::{OAuthKind, OAuthProvider};
 use crate::sql::Sql;
@@ -22,10 +24,13 @@ const FLOW_TTL: Duration = Duration::from_secs(600);
 const JWKS_TTL: Duration = Duration::from_secs(3600);
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-/// Where to send the browser, and the state value the provider sends back with the code.
-#[derive(Debug, Clone)] pub struct OAuthStart { pub url: String, pub state: String }
-/// A sign-in waiting for the provider's answer.
-pub(crate) struct Flow { provider: String, table: String, verifier: String, nonce: String, redirect: String, link: Option<String>, at: Instant }
+/// Where to send the browser, the state value the provider sends back with the code, and a secret the application
+/// keeps in an HttpOnly cookie of that browser and hands back to `oauth_finish`: only the browser that started a
+/// sign-in can finish it (no login or link CSRF).
+#[derive(Debug, Clone)] pub struct OAuthStart { pub url: String, pub state: String, pub cookie: String }
+/// A sign-in waiting for the provider's answer (`cookie`: the SHA-256 of the browser's secret).
+pub(crate) struct Flow { provider: String, table: String, verifier: String, nonce: String, redirect: String, link: Option<String>, cookie: [u8; 32], at: Instant }
+fn sha(s: &str) -> [u8; 32] { use sha2::Digest; sha2::Sha256::digest(s.as_bytes()).into() }
 /// Who the provider says signed in.
 pub(crate) struct Identity { pub subject: String, pub email: String }
 
@@ -68,13 +73,22 @@ impl Sql {
         let mut flows = self.oauth.flows.lock().unwrap();
         if flows.len() > 10_000 { flows.retain(|_, f| f.at.elapsed() < FLOW_TTL); }
         if flows.len() > 100_000 { return Err(fail("too many sign-ins in progress; try again shortly")); }
-        flows.insert(state.clone(), Flow { provider: provider.into(), table: table.to_lowercase(), verifier, nonce, redirect: redirect_uri.into(), link, at: Instant::now() });
-        Ok(OAuthStart { url, state })
+        let cookie = hexs(&random::<32>());
+        #[cfg(test)] tests::COOKIES.lock().unwrap().get_or_insert_with(HashMap::new).insert(state.clone(), cookie.clone());
+        flows.insert(state.clone(), Flow { provider: provider.into(), table: table.to_lowercase(), verifier, nonce, redirect: redirect_uri.into(), link, cookie: sha(&cookie), at: Instant::now() });
+        Ok(OAuthStart { url, state, cookie })
     }
 
-    /// Finish a sign-in: exchange `code` (with `state` from the same start), find or make the user, start a session.
-    pub fn oauth_finish(&self, table: &str, provider: &str, code: &str, state: &str) -> Result<SignedIn, String> {
-        let flow = self.oauth.flows.lock().unwrap().remove(state).ok_or_else(|| fail("unknown or already used sign-in state; start again"))?;
+    /// Finish a sign-in: exchange `code` (with `state` and the `cookie` from the same start, the cookie read from the
+    /// browser), find the user, start a session.
+    pub fn oauth_finish(&self, table: &str, provider: &str, code: &str, state: &str, cookie: &str) -> Result<SignedIn, String> {
+        let flow = {
+            let mut flows = self.oauth.flows.lock().unwrap();
+            let f = flows.get(state).ok_or_else(|| fail("unknown or already used sign-in state; start again"))?;
+            // a wrong cookie leaves the sign-in in place: whoever only saw the state in a URL can't cancel it
+            if sha(cookie).iter().zip(f.cookie.iter()).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 { return Err(fail("this browser did not start this sign-in (the cookie from oauthStart is missing or wrong)")); }
+            flows.remove(state).unwrap()
+        };
         if flow.at.elapsed() > FLOW_TTL { return Err(fail("the sign-in took longer than 10 minutes; start again")); }
         if flow.provider != provider || flow.table != table.to_lowercase() { return Err(fail("this state belongs to another sign-in")); }
         let p = self.provider(provider)?.clone();
@@ -162,6 +176,9 @@ mod tests {
     use crate::table::Value;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::{Arc, Mutex};
+    /// The cookie each test sign-in started with (the browser would hold it).
+    pub(super) static COOKIES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    fn cookie(state: &str) -> String { COOKIES.lock().unwrap().as_ref().and_then(|m| m.get(state).cloned()).unwrap_or_default() }
 
     /// What the fake provider answers for one authorization code.
     #[derive(Clone, Default)] struct Grant { challenge: String, nonce: String, sub: String, email: String, verified: bool, tamper: &'static str }
@@ -241,19 +258,19 @@ mod tests {
         let q = query(&st.url);
         assert!(st.url.starts_with(&format!("http://127.0.0.1:{port}/auth?")) && q["client_id"] == "google-client" && q["redirect_uri"] == REDIRECT && q["code_challenge_method"] == "S256" && q["scope"] == "openid email profile" && q["state"] == st.state && !q["nonce"].is_empty());
         let state = approve(&fake, &st.url, "c1", "g-123", "Ann@Gmail.com", true, "");
-        let a = s.oauth_finish("users", "google", "c1", &state).unwrap();
+        let a = s.oauth_finish("users", "google", "c1", &state, &cookie(&state)).unwrap();
         assert!(a.created && a.user.contains(&("email".to_string(), Value::Text("ann@gmail.com".into()))));
         let mut u = crate::sql::Session::default(); s.session_from_token(&mut u, &a.token).unwrap(); assert_eq!(u.attrs.get("id"), Some(&Value::Int(1)));
-        assert_eq!(error_code(&s.oauth_finish("users", "google", "c1", &state).unwrap_err()), "AUTH", "a state is used once");
+        assert_eq!(error_code(&s.oauth_finish("users", "google", "c1", &state, &cookie(&state)).unwrap_err()), "AUTH", "a state is used once");
         let st2 = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state2 = approve(&fake, &st2.url, "c2", "g-123", "ann@gmail.com", true, "");
-        let b = s.oauth_finish("users", "google", "c2", &state2).unwrap(); assert!(!b.created); assert_eq!(b.user, a.user);
+        let b = s.oauth_finish("users", "google", "c2", &state2, &cookie(&state2)).unwrap(); assert!(!b.created); assert_eq!(b.user, a.user);
         // an account made by a provider has no password
         assert!(s.sign_in("users", "ann@gmail.com", "anything at all").is_err());
         s.set_password("users", &Value::Int(1), "now a password").unwrap(); assert!(s.sign_in("users", "ann@gmail.com", "now a password").is_ok());
         // the identity survives a restart (its table and index are replayed)
         drop(s); let s = Sql::open_with(&d, cfg(port)).unwrap();
         let st3 = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state3 = approve(&fake, &st3.url, "c3", "g-123", "ann@gmail.com", true, "");
-        assert_eq!(s.oauth_finish("users", "google", "c3", &state3).unwrap().user, a.user);
+        assert_eq!(s.oauth_finish("users", "google", "c3", &state3, &cookie(&state3)).unwrap().user, a.user);
         assert!(s.exec_s(&mut crate::sql::Session::default(), "SELECT * FROM _auth_identities", &[]).is_err());
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
@@ -263,11 +280,11 @@ mod tests {
         let s = Sql::open_with(&d, cfg(port)).unwrap(); setup(&s);
         for (i, (tamper, verified, want)) in [("nonce", true, "nonce"), ("aud", true, "another application"), ("iss", true, "is from"), ("expired", true, "expired"), ("alg", true, "RS256"), ("forged", true, "signature"), ("", false, "not verified")].into_iter().enumerate() {
             let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let code = format!("t{i}"); let state = approve(&fake, &st.url, &code, "g-9", "x@y.com", verified, tamper);
-            let e = s.oauth_finish("users", "google", &code, &state).unwrap_err(); assert!(e.contains(want), "{tamper}: {e}"); assert_eq!(error_code(&e), "AUTH");
+            let e = s.oauth_finish("users", "google", &code, &state, &cookie(&state)).unwrap_err(); assert!(e.contains(want), "{tamper}: {e}"); assert_eq!(error_code(&e), "AUTH");
         }
         // a code the provider never issued, a state from another provider, an unknown provider
-        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); assert!(s.oauth_finish("users", "google", "never", &st.state).unwrap_err().contains("token request"));
-        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); assert!(s.oauth_finish("users", "github", "x", &st.state).unwrap_err().contains("another sign-in"));
+        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); assert!(s.oauth_finish("users", "google", "never", &st.state, &cookie(&st.state)).unwrap_err().contains("token request"));
+        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); assert!(s.oauth_finish("users", "github", "x", &st.state, &cookie(&st.state)).unwrap_err().contains("another sign-in"));
         assert!(s.oauth_start("users", "facebook", REDIRECT, None).unwrap_err().contains("no sign-in provider"));
         assert_eq!(s.exec_s(&mut crate::sql::Session::default(), "SELECT count(*) FROM users", &[]).unwrap()[0][0], Value::Int(0), "no user was made");
         drop(s); let _ = std::fs::remove_dir_all(&d);
@@ -279,23 +296,57 @@ mod tests {
         let ann = s.sign_up("users", &[("email".into(), Value::Text("ann@gmail.com".into()))], "ann's password").unwrap();
         // someone signing in with a Google account for that email does not get the password account
         let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "l1", "g-ann", "ann@gmail.com", true, "");
-        assert!(s.oauth_finish("users", "google", "l1", &state).unwrap_err().contains("already has a password"));
+        assert!(s.oauth_finish("users", "google", "l1", &state, &cookie(&state)).unwrap_err().contains("already exists"));
         // the owner, signed in, links it
         let st = s.oauth_start("users", "google", REDIRECT, Some(&ann.token)).unwrap(); let state = approve(&fake, &st.url, "l2", "g-ann", "ann@gmail.com", true, "");
-        let linked = s.oauth_finish("users", "google", "l2", &state).unwrap(); assert_eq!(linked.user, ann.user);
+        let linked = s.oauth_finish("users", "google", "l2", &state, &cookie(&state)).unwrap(); assert_eq!(linked.user, ann.user);
         let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "l3", "g-ann", "ann@gmail.com", true, "");
-        assert_eq!(s.oauth_finish("users", "google", "l3", &state).unwrap().user, ann.user, "from now on Google signs her in");
+        assert_eq!(s.oauth_finish("users", "google", "l3", &state, &cookie(&state)).unwrap().user, ann.user, "from now on Google signs her in");
         // a provider account linked to one user can't be linked to another
         let bob = s.sign_up("users", &[("email".into(), Value::Text("bob@x.com".into()))], "bob's password").unwrap();
         let st = s.oauth_start("users", "google", REDIRECT, Some(&bob.token)).unwrap(); let state = approve(&fake, &st.url, "l4", "g-ann", "ann@gmail.com", true, "");
-        assert!(s.oauth_finish("users", "google", "l4", &state).unwrap_err().contains("linked to another user"));
+        assert!(s.oauth_finish("users", "google", "l4", &state, &cookie(&state)).unwrap_err().contains("linked to another user"));
         assert!(s.oauth_start("users", "google", REDIRECT, Some("sqz_00")).is_err(), "linking needs a valid session");
         // a deleted user's key taken by a new row: the old provider account does not sign into it
         s.exec_s(&mut crate::sql::Session::default(), "DELETE FROM users WHERE id = 1", &[]).unwrap();
         s.exec_s(&mut crate::sql::Session::default(), "INSERT INTO users (id, email) VALUES (1, 'carol@x.com')", &[]).unwrap();
         let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "l5", "g-ann", "ann@gmail.com", true, "");
-        let again = s.oauth_finish("users", "google", "l5", &state).unwrap();
+        let again = s.oauth_finish("users", "google", "l5", &state, &cookie(&state)).unwrap();
         assert!(again.created && again.user.contains(&("email".to_string(), Value::Text("ann@gmail.com".into()))) && !again.user.contains(&("id".to_string(), Value::Int(1))));
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test] fn only_the_browser_that_started_can_finish() {
+        let fake = Arc::new(Fake::default()); let port = serve(fake.clone()); let d = tmp("cookie");
+        let s = Sql::open_with(&d, cfg(port)).unwrap(); setup(&s);
+        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "k1", "g-k", "k@x.com", true, "");
+        for bad in ["", "wrong", &"0".repeat(64)] { assert!(s.oauth_finish("users", "google", "k1", &state, bad).unwrap_err().contains("did not start this sign-in"), "{bad:?}"); }
+        assert!(s.oauth_finish("users", "google", "k1", &state, &st.cookie).is_ok(), "a wrong cookie does not use the sign-in up");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test] fn a_provider_never_takes_an_existing_account_by_email() {
+        let fake = Arc::new(Fake::default()); let port = serve(fake.clone()); let d = tmp("noemail");
+        let s = Sql::open_with(&d, cfg(port)).unwrap(); setup(&s);
+        // an account made through GitHub has no password; a Google account with the same email still does not get it
+        *fake.gh_emails.lock().unwrap() = r#"[{"email":"dee@x.com","primary":true,"verified":true}]"#.into();
+        let st = s.oauth_start("users", "github", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "e1", "", "", true, "");
+        let dee = s.oauth_finish("users", "github", "e1", &state, &cookie(&state)).unwrap();
+        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "e2", "g-dee", "dee@x.com", true, "");
+        assert!(s.oauth_finish("users", "google", "e2", &state, &cookie(&state)).unwrap_err().contains("already exists"));
+        // nor does a row the application made itself, with no password yet
+        s.exec_s(&mut crate::sql::Session::default(), "INSERT INTO users (email) VALUES ('invited@x.com')", &[]).unwrap();
+        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "e3", "g-inv", "invited@x.com", true, "");
+        assert!(s.oauth_finish("users", "google", "e3", &state, &cookie(&state)).unwrap_err().contains("already exists"));
+        // the owner, signed in through GitHub, links Google
+        let st = s.oauth_start("users", "google", REDIRECT, Some(&dee.token)).unwrap(); let state = approve(&fake, &st.url, "e4", "g-dee", "dee@x.com", true, "");
+        assert_eq!(s.oauth_finish("users", "google", "e4", &state, &cookie(&state)).unwrap().user, dee.user);
+        // a provider account of a user in one table does not sign in to another, and stays linked
+        for st in ["CREATE TABLE staff (id SERIAL PRIMARY KEY, email TEXT UNIQUE)", "ALTER TABLE staff ENABLE AUTH (ROLE member)"] { s.exec_s(&mut crate::sql::Session::default(), st, &[]).unwrap(); }
+        let st = s.oauth_start("staff", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "e5", "g-dee", "dee@x.com", true, "");
+        assert!(s.oauth_finish("staff", "google", "e5", &state, &cookie(&state)).unwrap_err().contains("another table"));
+        let st = s.oauth_start("users", "google", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "e6", "g-dee", "dee@x.com", true, "");
+        assert_eq!(s.oauth_finish("users", "google", "e6", &state, &cookie(&state)).unwrap().user, dee.user);
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -306,14 +357,14 @@ mod tests {
         let st = s.oauth_start("users", "github", REDIRECT, None).unwrap(); let q = query(&st.url);
         assert!(q["scope"] == "read:user user:email" && q.get("nonce").is_none() && q["code_challenge_method"] == "S256");
         let state = approve(&fake, &st.url, "g1", "", "", true, "");
-        let o = s.oauth_finish("users", "github", "g1", &state).unwrap(); assert!(o.created && o.user.contains(&("email".to_string(), Value::Text("octo@x.com".into()))));
+        let o = s.oauth_finish("users", "github", "g1", &state, &cookie(&state)).unwrap(); assert!(o.created && o.user.contains(&("email".to_string(), Value::Text("octo@x.com".into()))));
         *fake.gh_emails.lock().unwrap() = r#"[{"email":"new@x.com","primary":true,"verified":true}]"#.into();
         let st = s.oauth_start("users", "github", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "g2", "", "", true, "");
-        assert_eq!(s.oauth_finish("users", "github", "g2", &state).unwrap().user, o.user, "the account is found by its GitHub id, not its email");
+        assert_eq!(s.oauth_finish("users", "github", "g2", &state, &cookie(&state)).unwrap().user, o.user, "the account is found by its GitHub id, not its email");
         *fake.gh_emails.lock().unwrap() = r#"[{"email":"new@x.com","primary":true,"verified":false}]"#.into();
         drop(s); let d2 = tmp("github2"); let s = Sql::open_with(&d2, cfg(port)).unwrap(); setup(&s);
         let st = s.oauth_start("users", "github", REDIRECT, None).unwrap(); let state = approve(&fake, &st.url, "g3", "", "", true, "");
-        assert!(s.oauth_finish("users", "github", "g3", &state).unwrap_err().contains("no verified primary email"));
+        assert!(s.oauth_finish("users", "github", "g3", &state, &cookie(&state)).unwrap_err().contains("no verified primary email"));
         drop(s); let _ = std::fs::remove_dir_all(&d); let _ = std::fs::remove_dir_all(&d2);
     }
 

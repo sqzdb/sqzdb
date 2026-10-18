@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.1 — 2026-10-18
+
+**Upgrade from 0.5.0 if you use provider sign-in.** This changes its API (see Changed).
+
+### Fixed
+- **A provider sign-in could take over an account with the same email.** In 0.5.0 a first Google or
+  GitHub sign-in attached to an existing account with that email if it had no password: an account
+  made through another provider, or a row the application inserted itself. A sign-in now never attaches
+  to an existing account by email. Its owner signs in and links the provider (`{ link: token }`).
+- **A sign-in or a link could be finished in another browser.** The state from `oauthStart` was the
+  only check, so an attacker could start a sign-in, or a link to their own account, and get a victim's
+  browser to finish it. That logged the victim in as the attacker, or attached the victim's provider
+  account to the attacker's account. `oauthStart` now also returns a `cookie` secret, and
+  `oauthFinish` requires it back.
+- A provider sign-in to one auth table with a provider account linked to a user of another table
+  removed that link. It is now refused.
+
+### Changed
+- `oauthStart` returns `{ url, state, cookie }`; keep `cookie` in an HttpOnly cookie of that browser.
+  `oauthFinish(provider, code, state, cookie)` takes it back. In Python, `oauth_start` returns
+  `(url, state, cookie)` and `oauth_finish` takes `cookie`. In Go, `OAuthStart` returns the cookie and
+  `OAuthFinish` takes it. In C, `sqweezdb_oauth_finish` takes it as its last argument.
+
 ## 0.5.0 — 2026-10-18
 
 ### Added

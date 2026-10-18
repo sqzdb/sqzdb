@@ -110,7 +110,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.5.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.5.1` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -480,13 +480,13 @@ Your app sends the browser to the provider and takes the code back:
 
 ```js
 app.get('/auth/google', (req, res) => {
-  const { url, state } = db.auth('users').oauthStart('google', 'https://app.example/auth/google/callback')
-  res.cookie('oauth_state', state, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 600_000 })
+  const { url, cookie } = db.auth('users').oauthStart('google', 'https://app.example/auth/google/callback')
+  res.cookie('oauth', cookie, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 600_000 })   // this browser
   res.redirect(url)
 })
 app.get('/auth/google/callback', async (req, res) => {
-  if (req.query.state !== req.cookies.oauth_state) return res.status(400).end()   // this browser started it
-  const { token, user, created } = await db.auth('users').oauthFinish('google', req.query.code, req.query.state)
+  const { token, user, created } = await db.auth('users')
+    .oauthFinish('google', req.query.code, req.query.state, req.cookies.oauth)    // rejects with AUTH if they don't match
   res.cookie('session', token, { httpOnly: true, secure: true, sameSite: 'lax' }).redirect('/')
 })
 ```
@@ -494,15 +494,18 @@ app.get('/auth/google/callback', async (req, res) => {
 - The engine makes a single-use `state` (10 minutes), a PKCE challenge, and for OpenID Connect a
   nonce. It checks a Google ID token's RS256 signature against Google's keys, and its issuer, audience,
   expiry, nonce and verified email. A GitHub sign-in needs a verified primary email.
-- The cookie in the example is the app's part: it ties the sign-in to the browser that started it.
+- `oauthFinish` needs the `cookie` from `oauthStart`, read back from the browser, so only the browser that
+  started a sign-in can finish it. That rules out login CSRF, and linking someone's provider account to an
+  attacker's.
 - A first sign-in makes a user whose login is the verified email (`created: true`). Later sign-ins find
   that user by the provider's account id, even if the email changes.
-- If a user with that email already has a password, the sign-in is refused: without email verification
-  here, that account may have been made by someone else. The owner links the provider while signed in,
-  with `oauthStart('google', redirectUri, { link: token })`.
+- A sign-in never takes over an existing account by its email, with or without a password. That account
+  may have been made by someone else with this address, or through a provider that checks emails less
+  strictly. Its owner links the provider while signed in, with
+  `oauthStart('google', redirectUri, { link: token })`.
 - A user made through a provider has no password until `setPassword`.
-- In Python, `auth.oauth_start(provider, redirect_uri, link=None)` returns `(url, state)`, and
-  `auth.oauth_finish(provider, code, state)` returns `(token, user, created)`. In Go, use
+- In Python, `auth.oauth_start(provider, redirect_uri, link=None)` returns `(url, state, cookie)`, and
+  `auth.oauth_finish(provider, code, state, cookie)` returns `(token, user, created)`. In Go, use
   `Auth.OAuthStart` and `Auth.OAuthFinish`, configured with `Options.Auth`.
 
 ### Backup, restore and replication
@@ -777,7 +780,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.5.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.5.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

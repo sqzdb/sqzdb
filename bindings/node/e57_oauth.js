@@ -36,15 +36,16 @@ server.listen(0, '127.0.0.1', async () => {
   try {
     const st = auth.oauthStart('idp', 'http://127.0.0.1:3000/cb');
     assert.ok(st.url.startsWith(`${base}/authorize?`) && new URL(st.url).searchParams.get('state') === st.state);
-    const first = await auth.oauthFinish('idp', 'code-1', approve(st.url, 'code-1', 'user-1', 'Ann@IdP.test'));
+    await assert.rejects(auth.oauthFinish('idp', 'code-1', approve(st.url, 'code-1', 'user-1', 'Ann@IdP.test'), 'not the cookie'), (e) => e.code === 'AUTH');   // another browser
+    const first = await auth.oauthFinish('idp', 'code-1', st.state, st.cookie);
     assert.strictEqual(first.created, true); assert.strictEqual(first.user.email, 'ann@idp.test');
     assert.ok(db.session(first.token).all('SELECT 1 AS one')[0].one === 1);
-    await assert.rejects(auth.oauthFinish('idp', 'code-1', st.state), (e) => e.code === 'AUTH');   // the state was used
+    await assert.rejects(auth.oauthFinish('idp', 'code-1', st.state, st.cookie), (e) => e.code === 'AUTH');   // the state was used
     console.log('API checks: ok');
     const N = 200; const t0 = process.hrtime.bigint(); const lat = [];
     for (let i = 0; i < N; i++) {
       const s = auth.oauthStart('idp', 'http://127.0.0.1:3000/cb'); const a = process.hrtime.bigint();
-      const r = await auth.oauthFinish('idp', `c${i}`, approve(s.url, `c${i}`, `user-${i % 50}`, `u${i % 50}@idp.test`));
+      const r = await auth.oauthFinish('idp', `c${i}`, approve(s.url, `c${i}`, `user-${i % 50}`, `u${i % 50}@idp.test`), s.cookie);
       lat.push(Number(process.hrtime.bigint() - a) / 1e6); if (i >= 50) assert.strictEqual(r.created, false);
     }
     lat.sort((a, b) => a - b);

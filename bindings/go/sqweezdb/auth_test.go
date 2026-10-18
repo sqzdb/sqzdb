@@ -89,14 +89,17 @@ func TestOAuthStart(t *testing.T) {
 		}
 	}
 	auth := db.Auth("users")
-	url, state, err := auth.OAuthStart("github", "https://app.example/cb", "")
-	if err != nil || !strings.HasPrefix(url, "https://github.com/login/oauth/authorize?") || !strings.Contains(url, "state="+state) || !strings.Contains(url, "code_challenge_method=S256") {
+	url, state, cookie, err := auth.OAuthStart("github", "https://app.example/cb", "")
+	if err != nil || !strings.HasPrefix(url, "https://github.com/login/oauth/authorize?") || !strings.Contains(url, "state="+state) || !strings.Contains(url, "code_challenge_method=S256") || len(cookie) != 64 {
 		t.Fatalf("start: %q %q %v", url, state, err)
 	}
-	if _, err := auth.OAuthFinish("github", "code", "not-a-state"); err == nil || !strings.Contains(err.Error(), "state") {
+	if _, err := auth.OAuthFinish("github", "code", state, "wrong cookie"); err == nil || !strings.Contains(err.Error(), "did not start") {
+		t.Fatalf("a wrong cookie: %v", err)
+	}
+	if _, err := auth.OAuthFinish("github", "code", "not-a-state", cookie); err == nil || !strings.Contains(err.Error(), "state") {
 		t.Fatalf("an unknown state: %v", err)
 	}
-	if _, _, err := auth.OAuthStart("google", "https://app.example/cb", ""); err == nil {
+	if _, _, _, err := auth.OAuthStart("google", "https://app.example/cb", ""); err == nil {
 		t.Fatal("an unconfigured provider was accepted")
 	}
 }

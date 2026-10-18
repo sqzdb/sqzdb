@@ -122,13 +122,13 @@ pub fn open(path: String, options: Option<String>) -> Result<Db> {
         Ok(AsyncTask::new(AuthTask { sql: self.sql()?, table, op: Some(AuthOp::SetPassword { key: from_js(key)?, password }) }))
     }
     /// Begin a sign-in with an OAuth provider: where to send the browser, and the state it comes back with.
-    #[napi(ts_return_type = "{ url: string, state: string }")] pub fn oauth_start(&self, env: Env, table: String, provider: String, redirect_uri: String, link: Option<String>) -> Result<JsObject> {
+    #[napi(ts_return_type = "{ url: string, state: string, cookie: string }")] pub fn oauth_start(&self, env: Env, table: String, provider: String, redirect_uri: String, link: Option<String>) -> Result<JsObject> {
         let st = self.sql()?.oauth_start(&table, &provider, &redirect_uri, link.as_deref()).map_err(err)?;
-        let mut o = env.create_object()?; o.set_named_property("url", env.create_string(&st.url)?)?; o.set_named_property("state", env.create_string(&st.state)?)?; Ok(o)
+        let mut o = env.create_object()?; o.set_named_property("url", env.create_string(&st.url)?)?; o.set_named_property("state", env.create_string(&st.state)?)?; o.set_named_property("cookie", env.create_string(&st.cookie)?)?; Ok(o)
     }
     /// Finish it with the code and state the provider sent back (network calls run off the JavaScript thread).
-    #[napi(ts_return_type = "Promise<{ token: string, user: Record<string, unknown>, created: boolean }>")] pub fn oauth_finish(&self, table: String, provider: String, code: String, state: String) -> Result<AsyncTask<AuthTask>> {
-        Ok(AsyncTask::new(AuthTask { sql: self.sql()?, table, op: Some(AuthOp::OAuthFinish { provider, code, state }) }))
+    #[napi(ts_return_type = "Promise<{ token: string, user: Record<string, unknown>, created: boolean }>")] pub fn oauth_finish(&self, table: String, provider: String, code: String, state: String, cookie: String) -> Result<AsyncTask<AuthTask>> {
+        Ok(AsyncTask::new(AuthTask { sql: self.sql()?, table, op: Some(AuthOp::OAuthFinish { provider, code, state, cookie }) }))
     }
     #[napi] pub fn sign_out(&self, token: String) -> Result<()> { self.sql()?.sign_out(&token).map_err(err) }
     #[napi] pub fn sign_out_everywhere(&self, table: String, key: JsUnknown) -> Result<()> { self.sql()?.sign_out_everywhere(&table, &from_js(key)?).map_err(err) }
@@ -252,7 +252,7 @@ impl Task for WaitDurable {
     fn compute(&mut self) -> Result<()> { match &self.sql { Some(s) => { s.wait_durable(self.seq); Ok(()) } None => Err(err_code("CLOSED", "database is closed")) } }
     fn resolve(&mut self, _env: Env, _o: ()) -> Result<()> { Ok(()) }
 }
-pub enum AuthOp { SignUp { fields: Vec<(String, Value)>, password: String }, SignIn { login: String, password: String }, SetPassword { key: Value, password: String }, OAuthFinish { provider: String, code: String, state: String } }
+pub enum AuthOp { SignUp { fields: Vec<(String, Value)>, password: String }, SignIn { login: String, password: String }, SetPassword { key: Value, password: String }, OAuthFinish { provider: String, code: String, state: String, cookie: String } }
 pub struct AuthTask { sql: Arc<Sql>, table: String, op: Option<AuthOp> }
 impl Task for AuthTask {
     type Output = Option<sqweezdb::auth::SignedIn>; type JsValue = JsUnknown;
@@ -262,7 +262,7 @@ impl Task for AuthTask {
             AuthOp::SignUp { fields, password } => sql.sign_up(table, &fields, &password).map(Some),
             AuthOp::SignIn { login, password } => sql.sign_in(table, &login, &password).map(Some),
             AuthOp::SetPassword { key, password } => sql.set_password(table, &key, &password).map(|_| None),
-            AuthOp::OAuthFinish { provider, code, state } => sql.oauth_finish(table, &provider, &code, &state).map(Some),
+            AuthOp::OAuthFinish { provider, code, state, cookie } => sql.oauth_finish(table, &provider, &code, &state, &cookie).map(Some),
         }.map_err(err)
     }
     fn resolve(&mut self, env: Env, out: Self::Output) -> Result<JsUnknown> {

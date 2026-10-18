@@ -265,7 +265,7 @@ impl Sql {
         let row = t.with_pk(pk, |r| r.to_vec())?; Some((t, row))
     }
     /// Sign in (or up) with a provider identity: an identity already linked signs in its user; a new one links to
-    /// `link` (a signed-in user's password-row id), or to a user with this login and no password, or makes a user.
+    /// `link` (a signed-in user's password-row id), or makes a user; it never attaches to an existing user by email.
     pub(crate) fn oauth_sign_in(&self, table: &str, provider: &str, who: crate::oauth::Identity, link: Option<&str>) -> Result<SignedIn, String> {
         let (t, cfg) = self.auth_table(table)?; let ids = self.identities()?; let secrets = self.system(SECRETS)?;
         let email = normalize(&who.email); let id = format!("{provider}:{}", who.subject);
@@ -281,18 +281,18 @@ impl Sql {
             if let Some((s, _)) = &linked_user { if s != target { return Err(format!("sign-in failed: this {provider} account is linked to another user")); } }
             else { if linked.is_some() { ids.txn_delete(&mut txn, ik).map_err(|e| e.to_string())?; } ids.txn_insert(&mut txn, &ident_row(target)?).map_err(|e| e.to_string())?; }
             (ut, ur, false)
-        } else if let Some((s, (ut, ur))) = linked_user.filter(|(_, (ut, _))| ut.schema.name.eq_ignore_ascii_case(&t.schema.name)) { let _ = s; (ut, ur, false) }
-        else {
+        } else if let Some((_, (ut, ur))) = linked_user {
+            // a provider account belongs to one user: a sign-in to another table neither takes it nor unlinks it
+            if !ut.schema.name.eq_ignore_ascii_case(&t.schema.name) { return Err(format!("sign-in failed: this {provider} account belongs to a user of another table")); }
+            (ut, ur, false)
+        } else {
             if linked.is_some() { ids.txn_delete(&mut txn, ik).map_err(|e| e.to_string())?; }   // it pointed at a user who is gone
             let ty = &t.schema.columns[cfg.login].ty; let mut key = vec![0u8; ty.width()];
             let existing = if encode_value(ty, &Value::Text(email.clone()), &mut key).is_ok() { t.with_unique(&key, |r| r.to_vec()) } else { None };
             match existing {
-                Some(ur) => {
-                    let has_password = secrets.with_pk(Self::text_pk(&secrets, &Self::secret_id(&t, &ur))?, |r| decode_col(&secrets.schema, r, 1)).map(|h| matches!(&h, Value::Text(h) if PasswordHash::new(h).is_ok())).unwrap_or(false);
-                    if has_password { return Err(format!("sign-in failed: an account with this email already has a password; sign in with it, then link {provider} from that account")); }
-                    ids.txn_insert(&mut txn, &ident_row(&Self::secret_id(&t, &ur))?).map_err(|e| e.to_string())?;
-                    (t.clone(), ur, false)
-                }
+                // never by email: the account may be someone else's (made with their address, or through a provider
+                // that checks emails less strictly). Its owner signs in and links the provider.
+                Some(_) => return Err(format!("sign-in failed: an account with this email already exists; sign in to it, then link {provider} from that account")),
                 None => {
                     // a new user whose login is the verified email: inserted through SQL (defaults, automatic ids, the
                     // insert hook), then the identity, a password row without a password, and the session
