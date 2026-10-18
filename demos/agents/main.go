@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"log"
 	mrand "math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -424,7 +425,43 @@ func main() {
 	mux.HandleFunc("POST /api/swarm/spawn", s.spawn)
 	mux.HandleFunc("POST /api/swarm/run", s.run)
 	log.Printf("agents on http://%s (%d agents in %s)", *addr, len(p.names), *dir)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	log.Fatal(http.ListenAndServe(*addr, guard(*addr, mux)))
+}
+
+// guard refuses what a web page open in the same browser could send to this demo, which has no sign-in: a write
+// from another origin (CSRF; a browser sends a plain-text POST without asking first), and, while the demo listens on
+// loopback, any request whose Host is not a loopback name (DNS rebinding, a page whose name points at 127.0.0.1).
+// Tools without a browser, like the load generator in bench/, send neither header and pass.
+func guard(addr string, h http.Handler) http.Handler {
+	listenHost, _, _ := net.SplitHostPort(addr)
+	loopback := isLoopback(listenHost)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+		}
+		if loopback && !isLoopback(host) {
+			http.Error(w, "unknown host "+r.Host, http.StatusMisdirectedRequest)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			site := r.Header.Get("Sec-Fetch-Site")
+			origin := r.Header.Get("Origin")
+			if (site != "" && site != "same-origin" && site != "none") || (origin != "" && origin != "http://"+r.Host) {
+				http.Error(w, "cross-origin request refused", http.StatusForbidden)
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *server) with(w http.ResponseWriter, r *http.Request, create bool, f func(a *agent, opened time.Duration)) {

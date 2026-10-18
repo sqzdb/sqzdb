@@ -12,7 +12,7 @@ Turso is tried with its default build first, then with its experimental features
 
 | SQL features (88) | ✅ | ⚠️ | ⛔ wrong | ❌ |
 |---|---:|---:|---:|---:|
-| sqweezdb | 48 | 4 | 0 | 36 |
+| sqweezdb | 49 | 4 | 0 | 35 |
 | SQLite | 73 | 5 | 2 | 8 |
 | Turso | 72 | 12 | 2 | 2 |
 
@@ -164,7 +164,7 @@ None now. The first run (`results/e54_features_sql_before_h63.tsv`) found the ca
 | Writes | UPSERT (ON CONFLICT DO UPDATE) | ✅ | ✅ | ✅ |
 | Writes | Insert, ignoring duplicates | ✅ ON CONFLICT DO NOTHING | ✅ ON CONFLICT DO NOTHING | ✅ ON CONFLICT DO NOTHING |
 | Writes | INSERT … RETURNING | ✅ | ✅ | ✅ |
-| Writes | UPDATE … RETURNING | ❌ unsupported: UPDATE … RETURNING is not implemented yet | ✅ | ✅ |
+| Writes | UPDATE … RETURNING | ✅ | ✅ | ✅ |
 | Writes | INSERT … SELECT | ✅ | ✅ | ✅ |
 | Writes | CREATE TABLE … AS SELECT | ❌ unsupported: CREATE TABLE with OR REPLACE, TEMPORARY, AS SELECT, LIKE, CLONE, INHERITS or … | ✅ | ✅ |
 | Writes | UPDATE with a subquery | ✅ | ✅ | ✅ |

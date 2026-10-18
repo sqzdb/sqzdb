@@ -1,4 +1,4 @@
-//! E13 scan queries only (Q3, Q4, Q5, Q7 on the same 1M rows), many repetitions: a quick A/B of the scan path.
+//! E13's scan queries (Q3, Q4, Q5, Q7) and its UPDATE by id (W1) on the same 1M rows, many repetitions: a quick A/B.
 use sqweezdb::sql::Sql;
 use sqweezdb::table::Value;
 use sqweezdb::util::Rng;
@@ -17,7 +17,9 @@ fn main() {
         let q7 = median(31, || { sql.exec("SELECT sum(score) FROM t WHERE country = 7 AND age BETWEEN 30 AND 50", &[]).unwrap(); });
         let q5p = sql.prepare("SELECT sum(score) FROM t WHERE id >= ? AND id < ?").unwrap(); let mut r = Rng(99);
         let t = Instant::now(); for _ in 0..50_000 { let a = (r.next() % (N - 1000) as u64) as i64 + 1; sql.execute(&q5p, &[Value::Int(a), Value::Int(a + 1000)]).unwrap(); } let q5 = t.elapsed().as_secs_f64() * 1e6 / 50_000.0;
-        println!("round {round}: Q3 {q3:.3} ms  Q4 {q4:.3} ms  Q7 {q7:.3} ms  Q5 {q5:.3} us/call");
+        let w1p = sql.prepare("UPDATE t SET score = ? WHERE id = ?").unwrap();
+        let t = Instant::now(); for i in 0..300_000 { let id = (r.next() % N as u64) as i64 + 1; sql.execute(&w1p, &[Value::Float(i as f64), Value::Int(id)]).unwrap(); } let w1 = t.elapsed().as_secs_f64() * 1e6 / 300_000.0;
+        println!("round {round}: Q3 {q3:.3} ms  Q4 {q4:.3} ms  Q7 {q7:.3} ms  Q5 {q5:.3} us/call  W1 {w1:.3} us/call");
     }
     drop(sql); let _ = std::fs::remove_dir_all(&dir);
 }

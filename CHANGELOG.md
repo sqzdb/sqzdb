@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.1 — 2026-10-17
+
+**Upgrade from 0.3.0:** any role allowed to run a `SELECT` could crash a 0.3.0 server by exhausting its
+memory with one expression (see Fixed).
+
+### Added
+- **`UPDATE` by any condition**, with `RETURNING`. An `UPDATE` that changes several rows changes all of
+  them or none, and a row is changed only if it still matches when it is written.
+
+### Changed
+- `UPDATE` returns how many rows it changed as a `changes` row, like `DELETE`; it returned no rows. In
+  Node, `run().changes` is that count. `UPDATE … WHERE <primary key> = ?` still fails with `NOT_FOUND`
+  for a missing row, and the message names the table and the key.
+
+### Fixed
+- **An expression could build a value big enough to exhaust the server's memory**, for example
+  `repeat(repeat('x', 1000000), 1000000)` or `replace()` with a long replacement, so any role allowed to
+  run a `SELECT` could crash a 0.3.0 server. A value an expression builds is now at most 1 MB, and a
+  `group_concat` result at most 16 MB; anything longer fails with `TYPE`.
+- The `demos/agents` server, which has no sign-in, accepted writes from any web page open in the same
+  browser. It now refuses writes from other origins and, while it listens on loopback, requests for
+  another host name (DNS rebinding).
+
 ## 0.3.0 — 2026-10-17
 
 **Upgrade if you delete rows inside transactions.** Versions 0.1.0 and 0.2.0 replayed a transaction's

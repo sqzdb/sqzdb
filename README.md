@@ -109,7 +109,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.3.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.3.1` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -553,7 +553,10 @@ token = "${DB_TOKEN}"
   `RETURNING`.
 - Upserts: `ON CONFLICT (col) DO NOTHING`, `ON CONFLICT (col) DO UPDATE SET … [WHERE …]` with
   `excluded.col`, `INSERT OR IGNORE`, `INSERT OR REPLACE` and `REPLACE INTO`.
-- `UPDATE … SET col = expression WHERE id = ?` by primary key, and `DELETE … WHERE` any condition.
+- `UPDATE … SET col = expression WHERE` any condition, with `RETURNING`, and `DELETE … WHERE` any
+  condition. Both return how many rows changed (`changes`), and a statement that changes several rows
+  changes all of them or none. `UPDATE … WHERE <primary key> = ?` fails with `NOT_FOUND` when the row
+  doesn't exist.
 - `BEGIN`, `COMMIT`, `ROLLBACK`. Inside a transaction, a lookup by primary key sees the transaction's own
   writes. Any other read of a table the transaction has already written is refused with `TRANSACTION`,
   because reads see committed data only: read before writing, or commit first.
@@ -568,12 +571,11 @@ token = "${DB_TOKEN}"
 - `TIMESTAMP` literals as text: `'2026-10-15'`, `'2026-10-15 19:30:00'`, `'2026-10-15T19:30:00.123Z'`.
 - `UUID` literals as text, with or without hyphens.
 
-**Not supported yet:** `UPDATE` by anything other than the primary key, `UPDATE … RETURNING`, `RIGHT`
-and `FULL` joins, `WITH`, `UNION`, window functions, subqueries in `FROM`, correlated subqueries on text
+**Not supported yet:** `UPDATE … FROM`, `DELETE … RETURNING`, `RIGHT` and `FULL` joins, `WITH`, `UNION`, window functions, subqueries in `FROM`, correlated subqueries on text
 columns, `DISTINCT ON`, `NULLS FIRST` and `NULLS LAST`, variable-length text (every text column has a
 maximum, at most 65,535 bytes), `CHECK` constraints, generated columns, a second `UNIQUE` column,
 composite primary keys, multi-column indexes, `DELETE … LIMIT`, savepoints, `DROP TABLE`, views and
-triggers. A correlated `IN (subquery)` can't be keyed on a UUID column; use `EXISTS` or a join. A table
+triggers. A value an expression builds is at most 1 MB (`group_concat`: 16 MB). A correlated `IN (subquery)` can't be keyed on a UUID column; use `EXISTS` or a join. A table
 holds at most 16.7 million rows.
 
 Anything not supported is refused with `SYNTAX` ("unsupported: … is not implemented yet"); nothing is
@@ -663,7 +665,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.3.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.3.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

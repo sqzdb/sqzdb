@@ -143,7 +143,11 @@ pub fn open(path: String, options: Option<String>) -> Result<Db> {
     #[napi] pub fn run(&self, stmt: &Stmt, args: Vec<JsUnknown>) -> Result<f64> {
         let vals = params(args)?; let mut s = self.s.lock().unwrap(); let before = s.last_seq;
         let rows = self.sql()?.execute_s(&mut s, &stmt.p, &vals).map_err(err)?;
-        if stmt.kind == 3 { return Ok(-(rows.first().and_then(|r| r.first()).map(|v| if let Value::Int(n) = v { *n as f64 } else { 0.0 }).unwrap_or(0.0)) - 1.0); }
+        // DELETE and UPDATE report how many rows changed (an UPDATE … RETURNING returns one row per changed row)
+        if stmt.kind == 3 || stmt.kind == 2 {
+            let n = if matches!(&stmt.p.plan, sql::Plan::Update { returning: Some(_), .. }) { rows.len() as f64 } else { rows.first().and_then(|r| r.first()).map(|v| if let Value::Int(n) = v { *n as f64 } else { 0.0 }).unwrap_or(0.0) };
+            return Ok(-n - 1.0);
+        }
         Ok(if s.last_seq != before { s.last_seq as f64 } else { 0.0 })
     }
     /// The rows of a SELECT as one packed frame (see `pack`); index.js turns it into objects.

@@ -47,6 +47,9 @@ enum GenOut { Key(usize), Agg { f: GenFn, arg: Option<usize>, distinct: bool, se
 /// Grouping over decoded rows: the first `nkeys` values of each raw row are the group key.
 struct GenAgg { nkeys: usize, outs: Vec<GenOut> }
 #[derive(Default)] struct GState { n: i64, sum_i: i64, sum_f: f64, float: bool, ovf: bool, best: Option<Value>, seen: Option<std::collections::HashSet<Vec<u8>>>, text: String }
+/// The longest `group_concat` / `string_agg` result: more than a scalar expression may build (`expr::MAX_VALUE`), since
+/// it gathers many rows, but bounded so one query can't take the server's memory.
+const CONCAT_MAX: usize = 16 << 20;
 const SUM_OVERFLOW: &str = "sum(): the total does not fit a 64-bit integer";
 /// A value's identity for grouping and DISTINCT: integral floats count as the integer, -0.0 as 0.0.
 fn canon(v: &Value, out: &mut Vec<u8>) {
@@ -89,7 +92,8 @@ impl GenAgg {
                 st.n += 1;
                 match f {
                     GenFn::Count => {}
-                    GenFn::Concat => { if st.n > 1 { st.text.push_str(sep); } match v { Value::Bytes(_) => st.text.push_str("?"), v => st.text.push_str(&crate::expr::num_text(v)) } }
+                    GenFn::Concat => { if st.n > 1 { st.text.push_str(sep); } match v { Value::Bytes(_) => st.text.push_str("?"), v => st.text.push_str(&crate::expr::num_text(v)) }
+                        if st.text.len() > CONCAT_MAX { return Err(format!("group_concat(): the result is over the {CONCAT_MAX}-byte limit for a value")); } }
                     GenFn::Sum | GenFn::Avg => match v {
                         Value::Int(i) => { match st.sum_i.checked_add(*i) { Some(t) => st.sum_i = t, None => st.ovf = true } st.sum_f += *i as f64; }
                         Value::Bool(b) => { st.sum_i += *b as i64; st.sum_f += *b as i64 as f64; }
@@ -178,6 +182,16 @@ fn literal_name(id: &ast::Ident) -> Result<(), String> {
     if id.quote_style.is_none() && ["true", "false", "null"].contains(&id.value.to_lowercase().as_str()) { return Err(format!("a column can't be named {} without quotes; write \"{}\"", id.value, id.value)); }
     Ok(())
 }
+/// The columns of a RETURNING list: names and `*`.
+fn returning_cols(items: &[SelectItem], schema: &Schema) -> Result<Vec<usize>, String> {
+    let mut cols = vec![];
+    for it in items { match it {
+        SelectItem::Wildcard(_) => cols.extend(0..schema.columns.len()),
+        SelectItem::UnnamedExpr(e) => { let n = match e { ast::Expr::Identifier(id) => id.value.clone(), ast::Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.clone()).unwrap_or_default(), other => return Err(format!("RETURNING supports column names and * (got {other})")) }; cols.push(schema.col(&n).ok_or(format!("no such column {n}"))?); }
+        other => return Err(format!("RETURNING supports column names and * (got {other})")),
+    } }
+    Ok(cols)
+}
 fn col_eq(srcs: &[Src], e: &ast::Expr) -> Option<(usize, usize, usize, usize)> {
     let ast::Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = e else { return None };
     match (jcol(srcs, left).ok().flatten(), jcol(srcs, right).ok().flatten()) { (Some((a, ca)), Some((b, cb))) if a != b => Some((a, ca, b, cb)), _ => None }
@@ -205,7 +219,7 @@ fn int_lit(e: &ast::Expr) -> Option<i64> { if let ast::Expr::Value(v) = e { if l
 /// An expression's text for matching ORDER BY or HAVING items against the select list.
 fn norm_sql(e: &ast::Expr) -> String { e.to_string().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ") }
 pub enum Plan { /// the table, and whether IF NOT EXISTS was given
-    CreateTable(Schema, bool), Insert { table: Arc<Table>, rows: Vec<Vec<Expr>>, returning: Option<Vec<usize>>, from: Option<InsertFrom>, conflict: Conflict }, Select(SelectPlan), Update { table: Arc<Table>, sets: Vec<(usize, SetVal)>, pk: Expr }, Delete { table: Arc<Table>, access: Access, preds: Vec<Pred>, filters: Vec<SExpr> }, Begin, Commit, Rollback, Alter { table: String, ops: Vec<AlterOp> },
+    CreateTable(Schema, bool), Insert { table: Arc<Table>, rows: Vec<Vec<Expr>>, returning: Option<Vec<usize>>, from: Option<InsertFrom>, conflict: Conflict }, Select(SelectPlan), Update { table: Arc<Table>, sets: Vec<(usize, SetVal)>, at: UpdWhere, returning: Option<Vec<usize>> }, Delete { table: Arc<Table>, access: Access, preds: Vec<Pred>, filters: Vec<SExpr> }, Begin, Commit, Rollback, Alter { table: String, ops: Vec<AlterOp> },
     /// SELECT without FROM: one row of expressions
     Const { exprs: Vec<SExpr>, names: Vec<String> } }
 /// INSERT … SELECT: the query, the destination column of each of its output columns, and for every other column
@@ -216,6 +230,8 @@ pub struct InsertFrom { pub plan: Box<Plan>, pub targets: Vec<usize>, pub fill: 
 pub enum Conflict { None, Nothing(Option<usize>), Update { target: usize, sets: Vec<(usize, SExpr)>, cond: Option<SExpr> }, Replace }
 /// An UPDATE's new value: a value known before the row is read, or an expression over the row's current values.
 #[derive(Clone, Debug)] pub enum SetVal { Value(Expr), Row(SExpr) }
+/// The rows an UPDATE changes: one by primary key (NOT_FOUND when it is missing), or every row a condition selects.
+#[derive(Clone)] pub enum UpdWhere { Pk(Expr), Rows { access: Access, preds: Vec<Pred>, filters: Vec<SExpr> } }
 #[derive(Clone, Debug)] pub enum AlterOp { Add { col: Column, default: Value }, Drop(String), Rename(String, String), SetType(String, ColType), SetNotNull(String), DropNotNull(String) }
 pub struct Prepared { pub plan: Plan, pub nparams: usize, pub text: String, pub epoch: u64 }
 #[derive(Default)] pub struct Session { pub txn: Option<Txn>, pub user: Option<String>, pub roles: Vec<String>, pub attrs: HashMap<String, Value>,
@@ -346,7 +362,7 @@ pub fn error_code(msg: &str) -> &'static str {
     else if m.starts_with("already in a transaction") || m.starts_with("not in a transaction") { "TRANSACTION" }
     else if m.contains("can't be named ") { "SYNTAX" }
     // a value of the wrong type for an operator or function, or arithmetic out of range (PostgreSQL's "data exception")
-    else if m.contains("division by zero") || m.contains("integer overflow") || m.contains("does not fit a 64-bit integer") || m.contains("() needs ") || m.contains("() takes numbers")
+    else if m.contains("-byte limit for a value") || m.contains("division by zero") || m.contains("integer overflow") || m.contains("does not fit a 64-bit integer") || m.contains("() needs ") || m.contains("() takes numbers")
         || m.contains("): not a number") || m.starts_with("LIKE needs") || m.starts_with("|| needs") || m.starts_with("-> needs") || m.starts_with("a date needs") || m.starts_with("cannot cast")
         || m.starts_with("cannot compare") || m.starts_with("cannot apply") || m.starts_with("cannot negate") || m.starts_with("a condition must be BOOLEAN") || m.contains("of a negative number") { "TYPE" }
     else if m.contains("type mismatch") || m.contains(" exceeds ") || m.contains("is NOT NULL") || (m.starts_with("expected ") && m.contains(", got ")) || m.contains(": expected ") || m.contains("not a timestamp") || m.contains("not a UUID") || m.contains("expected a UUID") { "TYPE" }
@@ -824,20 +840,12 @@ impl<'a> Planner<'a> {
                     }
                     rows.push(exprs.into_iter().enumerate().map(|(i, e)| match e { Some(e) => Ok(e), None => fill(i) }).collect::<Result<Vec<_>, _>>()?);
                 }
-                let returning = match &ins.returning {
-                    None => None,
-                    Some(items) => { let mut cols = vec![]; for it in items { match it {
-                        SelectItem::Wildcard(_) => cols.extend(0..ncols),
-                        SelectItem::UnnamedExpr(e) => { let n = match e { ast::Expr::Identifier(id) => id.value.clone(), ast::Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.clone()).unwrap_or_default(), other => return Err(format!("RETURNING supports column names and * (got {other})")) }; cols.push(schema.col(&n).ok_or(format!("no such column {n}"))?); }
-                        other => return Err(format!("RETURNING supports column names and * (got {other})")),
-                    } } Some(cols) }
-                };
+                let returning = ins.returning.as_ref().map(|items| returning_cols(items, &schema)).transpose()?;
                 Ok(Plan::Insert { table, rows, returning, from, conflict })
             }
             Statement::Query(q) => self.plan_query(q),
             Statement::Delete(d) => self.plan_delete(d),
             Statement::Update(u) => {
-                if u.returning.is_some() { return Err(unsup("UPDATE … RETURNING")); }
                 if u.from.is_some() || !u.table.joins.is_empty() { return Err(unsup("UPDATE … FROM another table")); }
                 if u.or.is_some() || u.output.is_some() || !u.order_by.is_empty() || u.limit.is_some() { return Err(unsup("UPDATE OR …, OUTPUT, ORDER BY or LIMIT")); }
                 check_table(&u.table.relation)?;
@@ -852,10 +860,11 @@ impl<'a> Planner<'a> {
                     let v = if simple { SetVal::Value(self.expr(&a.value)?) } else { let x = self.row_sexpr(&a.value, &srcs, &mut |_, c| c, &types)?; let x = if schema.columns[c].ty == ColType::Timestamp { coerce(x, &SExpr::Lit(Value::Int(0)), &|_| None)? } else { x }; SetVal::Row(x) };
                     sets.push((c, v));
                 }
-                let mut preds = vec![vec![]];
-                if let Some(w) = &u.selection { let mut cj = vec![]; conjuncts(w, &mut cj); for c in cj { self.classify(&srcs, c, &mut preds, &mut vec![])?; } }
-                if preds[0].len() != 1 || preds[0][0].col != schema.pk || preds[0][0].cmp != Cmp::Eq { return Err(unsup("UPDATE by anything other than WHERE <primary key> = <value>")); }
-                Ok(Plan::Update { table, sets, pk: preds[0].pop().unwrap().rhs })
+                let returning = u.returning.as_ref().map(|items| returning_cols(items, &schema)).transpose()?;
+                let (mut preds, filters) = self.plan_where(&srcs, u.selection.as_ref(), &types)?;
+                let at = if filters.is_empty() && preds.len() == 1 && preds[0].col == schema.pk && preds[0].cmp == Cmp::Eq { UpdWhere::Pk(preds.pop().unwrap().rhs) }
+                    else { let access = access_path(&table, &mut preds); UpdWhere::Rows { access, preds, filters } };
+                Ok(Plan::Update { table, sets, at, returning })
             }
             Statement::AlterTable(at) => {
                 let mut ops = vec![];
@@ -1221,15 +1230,19 @@ impl<'a> Planner<'a> {
         let twj = match &d.from { ast::FromTable::WithFromKeyword(v) | ast::FromTable::WithoutKeyword(v) => { if v.len() > 1 || v.first().map(|t| !t.joins.is_empty()).unwrap_or(false) { return Err(unsup("DELETE from several tables")); } v.first().ok_or("DELETE needs FROM")? } };
         check_table(&twj.relation)?;
         let src = self.table_src(&twj.relation)?; let table = src.table.clone(); let srcs = vec![src];
-        let mut preds = vec![vec![]]; let mut filters = vec![];
         let types: std::cell::RefCell<HashMap<usize, ColType>> = Default::default();
-        if let Some(w) = &d.selection { let mut cj = vec![]; conjuncts(w, &mut cj); for c in cj {
-            let mut p2 = preds.clone();
-            match self.classify(&srcs, c, &mut p2, &mut vec![]) { Ok(()) => preds = p2, Err(e1) => match self.row_sexpr(c, &srcs, &mut |_, c| c, &types) { Ok(x) => filters.push(x), Err(e2) => return Err(if e1.contains("correlat") || e1.contains("outer") { e1 } else { e2 }) } }
-        } }
-        let mut preds = preds.pop().unwrap();
+        let (mut preds, filters) = self.plan_where(&srcs, d.selection.as_ref(), &types)?;
         let access = access_path(&table, &mut preds);
         Ok(Plan::Delete { table, access, preds, filters })
+    }
+    /// The WHERE of a one-table write: compiled predicates where they apply, the other conditions as expressions.
+    fn plan_where(&mut self, srcs: &[Src], w: Option<&ast::Expr>, types: &std::cell::RefCell<HashMap<usize, ColType>>) -> Result<(Vec<Pred>, Vec<SExpr>), String> {
+        let mut preds = vec![vec![]]; let mut filters = vec![];
+        if let Some(w) = w { let mut cj = vec![]; conjuncts(w, &mut cj); for c in cj {
+            let mut p2 = preds.clone();
+            match self.classify(srcs, c, &mut p2, &mut vec![]) { Ok(()) => preds = p2, Err(e1) => match self.row_sexpr(c, srcs, &mut |_, c| c, types) { Ok(x) => filters.push(x), Err(e2) => return Err(if e1.contains("correlat") || e1.contains("outer") { e1 } else { e2 }) } }
+        } }
+        Ok((preds.pop().unwrap(), filters))
     }
 }
 /// Pick the single-table access path and remove the predicates it absorbs.
@@ -1740,7 +1753,8 @@ impl Sql {
                 let ty = match pr { Proj::Expr(k) => s.exprs[*k].ty(&|v| s.schema.columns.get(v).map(|c| c.ty.clone())), pr => proj_type(pr, &s.schema) };
                 (name, ty)
             }).collect(),
-            Plan::Delete { .. } => vec![("changes".to_string(), Some(ColType::Int))],
+            Plan::Delete { .. } | Plan::Update { returning: None, .. } => vec![("changes".to_string(), Some(ColType::Int))],
+            Plan::Update { table, returning: Some(cols), .. } => cols.iter().map(|&c| (table.schema.columns[c].name.clone(), Some(table.schema.columns[c].ty.clone()))).collect(),
             Plan::Insert { table, returning: Some(cols), .. } => cols.iter().map(|&c| (table.schema.columns[c].name.clone(), Some(table.schema.columns[c].ty.clone()))).collect(),
             _ => vec![],
         }
@@ -2054,18 +2068,49 @@ impl Sql {
                 sess.last_insert_id = last_id; if let Some(k) = last_key { sess.last_insert_key = Some(k); }
                 Ok(match returning { None => vec![], Some(cols) => encoded.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() })
             }
-            Plan::Update { table, sets, pk } => {
-                if let Some(t) = &sess.txn { let mut read = vec![]; for (_, v) in sets { match v { SetVal::Value(e) => expr_tables(e, &mut read), SetVal::Row(x) => sexpr_tables(x, &mut read) } } expr_tables(pk, &mut read); if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); } }
+            Plan::Update { table, sets, at, returning } => {
+                if let Some(t) = &sess.txn {
+                    // by primary key an update reads through the transaction; any other condition reads committed rows only
+                    let mut read = vec![]; for (_, v) in sets { match v { SetVal::Value(e) => expr_tables(e, &mut read), SetVal::Row(x) => sexpr_tables(x, &mut read) } }
+                    match at { UpdWhere::Pk(e) => expr_tables(e, &mut read), UpdWhere::Rows { access, preds, filters } => { if !matches!(access, Access::Pk(_)) { read.push(table.clone()); } for p in preds { expr_tables(&p.rhs, &mut read); } for x in filters { sexpr_tables(x, &mut read); } } }
+                    if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); }
+                }
                 let policy = self.guard(sess, table, P_UPDATE)?;
-                let pk = table.schema.key_from_value(&self.resolve(sess, pk, params)?)?;
                 let schema = &table.schema;
                 let vals = sets.iter().filter_map(|(c, v)| if let SetVal::Value(e) = v { Some(self.resolve(sess, e, params).map(|v| (*c, v))) } else { None }).collect::<Result<Vec<_>, _>>()?;
                 let rowx: Vec<(usize, SExpr)> = if !sets.iter().any(|(_, v)| matches!(v, SetVal::Row(_))) { vec![] } else { let xs: Vec<(usize, SExpr)> = sets.iter().filter_map(|(c, v)| if let SetVal::Row(x) = v { Some((*c, x.clone())) } else { None }).collect(); let bound = self.bind(sess, &xs.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?; xs.into_iter().map(|(c, _)| c).zip(bound).collect() };
-                let f = |row: &[u8]| -> Result<Vec<u8>, Abort> { for p in &policy { if !p.eval(row) { return Err(Abort::NotFound); } } let mut new = row.to_vec(); for (c, v) in &vals { encode_col(schema, &mut new, *c, v).map_err(Abort::Type)?; }
-                    // every SET expression reads the row as it was before this UPDATE
+                // the new row: every SET expression reads the row as it was before this UPDATE
+                let make = |row: &[u8]| -> Result<Vec<u8>, Abort> { let mut new = row.to_vec(); for (c, v) in &vals { encode_col(schema, &mut new, *c, v).map_err(Abort::Type)?; }
                     for (c, x) in &rowx { let v = x.eval(&|k| decode_col(schema, row, k)).map_err(Abort::Type)?; encode_col(schema, &mut new, *c, &v).map_err(Abort::Type)?; } for p in &policy { if !p.eval(&new) { return Err(Abort::Type("permission denied: new row violates a policy".into())); } } Ok(new) };
-                match &mut sess.txn { Some(t) => { table.txn_update(t, pk, f).map_err(|a| a.to_string())?; } None => { sess.last_seq = table.update_by_pk(pk, f).map_err(|a| a.to_string())?; } }
-                Ok(vec![])
+                let mut changed: Vec<Vec<u8>> = vec![];
+                match at {
+                    UpdWhere::Pk(e) => {
+                        let kv = self.resolve(sess, e, params)?; let pk = table.schema.key_from_value(&kv)?;
+                        let missing = |a: Abort| if matches!(a, Abort::NotFound) { format!("NotFound: no row in {} has {} = {}", schema.name, schema.columns[schema.pk].name, crate::expr::num_text(&kv)) } else { a.to_string() };
+                        let f = |row: &[u8]| -> Result<Vec<u8>, Abort> { for p in &policy { if !p.eval(row) { return Err(Abort::NotFound); } } let new = make(row)?; if returning.is_some() { changed.push(new.clone()); } Ok(new) };
+                        match &mut sess.txn { Some(t) => { table.txn_update(t, pk, f).map_err(missing)?; } None => { sess.last_seq = table.update_by_pk(pk, f).map_err(missing)?; } }
+                        if returning.is_none() { return Ok(vec![vec![Value::Int(1)]]); }
+                    }
+                    UpdWhere::Rows { access, preds, filters } => {
+                        let mut cp = preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?; cp.append(&mut self.guard(sess, table, P_UPDATE)?);
+                        let filters = self.bind(sess, filters, params)?;
+                        let pks = self.matching_keys(sess, table, access, &cp, &filters, params)?;
+                        // a row is changed only if it still matches when it is updated (a concurrent writer may have changed it since)
+                        let still = |row: &[u8]| -> Result<bool, Abort> { if !cp.iter().all(|p| p.eval(row)) { return Ok(false); } for f in &filters { if crate::expr::truth(&f.eval(&|c| decode_col(schema, row, c)).map_err(Abort::Type)?).map_err(Abort::Type)? != Some(true) { return Ok(false); } } Ok(true) };
+                        let mut n = 0i64;
+                        let mut one = |t: &mut Txn, pk: crate::table::Key, changed: &mut Vec<Vec<u8>>| -> Result<(), String> {
+                            match table.txn_update(t, pk, |row| { if !still(row)? { return Err(Abort::NotFound); } let new = make(row)?; if returning.is_some() { changed.push(new.clone()); } Ok(new) }) { Ok(()) => { n += 1; Ok(()) } Err(Abort::NotFound) => Ok(()), Err(a) => Err(a.to_string()) }
+                        };
+                        match &mut sess.txn {
+                            Some(t) => { for pk in pks { one(t, pk, &mut changed)?; } }
+                            // all or none: several rows commit as one transaction
+                            None => { let mut t = Txn::new(); for pk in pks { one(&mut t, pk, &mut changed)?; } if !t.writes.is_empty() { sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; } }
+                        }
+                        if returning.is_none() { return Ok(vec![vec![Value::Int(n)]]); }
+                    }
+                }
+                let cols = returning.as_ref().unwrap();
+                Ok(changed.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect())
             }
             Plan::Delete { table, access, preds, filters } => {
                 if let Some(t) = &sess.txn {
@@ -2076,22 +2121,8 @@ impl Sql {
                 let mut policy = self.guard(sess, table, P_DELETE)?;
                 let schema = &table.schema;
                 let mut cp = preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?; cp.append(&mut policy);
-                let pk_off = schema.offsets[schema.pk];
-                let mut pks: Vec<crate::table::Key> = vec![]; let _ = pk_off;
-                let filters = self.bind(sess, filters, params)?; let mut ferr: Option<String> = None;
-                let mut collect = |row: &[u8]| -> bool {
-                    for p in &cp { if !p.eval(row) { return true; } }
-                    for f in &filters { match f.eval(&|c| decode_col(schema, row, c)).and_then(|v| crate::expr::truth(&v)) { Ok(Some(true)) => {} Ok(_) => return true, Err(e) => { ferr.get_or_insert(e); return false; } } }
-                    pks.push(schema.key_of(row)); true
-                };
-                match access {
-                    Access::Pk(e) => { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; match &mut sess.txn { Some(t) => { if let Some(r) = table.txn_get(t, pk) { collect(&r); } } None => { table.with_pk(pk, |r| collect(r)); } } }
-                    Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; table.with_unique(&key, |r| collect(r)); }
-                    Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } table.range(a, b, &mut collect); }
-                    Access::Index(ix, e) => { let k = index_key(schema, ix.col, &self.resolve(sess, e, params)?)?; table.index_lookup(ix, k, &mut collect); }
-                    Access::Scan => table.scan(&mut collect),
-                }
-                if let Some(e) = ferr { return Err(e); }
+                let filters = self.bind(sess, filters, params)?;
+                let pks = self.matching_keys(sess, table, access, &cp, &filters, params)?;
                 let n = pks.len();
                 match &mut sess.txn {
                     Some(t) => { for pk in pks { table.txn_delete(t, pk).map_err(|a| a.to_string())?; } }
@@ -2174,6 +2205,25 @@ impl Sql {
             Access::Scan => t.scan(visit),
         }
         Ok(())
+    }
+    /// The keys of the rows a one-table write's WHERE selects: through its access path, then its compiled predicates
+    /// (row policies included) and expression conditions. Inside a transaction a lookup by key sees its own writes.
+    fn matching_keys(&self, sess: &mut Session, table: &Arc<Table>, access: &Access, cp: &[CPred], filters: &[SExpr], params: &[Value]) -> Result<Vec<crate::table::Key>, String> {
+        let schema = &table.schema;
+        let mut pks: Vec<crate::table::Key> = vec![]; let mut ferr: Option<String> = None;
+        let mut collect = |row: &[u8]| -> bool {
+            for p in cp { if !p.eval(row) { return true; } }
+            for f in filters { match f.eval(&|c| decode_col(schema, row, c)).and_then(|v| crate::expr::truth(&v)) { Ok(Some(true)) => {} Ok(_) => return true, Err(e) => { ferr.get_or_insert(e); return false; } } }
+            pks.push(schema.key_of(row)); true
+        };
+        match access {
+            Access::Pk(e) => { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; match &mut sess.txn { Some(t) => { if let Some(r) = table.txn_get(t, pk) { collect(&r); } } None => { table.with_pk(pk, |r| collect(r)); } } }
+            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; table.with_unique(&key, |r| collect(r)); }
+            Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } table.range(a, b, &mut collect); }
+            Access::Index(ix, e) => { let k = index_key(schema, ix.col, &self.resolve(sess, e, params)?)?; table.index_lookup(ix, k, &mut collect); }
+            Access::Scan => table.scan(&mut collect),
+        }
+        match ferr { Some(e) => Err(e), None => Ok(pks) }
     }
     /// HAVING, DISTINCT, ORDER BY, OFFSET and LIMIT over the scan's rows (see `Post`).
     #[inline(never)] fn post(&self, sess: &Session, p: &Post, rows: Vec<Vec<Value>>, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
@@ -2642,7 +2692,7 @@ mod gen_tests {
         assert_eq!(err("INSERT INTO notes (body, tag) VALUES ('a', 'b'), ('c')"), "INSERT names 2 columns (body, tag) but row 2 of VALUES gives 1 value");
         assert_eq!(error_code(&err("INSERT INTO notes (body) VALUES ('a', 'b')")), "SYNTAX");
         for (sql, code) in [("SELECT 1 / 0", "TYPE"), ("SELECT 9223372036854775807 + 1", "TYPE"), ("SELECT sum(body) FROM notes", "TYPE"), ("SELECT upper(5)", "TYPE"), ("SELECT 'a' LIKE 5", "TYPE"),
-                            ("SELECT sqrt(-1)", "TYPE"), ("CREATE TABLE q (id INT PRIMARY KEY, true INT)", "SYNTAX"), ("UPDATE notes SET body = 'x' WHERE tag = 'a'", "SYNTAX"), ("SELECT nosuch FROM notes", "SCHEMA")] {
+                            ("SELECT sqrt(-1)", "TYPE"), ("CREATE TABLE q (id INT PRIMARY KEY, true INT)", "SYNTAX"), ("UPDATE notes SET body = 'x' FROM people WHERE notes.body = people.name", "SYNTAX"), ("SELECT nosuch FROM notes", "SCHEMA")] {
             assert_eq!(error_code(&err(sql)), code, "{sql}: {}", err(sql));
         }
         drop(s); std::fs::remove_dir_all(&d).unwrap();
@@ -3029,7 +3079,7 @@ mod unsupported_tests {
             "CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)", "CREATE TABLE b (id INTEGER PRIMARY KEY, s VARCHAR(100000))",
             "CREATE TABLE u (id INTEGER PRIMARY KEY, a VARCHAR(10) UNIQUE, b VARCHAR(10) UNIQUE)", "CREATE TABLE u (id INTEGER PRIMARY KEY, a INT, b INT, UNIQUE (a, b))",
             "CREATE TABLE cp (a INT, b INT, PRIMARY KEY (a, b))", "CREATE TABLE n (id INTEGER PRIMARY KEY, s VARCHAR(10) COLLATE NOCASE)", "CREATE TEMPORARY TABLE tt (id INTEGER PRIMARY KEY)",
-            "UPDATE users SET age = 31 WHERE id = 1 RETURNING age", "DELETE FROM users WHERE grp = 1 LIMIT 1", "DELETE FROM users WHERE id = 1 RETURNING id",
+            "UPDATE users SET age = 31 FROM orders WHERE users.id = orders.user_id", "DELETE FROM users WHERE grp = 1 LIMIT 1", "DELETE FROM users WHERE id = 1 RETURNING id",
             "INSERT INTO users VALUES (1, 'x', 1, 1) ON DUPLICATE KEY UPDATE age = 1", "INSERT INTO users (id, name) VALUES (9, 'x') ON CONFLICT (name, age) DO NOTHING",
         ] {
             let e = s.exec_s(&mut Session::default(), q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}"));
@@ -3093,6 +3143,18 @@ mod expression_tests {
             s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
         }
         (s, d)
+    }
+    #[test] fn expressions_cannot_build_huge_values() {
+        let (s, d) = db("huge");
+        let q = |sql: &str| s.exec_s(&mut Session::default(), sql, &[]);
+        let t = std::time::Instant::now();
+        for bad in ["SELECT repeat(repeat('x', 1000000), 1000000)", "SELECT length(repeat('abc', 1000000))", "SELECT replace(repeat('a', 100000), 'a', repeat('b', 100))",
+                    "SELECT repeat('x', 600000) || repeat('y', 600000)", "SELECT concat(repeat('x', 600000), repeat('y', 600000))", "SELECT upper(repeat(repeat('x', 1000), 2000))"] {
+            let e = q(bad).unwrap_err(); assert!(e.contains("limit for a value"), "{bad}: {e}"); assert_eq!(error_code(&e), "TYPE");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "refused before allocating: {:?}", t.elapsed());
+        assert_eq!(q("SELECT length(repeat('ab', 500000)), replace('aaa', 'a', 'bb'), length(repeat('x', 1000) || 'y')").unwrap()[0], vec![Value::Int(1_000_000), Value::Text("bbbbbb".into()), Value::Int(1001)]);
+        drop(s); let _ = std::fs::remove_dir_all(&d);
     }
     #[test] fn aggregates_keep_their_types() {
         let (s, d) = db("aggtypes");
@@ -3214,6 +3276,56 @@ mod insert_tests {
         for q in ["BEGIN", "INSERT INTO kv (k, email, n) VALUES (50, 'e@x', 1)", "INSERT INTO kv (k, email, n) VALUES (50, 'e@x', 1) ON CONFLICT (k) DO UPDATE SET n = kv.n + 1", "COMMIT"] { s.exec_s(&mut se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
         assert_eq!(rows(&s, "SELECT n FROM kv WHERE k = 50")[0][0], Value::Int(2));
         assert!(s.exec_s(&mut Session::default(), "INSERT INTO kv (k, email) VALUES (60, 'f@x') ON CONFLICT DO UPDATE SET n = 1", &[]).is_err(), "DO UPDATE needs a target");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn updates_by_any_condition() {
+        let (s, d) = db("upd");
+        let err = |q: &str| s.exec_s(&mut Session::default(), q, &[]).unwrap_err();
+        let i = |v: i64| Value::Int(v);
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (3, 'c@x', 3), (4, 'dd@y', 4), (5, NULL, 5)");
+        // any condition, compiled or an expression; the result is the number of changed rows
+        assert_eq!(rows(&s, "UPDATE kv SET n = n * 10 WHERE n >= 3"), vec![vec![i(3)]]);
+        assert_eq!(rows(&s, "UPDATE kv SET n = n + 1 WHERE email LIKE '%@y' OR email IS NULL"), vec![vec![i(2)]]);
+        assert_eq!(rows(&s, "SELECT k, n FROM kv ORDER BY k"), vec![vec![i(1), i(1)], vec![i(2), i(2)], vec![i(3), i(30)], vec![i(4), i(41)], vec![i(5), i(51)]]);
+        assert_eq!(rows(&s, "UPDATE kv SET n = 0 WHERE n > 1000"), vec![vec![i(0)]], "no matching row is not an error");
+        // by primary key: one row, or NOT_FOUND as before
+        assert_eq!(rows(&s, "UPDATE kv SET n = 7 WHERE k = 1"), vec![vec![i(1)]]);
+        assert_eq!(err("UPDATE kv SET n = 7 WHERE k = 99"), "NotFound: no row in kv has k = 99"); assert_eq!(error_code(&err("UPDATE kv SET n = 7 WHERE k = 99")), "NOT_FOUND");
+        assert_eq!(rows(&s, "UPDATE kv SET n = 8 WHERE k = 99 OR k = 98"), vec![vec![i(0)]]);
+        // RETURNING the new rows
+        let mut r = rows(&s, "UPDATE kv SET n = n + 1 WHERE k >= 4 RETURNING k, n"); r.sort_by_key(|x| format!("{:?}", x[0]));
+        assert_eq!(r, vec![vec![i(4), i(42)], vec![i(5), i(52)]]);
+        assert_eq!(rows(&s, "UPDATE kv SET email = 'z@x' WHERE k = 2 RETURNING *")[0][1], Value::Text("z@x".into()));
+        assert!(rows(&s, "UPDATE kv SET n = 0 WHERE k = 1 AND n > 100 RETURNING k").is_empty());
+        // all or none: the second row would take a UNIQUE value another row holds
+        assert!(err("UPDATE kv SET email = 'c@x' WHERE k IN (4, 5)").contains("Duplicate"));
+        assert_eq!(rows(&s, "SELECT email FROM kv WHERE k = 4"), vec![vec![Value::Text("dd@y".into())]]);
+        // one statement can swap two rows' UNIQUE values
+        rows(&s, "UPDATE kv SET email = CASE WHEN k = 1 THEN 'c@x' ELSE 'a@x' END WHERE k = 1 OR k = 3");
+        assert_eq!(rows(&s, "SELECT k FROM kv WHERE email = 'a@x'"), vec![vec![i(3)]]);
+        // an index on the updated column follows; each row is updated once (the rows are chosen before any changes)
+        rows(&s, "CREATE INDEX kv_n ON kv (n)");
+        assert_eq!(rows(&s, "UPDATE kv SET n = n + 100 WHERE n < 100"), vec![vec![i(5)]]);
+        assert_eq!(rows(&s, "SELECT count(*) FROM kv WHERE n = 107"), vec![vec![i(1)]]);
+        assert_eq!(rows(&s, "UPDATE kv SET n = 0 WHERE n = 107"), vec![vec![i(1)]]);
+        assert!(rows(&s, "SELECT k FROM kv WHERE n = 107").is_empty());
+        // in a transaction: rows chosen from committed data until the transaction writes the table
+        let mut se = Session::default();
+        for q in ["BEGIN", "UPDATE kv SET n = 1 WHERE n >= 100"] { s.exec_s(&mut se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
+        assert_eq!(error_code(&s.exec_s(&mut se, "UPDATE kv SET n = 2 WHERE n = 1", &[]).unwrap_err()), "TRANSACTION");
+        s.exec_s(&mut se, "COMMIT", &[]).unwrap();
+        assert_eq!(rows(&s, "SELECT count(*) FROM kv WHERE n = 1"), vec![vec![i(4)]]);
+        // a row policy limits which rows an UPDATE reaches, and what they may become
+        rows(&s, "CREATE ROLE owner"); rows(&s, "GRANT SELECT, UPDATE ON kv TO owner"); rows(&s, "CREATE POLICY mine ON kv FOR ALL TO owner USING (k = SESSION.k)");
+        let mut o = Session::default(); s.assume(&mut o, &["owner".into()], [("k".to_string(), i(4))].into_iter().collect()).unwrap();
+        assert_eq!(s.exec_s(&mut o, "UPDATE kv SET n = 99 WHERE n = 1", &[]).unwrap(), vec![vec![i(1)]], "only the owner's row");
+        assert!(s.exec_s(&mut o, "UPDATE kv SET k = 5 WHERE n = 99", &[]).is_err(), "an UPDATE does not change the key");
+        assert_eq!(rows(&s, "SELECT k FROM kv WHERE n = 99"), vec![vec![i(4)]]);
+        // the changes are logged like any other update
+        drop(o); drop(se); drop(s);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        assert_eq!(rows(&s, "SELECT k, n, email FROM kv WHERE k = 4"), vec![vec![i(4), i(99), Value::Text("dd@y".into())]]);
+        assert_eq!(rows(&s, "SELECT k FROM kv WHERE email = 'a@x'"), vec![vec![i(3)]]);
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
     #[test] fn deletes_in_a_transaction_survive_a_restart() {

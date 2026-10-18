@@ -222,6 +222,21 @@ const QUERIES: &[&str] = &[
     "!DELETE FROM codes WHERE code = 'lm-metropolitan-region'",
     "!UPDATE codes SET label = 'Aaland' WHERE code = 'aa'",
     "SELECT code, label FROM codes ORDER BY code",
+    // UPDATE by any condition, then the rows it left
+    "!UPDATE users SET score = score * 2 WHERE grp = 1",
+    "SELECT name, score FROM users ORDER BY id",
+    "!UPDATE users SET city = upper(city), age = age + 1 WHERE name LIKE '%e%' AND city IS NOT NULL",
+    "SELECT name, age, city FROM users ORDER BY id",
+    "!UPDATE users SET score = CASE WHEN score IS NULL THEN 0 ELSE score + 1 END WHERE age > 30 OR age IS NULL",
+    "SELECT name, score FROM users ORDER BY id",
+    "!UPDATE orders SET amount = amount + 1 WHERE user_id IN (SELECT id FROM users WHERE grp = 1)",
+    "SELECT id, amount FROM orders ORDER BY id",
+    "!UPDATE visits SET days = days * 10 WHERE city = 'porto'",
+    "SELECT id, days FROM visits ORDER BY id",
+    "!UPDATE codes SET label = label || '?' WHERE code > 'b'",
+    "SELECT code, label FROM codes ORDER BY code",
+    "!UPDATE users SET age = 0 WHERE id = 999 OR id = 998",
+    "SELECT count(*) FROM users WHERE age = 0",
 ];
 
 fn norm(v: &Value) -> String { match v { Value::Null => "NULL".into(), Value::Int(i) => i.to_string(), Value::Float(f) => if f.fract() == 0.0 && f.abs() < 1e15 { format!("{}", *f as i64) } else { format!("{:.6}", f) }, Value::Bool(b) => (*b as i32).to_string(), Value::Text(s) => s.clone(), Value::Bytes(b) => format!("{b:?}") } }

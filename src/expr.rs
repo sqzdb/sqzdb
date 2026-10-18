@@ -159,7 +159,7 @@ impl SExpr {
                 match els { Some(e) => e.eval(col)?, None => Value::Null }
             }
             SExpr::Cast(a, c) => cast(a.eval(col)?, *c)?,
-            SExpr::Call(f, args) => call(*f, args, col)?,
+            SExpr::Call(f, args) => capped(call(*f, args, col)?)?,
         })
     }
 }
@@ -190,7 +190,7 @@ fn binary(op: Op, a: Value, b: Value) -> Result<Value, String> {
     }
     if a == Null || b == Null { return Ok(Null); }
     Ok(match op {
-        Op::Concat => match (&a, &b) { (Bytes(_), _) | (_, Bytes(_)) => return Err("|| needs text or numbers".into()), _ => Text(num_text(&a) + &num_text(&b)) },
+        Op::Concat => match (&a, &b) { (Bytes(_), _) | (_, Bytes(_)) => return Err("|| needs text or numbers".into()), _ => capped(Text(num_text(&a) + &num_text(&b)))? },
         Op::JsonGet | Op::JsonGetText => {
             let Text(doc) = &a else { return Err(format!("-> needs JSON text, got {}", kind(&a))) };
             let path = match &b { Text(p) if p.starts_with('$') => p.clone(), Text(k) => format!("$.\"{k}\""), Int(i) => format!("$[{i}]"), other => return Err(format!("-> needs a key, a path or an index, got {}", kind(other))) };
@@ -247,6 +247,11 @@ fn cast(v: Value, c: Cast) -> Result<Value, String> {
 fn text_arg(v: &Value, f: &str) -> Result<Option<String>, String> { match v { Value::Null => Ok(None), Value::Text(s) => Ok(Some(s.clone())), v => Err(format!("{f}() needs TEXT, got {}", kind(v))) } }
 fn int_arg(v: &Value, f: &str) -> Result<Option<i64>, String> { match v { Value::Null => Ok(None), Value::Int(i) => Ok(Some(*i)), Value::Float(x) if x.fract() == 0.0 => Ok(Some(*x as i64)), v => Err(format!("{f}() needs an integer, got {}", kind(v))) } }
 
+/// The longest text or bytes value an expression may build (stored values are at most 65,535 bytes). Functions that
+/// multiply their input (repeat, replace) check before they allocate; the rest are checked on their result.
+pub const MAX_VALUE: usize = 1 << 20;
+fn too_long(n: usize) -> String { format!("a value of {n} bytes is over the {MAX_VALUE}-byte limit for a value") }
+fn capped(v: Value) -> Result<Value, String> { match &v { Value::Text(t) if t.len() > MAX_VALUE => Err(too_long(t.len())), Value::Bytes(b) if b.len() > MAX_VALUE => Err(too_long(b.len())), _ => Ok(v) } }
 fn call(f: F, args: &[SExpr], col: &dyn Fn(usize) -> Value) -> Result<Value, String> {
     use Value::*;
     // lazy ones first: only some arguments run
@@ -272,7 +277,9 @@ fn call(f: F, args: &[SExpr], col: &dyn Fn(usize) -> Value) -> Result<Value, Str
             let (from, to) = (from.clamp(0, n) as usize, to.clamp(0, n) as usize);
             Text(if from < to { s[from..to].iter().collect() } else { String::new() })
         }
-        F::Replace => { if nullin() { return Ok(Null); } let (s, x, y) = (text_arg(&a[0], "replace")?.unwrap(), text_arg(&a[1], "replace")?.unwrap(), text_arg(&a[2], "replace")?.unwrap()); Text(if x.is_empty() { s } else { s.replace(&x, &y) }) }
+        F::Replace => { if nullin() { return Ok(Null); } let (s, x, y) = (text_arg(&a[0], "replace")?.unwrap(), text_arg(&a[1], "replace")?.unwrap(), text_arg(&a[2], "replace")?.unwrap());
+            if !x.is_empty() && y.len() > x.len() { let n = s.len() + s.matches(x.as_str()).count().saturating_mul(y.len() - x.len()); if n > MAX_VALUE { return Err(too_long(n)); } }
+            Text(if x.is_empty() { s } else { s.replace(&x, &y) }) }
         F::Trim | F::Ltrim | F::Rtrim => {
             if nullin() { return Ok(Null); }
             let s = text_arg(&a[0], &name)?.unwrap(); let set: Vec<char> = if a.len() > 1 { text_arg(&a[1], &name)?.unwrap().chars().collect() } else { vec![' '] };
@@ -284,7 +291,7 @@ fn call(f: F, args: &[SExpr], col: &dyn Fn(usize) -> Value) -> Result<Value, Str
         F::ConcatWs => { if a[0] == Null { return Ok(Null); } let sep = num_text(&a[0]); Text(a[1..].iter().filter(|v| **v != Null).map(num_text).collect::<Vec<_>>().join(&sep)) }
         F::Left | F::Right => { if nullin() { return Ok(Null); } let s: Vec<char> = text_arg(&a[0], &name)?.unwrap().chars().collect(); let k = int_arg(&a[1], &name)?.unwrap().max(0) as usize; let k = k.min(s.len()); Text(if f == F::Left { s[..k].iter().collect() } else { s[s.len() - k..].iter().collect() }) }
         F::Reverse => text_arg(&a[0], "reverse")?.map(|s| Text(s.chars().rev().collect())).unwrap_or(Null),
-        F::Repeat => { if nullin() { return Ok(Null); } let k = int_arg(&a[1], "repeat")?.unwrap(); if !(0..=1_000_000).contains(&k) { return Err("repeat() count must be between 0 and 1000000".into()); } Text(text_arg(&a[0], "repeat")?.unwrap().repeat(k as usize)) }
+        F::Repeat => { if nullin() { return Ok(Null); } let k = int_arg(&a[1], "repeat")?.unwrap(); if !(0..=1_000_000).contains(&k) { return Err("repeat() count must be between 0 and 1000000".into()); } let n = text_arg(&a[0], "repeat")?.unwrap().len().saturating_mul(k as usize); if n > MAX_VALUE { return Err(too_long(n)); } Text(text_arg(&a[0], "repeat")?.unwrap().repeat(k as usize)) }
         F::Hex => match &a[0] { Null => Null, Bytes(b) => Text(b.iter().map(|x| format!("{x:02X}")).collect()), v => Text(num_text(v).bytes().map(|x| format!("{x:02X}")).collect()) },
         F::Typeof => Text(match &a[0] { Null => "null", Int(_) => "integer", Float(_) => "real", Text(_) => "text", Bytes(_) => "blob", Bool(_) => "boolean" }.into()),
         F::Abs => match &a[0] { Null => Null, Int(i) => Int(i.checked_abs().ok_or("integer overflow")?), Float(x) => Float(x.abs()), v => return Err(format!("abs() needs a number, got {}", kind(v))) },

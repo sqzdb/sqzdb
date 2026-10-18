@@ -75,7 +75,7 @@ Search	Vector index	no: expected ( column )	no: near "USING": syntax error	yes: 
 Writes	UPSERT (ON CONFLICT DO UPDATE)	yes	yes	yes
 Writes	Insert, ignoring duplicates	yes: ON CONFLICT DO NOTHING	yes: ON CONFLICT DO NOTHING	yes: ON CONFLICT DO NOTHING
 Writes	INSERT … RETURNING	yes	yes	yes
-Writes	UPDATE … RETURNING	no: unsupported: UPDATE … RETURNING is not implemented yet	yes	yes
+Writes	UPDATE … RETURNING	yes	yes	yes
 Writes	INSERT … SELECT	yes	yes	yes
 Writes	CREATE TABLE … AS SELECT	no: unsupported: CREATE TABLE with OR REPLACE, TEMPORARY, AS SELECT, LIKE, CLONE, INHERITS or PARTITION OF is not implemented yet	yes	yes
 Writes	UPDATE with a subquery	yes	yes	yes
