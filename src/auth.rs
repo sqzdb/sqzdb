@@ -42,7 +42,9 @@ pub fn is_system(name: &str) -> bool { name.len() >= 6 && name[..6].eq_ignore_as
 #[derive(Debug, Clone)] pub struct SignedIn { pub token: String, pub user: Vec<(String, Value)> }
 
 /// Per database: failed sign-ins by login, and when expired sessions were last swept.
-#[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64 }
+/// Per database: failed sign-ins by login, when expired sessions were last swept, and the sign-in state counter that
+/// the users table and the auth system tables bump on every write (`Table::watch`).
+#[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64> }
 
 fn hasher() -> Argon2<'static> { Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(19_456, 2, 1, None).expect("argon2 parameters")) }
 /// At most this many hashes at once: each holds 19 MiB.
@@ -90,6 +92,7 @@ impl Sql {
     /// system tables on first use (logged like any CREATE, so a restart replays them before this statement).
     pub(crate) fn enable_auth(&self, table: &str, role: Option<(bool, String)>) -> Result<AuthTable, String> {
         if is_system(table) { return Err(format!("{table} is a system table")); }
+        if table.contains(':') { return Err(format!("{table}: the name of a table users sign in to can't contain ':'")); }
         let t = self.db.table(table).ok_or_else(|| format!("no such table {table}"))?;
         let s = &t.schema;
         let login = s.unique.filter(|&u| matches!(s.columns[u].ty, ColType::Text(_))).ok_or_else(|| format!("{table} needs a UNIQUE text column to sign in with, such as email TEXT UNIQUE"))?;
@@ -104,6 +107,7 @@ impl Sql {
                             (SESSIONS, "CREATE TABLE _auth_sessions (id BYTES(32) PRIMARY KEY, secret VARCHAR(160) NOT NULL, gen BYTES(16) NOT NULL, created TIMESTAMP NOT NULL, expires TIMESTAMP NOT NULL)")] {
             if self.db.table(name).is_none() { self.create_system_table(ddl)?; }
         }
+        for tb in [t.clone(), self.system(SECRETS)?, self.system(SESSIONS)?] { let _ = tb.watch.set(self.auth.epoch.clone()); }
         Ok(AuthTable { login, role })
     }
 
@@ -138,8 +142,13 @@ impl Sql {
         let (t, cfg) = self.auth_table(table)?;
         let login = normalize(login);
         let fkey = format!("{}:{login}", t.schema.name.to_lowercase());
-        if let Some((n, at)) = self.auth.failures.lock().unwrap().get(&fkey).copied() {
-            if n >= FREE_FAILURES { let wait = Duration::from_secs(1u64 << (n - FREE_FAILURES).min(10)).min(LOCK_MAX); if at.elapsed() < wait { return Err(format!("sign-in failed: too many failed sign-ins for this login; try again in {} s", (wait - at.elapsed()).as_secs() + 1)); } }
+        {   // the attempt counts as a failure before its hash, so attempts running at once count against each other; a success clears it
+            let mut f = self.auth.failures.lock().unwrap();
+            if let Some(&(n, at)) = f.get(&fkey) {
+                if n >= FREE_FAILURES { let wait = Duration::from_secs(1u64 << (n - FREE_FAILURES).min(10)).min(LOCK_MAX); if at.elapsed() < wait { return Err(format!("sign-in failed: too many failed sign-ins for this login; try again in {} s", (wait - at.elapsed()).as_secs() + 1)); } }
+            }
+            if f.len() > 100_000 { f.retain(|_, (_, at)| at.elapsed() < LOCK_MAX); }
+            let e = f.entry(fkey.clone()).or_insert((0, Instant::now())); e.0 += 1; e.1 = Instant::now();
         }
         let ty = &t.schema.columns[cfg.login].ty;
         let mut key = vec![0u8; ty.width()];
@@ -147,12 +156,7 @@ impl Sql {
         let secrets = self.system(SECRETS)?;
         let stored = user.as_ref().and_then(|r| secrets.with_pk(Self::text_pk(&secrets, &Self::secret_id(&t, r)).ok()?, |r| r.to_vec()));
         let ok = match &stored { Some(sr) => match decode_col(&secrets.schema, sr, 1) { Value::Text(h) => verify_password(password, &h), _ => false }, None => { let _ = verify_password(password, dummy_hash()); false } };
-        if !ok {
-            let mut f = self.auth.failures.lock().unwrap();
-            if f.len() > 100_000 { f.retain(|_, (_, at)| at.elapsed() < LOCK_MAX); }
-            let e = f.entry(fkey).or_insert((0, Instant::now())); e.0 += 1; e.1 = Instant::now();
-            return Err(WRONG.into());
-        }
+        if !ok { return Err(WRONG.into()); }
         self.auth.failures.lock().unwrap().remove(&fkey);
         let user = user.unwrap(); let sr = stored.unwrap();
         let token = self.new_session(&secrets, &Self::secret_id(&t, &user), &sr)?;
@@ -163,6 +167,22 @@ impl Sql {
     /// Make `sess` act as the user the token belongs to: the row's role and its columns as session attributes.
     pub fn session_from_token(&self, sess: &mut Session, token: &str) -> Result<(), String> {
         if sess.txn.is_some() { return Err("cannot change identity inside a transaction".into()); }
+        self.bind_token(sess, token).inspect_err(|_| deny(sess))
+    }
+    /// The sign-in state counter (see `AuthState`).
+    pub(crate) fn auth_epoch(&self) -> u64 { self.auth.epoch.load(std::sync::atomic::Ordering::Acquire) }
+    pub(crate) fn auth_changed(&self) { self.auth.epoch.fetch_add(1, std::sync::atomic::Ordering::Release); }
+    /// Before a statement: a session from a token whose sign-in state changed checks the token again and takes the
+    /// user's current role and attributes. If the token no longer holds, the session keeps no roles (so nothing passes
+    /// a grant) and every statement fails with AUTH until a new token is bound.
+    pub(crate) fn check_identity(&self, sess: &mut Session) -> Result<(), String> {
+        let Some((token, seen)) = &sess.token else { return Ok(()) };
+        if *seen == self.auth_epoch() { return Ok(()); }
+        let token = token.clone();
+        self.bind_token(sess, &token).inspect_err(|_| deny(sess))
+    }
+    fn bind_token(&self, sess: &mut Session, token: &str) -> Result<(), String> {
+        let epoch = self.auth_epoch();
         let id = token_id(token).ok_or("session: not a session token")?;
         let sessions = self.system(SESSIONS)?; let secrets = self.system(SECRETS)?;
         let sk = sessions.schema.key_from_value(&Value::Bytes(id.to_vec()))?;
@@ -179,7 +199,7 @@ impl Sql {
         if !self.acl.read().unwrap().roles.contains(&role) { return Err(format!("session: the user's role {role} is not a role")); }
         let attrs: HashMap<String, Value> = user_pairs(&t, &user).into_iter().filter(|(_, v)| *v != Value::Null).collect();
         sess.user = match decode_col(&t.schema, &user, cfg.login) { Value::Text(l) => Some(l), v => Some(crate::expr::num_text(&v)) };
-        sess.roles = vec![role]; sess.attrs = attrs; sess.assumed = false;
+        sess.roles = vec![role]; sess.attrs = attrs; sess.assumed = false; sess.token = Some((token.to_string(), epoch));
         Ok(())
     }
 
@@ -258,6 +278,9 @@ impl Sql {
     }
 }
 
+/// A session whose token failed: no roles (nothing passes a grant), still a user (never the application), and the
+/// token kept, so each later statement checks it again and fails.
+fn deny(sess: &mut Session) { sess.roles.clear(); sess.attrs.clear(); if sess.user.is_none() { sess.user = Some("(signed out)".into()); } if let Some(t) = sess.token.as_mut() { t.1 = u64::MAX; } }
 fn user_pairs(t: &Table, row: &[u8]) -> Vec<(String, Value)> { (0..t.schema.columns.len()).map(|i| (t.schema.columns[i].name.clone(), decode_col(&t.schema, row, i))).collect() }
 fn key_text(v: &Value) -> String { match v { Value::Text(s) => s.clone(), v => crate::expr::num_text(v) } }
 fn key_value(ty: &ColType, s: &str) -> Result<Value, String> { match ty { ColType::Int => s.parse::<i64>().map(Value::Int).map_err(|_| "session: damaged session row".to_string()), _ => Ok(Value::Text(s.to_string())) } }
@@ -365,6 +388,65 @@ mod tests {
             let e = s.exec_s(&mut Session::default(), st, &[]).unwrap_err(); assert!(e.contains(msg), "{st}: {e}");
         }
         drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test] fn guesses_at_once_count_against_each_other() {
+        let d = tmp("race"); let s = Arc::new(Sql::open_with(&d, Config::default()).unwrap()); setup(&s);
+        s.sign_up("users", &[("email".into(), text("a@x"))], "the password").unwrap();
+        let hs: Vec<_> = (0..40).map(|_| { let s = s.clone(); std::thread::spawn(move || s.sign_in("users", "a@x", "guess")) }).collect();
+        let errs: Vec<String> = hs.into_iter().map(|h| h.join().unwrap().unwrap_err()).collect();
+        let tried = errs.iter().filter(|e| e.as_str() == WRONG).count();
+        assert!(tried <= FREE_FAILURES as usize, "{tried} guesses were checked; the rest must wait");
+        assert_eq!(errs.len() - tried, 40 - tried); assert!(errs.iter().all(|e| e == WRONG || e.contains("too many")));
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test] fn a_held_session_follows_sign_in_state() {
+        let d = tmp("held"); let s = Arc::new(Sql::open_with(&d, Config::default()).unwrap()); setup(&s);
+        q(&s, "CREATE ROLE boss"); q(&s, "GRANT SELECT ON notes TO boss");   // no policy: sees every note
+        q(&s, "INSERT INTO notes (owner, body) VALUES (1, 'a1'), (2, 'b1')");
+        let a = s.sign_up("users", &[("email".into(), text("a@x")), ("tenant".into(), Value::Int(1))], "password a").unwrap();
+        // one session object kept across requests (a connection, a websocket)
+        let mut held = as_token(&s, &a.token).unwrap();
+        assert_eq!(qs(&s, &mut held, "SELECT count(*) FROM notes").unwrap()[0][0], Value::Int(1));
+        q(&s, "UPDATE users SET role = 'boss' WHERE id = 1");                   // a role change applies to the held session
+        assert_eq!(qs(&s, &mut held, "SELECT count(*) FROM notes").unwrap()[0][0], Value::Int(2));
+        q(&s, "UPDATE users SET role = 'member', tenant = 9 WHERE id = 1");
+        assert_eq!(qs(&s, &mut held, "SELECT count(*) FROM notes").unwrap()[0][0], Value::Int(1)); assert_eq!(held.attrs.get("tenant"), Some(&Value::Int(9)));
+        // a sign-out ends it at the next statement, and it stays ended (no roles, never the application)
+        s.sign_out(&a.token).unwrap();
+        assert_eq!(error_code(&qs(&s, &mut held, "SELECT count(*) FROM notes").unwrap_err()), "AUTH");
+        assert!(held.roles.is_empty() && held.user.is_some());
+        assert!(qs(&s, &mut held, "SELECT count(*) FROM notes").is_err());
+        // so does a password change, and the user's deletion
+        let t2 = s.sign_in("users", "a@x", "password a").unwrap().token; let mut h2 = as_token(&s, &t2).unwrap();
+        s.set_password("users", &Value::Int(1), "password b").unwrap(); assert!(qs(&s, &mut h2, "SELECT 1").is_err());
+        let t3 = s.sign_in("users", "a@x", "password b").unwrap().token; let mut h3 = as_token(&s, &t3).unwrap();
+        q(&s, "DELETE FROM users WHERE id = 1"); assert!(qs(&s, &mut h3, "SELECT 1").is_err());
+        // a token that fails leaves the session with nothing, not as the application
+        let mut bad = Session::default(); assert!(s.session_from_token(&mut bad, "sqz_00").is_err());
+        assert!(qs(&s, &mut bad, "SELECT count(*) FROM notes").unwrap_err().starts_with("permission denied"));
+        assert!(qs(&s, &mut bad, "CREATE TABLE x (id INT PRIMARY KEY)").is_err());
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test] fn subscriptions_from_a_token_end_with_it() {
+        let d = tmp("subs"); let s = Arc::new(Sql::open_with(&d, Config::default()).unwrap()); setup(&s);
+        let a = s.sign_up("users", &[("email".into(), text("a@x"))], "password a").unwrap();
+        let held = as_token(&s, &a.token).unwrap();
+        let sub = s.reactor().subscribe(&held, "SELECT * FROM notes", &[]).unwrap();
+        let (watch, _) = s.reactor().watch(&held, "SELECT count(*) FROM notes", &[]).unwrap();
+        q(&s, "INSERT INTO notes (owner, body) VALUES (1, 'mine')");
+        assert!(matches!(sub.recv_timeout(Duration::from_secs(2)), Some(crate::live::Event::Change(_))));
+        assert!(matches!(watch.recv_timeout(Duration::from_secs(2)), Some(crate::live::Event::Live { .. })));
+        s.sign_out(&a.token).unwrap();
+        q(&s, "INSERT INTO notes (owner, body) VALUES (1, 'after')");
+        assert!(matches!(sub.recv_timeout(Duration::from_secs(2)), Some(crate::live::Event::Overflow { .. })), "the subscription is dropped");
+        assert!(matches!(watch.recv_timeout(Duration::from_secs(2)), Some(crate::live::Event::Overflow { .. })), "the live query is dropped");
+        assert!(s.reactor().subscribe(&held, "SELECT * FROM notes", &[]).is_err(), "and can't be made again");
+        q(&s, r#"CREATE TABLE "odd:name" (id INT PRIMARY KEY, email TEXT UNIQUE, role TEXT)"#);
+        assert!(s.exec_s(&mut Session::default(), r#"ALTER TABLE "odd:name" ENABLE AUTH"#, &[]).is_err());
+        drop(sub); drop(watch); drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test] fn sign_ins_survive_restarts_and_snapshots() {

@@ -517,16 +517,20 @@ pub struct Table {
     /// Highest primary key ever issued or seen (auto ids continue above it and are never reused). Shared with the
     /// shadow table during an online ALTER so both hand out from one sequence.
     pub next_id: Arc<std::sync::atomic::AtomicI64>,
+    /// Bumped on every write, for tables sign-in depends on (the users table and the auth system tables): sessions
+    /// built from a token check it before each statement (see `auth.rs`).
+    pub watch: OnceLock<Arc<std::sync::atomic::AtomicU64>>,
 }
 /// The target of an online ALTER TABLE: a table with the new schema and a row converter old -> new.
 #[derive(Clone)] pub struct Shadow { pub table: Arc<Table>, pub convert: Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync> }
-impl Table { #[inline] fn base_is_some(&self) -> bool { self.base.get().is_some() } }
+impl Table { #[inline] fn base_is_some(&self) -> bool { self.base.get().is_some() }
+    #[inline] fn touched(&self) { if let Some(w) = self.watch.get() { w.fetch_add(1, Ordering::Release); } } }
 impl Table {
     pub fn new(id: u16, schema: Schema, log: Arc<GLog>, durable: bool) -> Table {
         let wide = schema.key16;
         let stride = 16 + schema.row_size;
         Table { id, schema, stride, chunks_: Lazy2::new(MAX_CHUNKS, 64, || RwLock::new(Chunk { data: None })), next_slot: AtomicU32::new(0),
-                pk_: Lazy2::new(PK_SHARDS, 64, if wide { pk_wide } else { pk_narrow }), sec_: Lazy2::new(SEC_SHARDS, 64, || RwLock::new(UniqShard::default())), indexes: RwLock::new(vec![]), log, durable, base: OnceLock::new(), map: OnceLock::new(), free: Mutex::new(vec![]), shadow: RwLock::new(None), retired: std::sync::atomic::AtomicBool::new(false), fks: RwLock::new(vec![]), children: RwLock::new(vec![]), owner_since: std::sync::atomic::AtomicU64::new(0), owner_until: std::sync::atomic::AtomicU64::new(u64::MAX) , next_id: Arc::new(std::sync::atomic::AtomicI64::new(0)) }
+                pk_: Lazy2::new(PK_SHARDS, 64, if wide { pk_wide } else { pk_narrow }), sec_: Lazy2::new(SEC_SHARDS, 64, || RwLock::new(UniqShard::default())), indexes: RwLock::new(vec![]), log, durable, base: OnceLock::new(), map: OnceLock::new(), free: Mutex::new(vec![]), shadow: RwLock::new(None), retired: std::sync::atomic::AtomicBool::new(false), fks: RwLock::new(vec![]), children: RwLock::new(vec![]), owner_since: std::sync::atomic::AtomicU64::new(0), owner_until: std::sync::atomic::AtomicU64::new(u64::MAX) , next_id: Arc::new(std::sync::atomic::AtomicI64::new(0)), watch: OnceLock::new() }
     }
     /// Use another table's id sequence (the shadow of an online ALTER shares the original's).
     pub fn with_counter(mut self, c: Arc<std::sync::atomic::AtomicI64>) -> Table { self.next_id = c; self }
@@ -694,7 +698,7 @@ impl Table {
             let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
             let (v, p) = Self::hdr_at(d, off); if v == 0 || self.pk_of(&d[off + 16..off + self.stride]) != pk { return Err(Abort::NotFound); } if p != 0 { return Err(Abort::Conflict); }
             let row = d[off + 16..off + self.stride].to_vec();
-            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &row); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
+            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &row); self.touched(); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
         match guard { Some(mut m) => { m.remove(&pk); drop(m); if let Some(k) = self.unique_key(&row) { self.uniq_remove(k, slot); } self.idx_remove(&row, slot); } None => self.unpublish(slot, &row) }
@@ -844,7 +848,7 @@ impl Table {
             let mut secm = ukey.as_ref().map(|_| self.sec()[Self::sec_shard_h(h)].write().unwrap());
             if let (Some(m), Some(k)) = (&secm, &ukey) { if self.uniq_contains_locked(m, h, k) { self.free_slot(slot); return Err(Abort::Duplicate); } }
             let mut c = self.chunks()[ck].write().unwrap();
-            seq = self.log.append(OP_INSERT, self.id, row);
+            seq = self.log.append(OP_INSERT, self.id, row); self.touched();
             pkm.insert(pk, slot);
             if let Some(m) = &mut secm { Self::uniq_insert_locked(m, h, slot); }
             let d = Self::alloc(&mut c, self.stride);
@@ -898,7 +902,7 @@ impl Table {
             let d = Self::alloc(&mut c, self.stride);
             let v = u64::from_le_bytes(d[off..off + 8].try_into().unwrap()); let p = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
             if p != 0 || v != ver { return Err(Abort::Conflict); }
-            seq = self.log.append(OP_UPDATE, self.id, &new);
+            seq = self.log.append(OP_UPDATE, self.id, &new); self.touched();
             d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes());
             if let Some(m) = &mut secm { Self::uniq_insert_locked(m, nh.unwrap(), slot); }
         }
@@ -1063,6 +1067,7 @@ impl Database {
         if old.shadow.read().unwrap().is_some() { return Err(format!("table {name} already has a schema change in progress")); }
         let shadow = { let mut names = self.names.write().unwrap(); let mut tables = self.tables.write().unwrap(); let t = Arc::new(Table::new(tables.len() as u16, schema, self.log.clone(), self.durable).with_counter(old.next_id.clone())); t.owner_since.store(u64::MAX, Ordering::Relaxed); names.insert(format!("\u{0}alter:{}", name.to_lowercase()), tables.len()); tables.push(t.clone()); t };
         self.link_fks(&shadow)?;
+        if let Some(w) = old.watch.get() { let _ = shadow.watch.set(w.clone()); }   // the table that replaces it keeps signalling sign-in
         *old.shadow.write().unwrap() = Some(Shadow { table: shadow.clone(), convert });
         Ok((old, shadow))
     }
@@ -1386,7 +1391,7 @@ impl Database {
             let mut ring = Vec::with_capacity(payload.capacity() + 64);
             for w in &txn.writes { let key; let bytes: &[u8] = if let TxnWrite::Delete { table, row, .. } = w { key = table.schema.key_record(row); &key } else { w.row() }; payload.extend_from_slice(&w.table().id.to_le_bytes()); payload.push(w.op()); payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); payload.extend_from_slice(bytes);
                                     ring.extend_from_slice(&w.table().id.to_le_bytes()); ring.push(w.op()); ring.extend_from_slice(&(w.row().len() as u32).to_le_bytes()); ring.extend_from_slice(w.row()); }
-            seq = self.log.append_with_ring(OP_TXN, u16::MAX, &payload, &ring);
+            seq = self.log.append_with_ring(OP_TXN, u16::MAX, &payload, &ring); for w in &txn.writes { w.table().touched(); }
             for w in &txn.writes {
                 let (t, slot) = (w.table(), w.slot());
                 let i = idx(t.id, slot as usize / CHUNK_ROWS); let d = t.alloc_in(&mut guards[i]); let off = (slot as usize % CHUNK_ROWS) * t.stride;

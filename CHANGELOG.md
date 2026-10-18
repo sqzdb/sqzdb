@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1 — 2026-10-17
+
+**Upgrade from 0.4.0 if you use sign-in** (see Fixed).
+
+### Fixed
+- **Sign-in attempts sent at the same moment were not limited.** The failure count was checked before
+  the password hash and raised after it, so many guesses at once all got through before the slowdown
+  began. Each attempt now counts as it starts.
+- **A session handle kept the identity it had when it was made.** A handle from `db.session(token)`
+  that an application kept open, and subscriptions and live queries made through it, went on acting as
+  the user after a sign-out, a password change or the user's deletion, and with an old role or old
+  attributes. Such a handle now checks its token again after any sign-in change. It fails with `AUTH`
+  once the token no longer holds, and its subscriptions are dropped.
+- A session whose `use_token` failed was left acting as the application, without restrictions, if the
+  error was ignored. It now has no rights.
+- A table whose name contains `:` can't be marked `ENABLE AUTH` (the name would make password records
+  ambiguous).
+
 ## 0.4.0 — 2026-10-17
 
 ### Added

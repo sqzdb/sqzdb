@@ -110,7 +110,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.4.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.4.1` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -448,7 +448,11 @@ s := db.Session(); err = s.UseToken(in.Token)
 - **Sessions** are random 256-bit tokens (`sqz_…`). Only their SHA-256 is stored. `db.session(token)`
   costs about 2 µs, so it can run on every request. A session lasts `auth.sessionTtl` (30 days).
   `signOut` ends one session; `setPassword` and `signOutEverywhere` end all of a user's sessions.
-  Changing a user's role column applies on the next `db.session(token)`.
+- **Open handles follow the user.** A handle from `db.session(token)` that you keep, for a connection
+  or a socket, checks its token again before its next statement whenever anything about sign-in
+  changes. A role or attribute change in the user's row applies there. A sign-out, a password change
+  or the user's deletion makes it fail with `AUTH` from then on. Subscriptions and live queries made
+  through such a handle are dropped (resubscribe) when the user changes or the session ends.
 - **Wrong passwords**: a wrong password and an unknown login fail the same way, in the same time. After
   5 failures for one login, each further attempt waits 1 s, then 2, 4 and so on, up to 15 minutes.
 - **Deleting a user** ends their sessions. A new row that reuses a deleted user's key starts without a
@@ -727,7 +731,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.4.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.4.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

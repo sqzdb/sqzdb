@@ -243,7 +243,10 @@ pub struct Prepared { pub plan: Plan, pub nparams: usize, pub text: String, pub 
     /// primary key of the last row this session inserted (0 before any insert)
     pub last_insert_id: i64,
     /// the same key as a value: an INT, or a UUID as text (None before any insert)
-    pub last_insert_key: Option<Value> }
+    pub last_insert_key: Option<Value>,
+    /// The session token this identity came from, and the sign-in state it was checked against: when that state
+    /// changes (a sign-out, a password change, a write to the users table) the next statement checks the token again.
+    pub token: Option<(String, u64)> }
 
 // ---------- access control: roles, users, table grants, row policies ----------
 pub const P_SELECT: u8 = 1; pub const P_INSERT: u8 = 2; pub const P_UPDATE: u8 = 4; pub const P_DELETE: u8 = 8;
@@ -1865,7 +1868,7 @@ impl Sql {
         if up.len() >= 5 && up[0] == "ALTER" && up[1] == "TABLE" && up[4] == "AUTH" && (up[3] == "ENABLE" || up[3] == "DISABLE") {
             // ALTER TABLE t ENABLE AUTH [(ROLE FROM column | ROLE name)] | ALTER TABLE t DISABLE AUTH
             let table = t[2].to_lowercase();
-            if up[3] == "DISABLE" { if t.len() > 5 { return Err(format!("unexpected token {}", t[5])); } self.acl.write().unwrap().auth.remove(&table); return Ok(()); }
+            if up[3] == "DISABLE" { if t.len() > 5 { return Err(format!("unexpected token {}", t[5])); } self.acl.write().unwrap().auth.remove(&table); self.auth_changed(); return Ok(()); }
             let role = match up.get(5).map(|x| x.as_str()) {
                 None => None,
                 Some("(") if up.get(6).map(|x| x.as_str()) == Some("ROLE") && up.get(7).map(|x| x.as_str()) == Some("FROM") && t.get(9).map(|x| x.as_str()) == Some(")") && t.len() == 10 => Some((true, t[8].clone())),
@@ -1873,7 +1876,7 @@ impl Sql {
                 _ => return Err("expected ENABLE AUTH, ENABLE AUTH (ROLE FROM column) or ENABLE AUTH (ROLE name)".into()),
             };
             let cfg = self.enable_auth(&table, role)?;
-            self.acl.write().unwrap().auth.insert(table, cfg); return Ok(());
+            self.acl.write().unwrap().auth.insert(table, cfg); self.auth_changed(); return Ok(());
         }
         if let Some(n) = t.iter().find(|x| crate::auth::is_system(x)) { return Err(format!("{n} is a system table")); }
         let mut acl = self.acl.write().unwrap();
@@ -2036,6 +2039,7 @@ impl Sql {
     }
 
     pub fn execute_s(&self, sess: &mut Session, p: &Prepared, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
+        self.check_identity(sess)?;
         if params.len() < p.nparams { return Err(format!("statement needs {} parameters, got {}", p.nparams, params.len())); }
         if p.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire) { let p2 = self.prepare(&p.text)?; return self.execute_s(sess, &p2, params); }  // a schema change swapped the table under this plan
         match &p.plan {

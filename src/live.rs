@@ -31,7 +31,9 @@ impl Subscription {
 impl Drop for Subscription { fn drop(&mut self) { self.q.closed.store(true, Ordering::Relaxed); } }
 
 /// `since`: the log position when the subscription was made; it receives exactly the changes committed after it.
-struct Sub { table: u16, preds: Vec<CPred>, policies: Vec<CPred>, q: Arc<Queue>, key: Option<(usize, i64)>, since: u64 }
+struct Sub { table: u16, preds: Vec<CPred>, policies: Vec<CPred>, q: Arc<Queue>, key: Option<(usize, i64)>, since: u64,
+    /// For a session from a sign-in token: its identity, checked again whenever sign-in state changes.
+    ident: Option<Session> }
 struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<(usize, ColType)>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, q: Arc<Queue> }
 /// Subscriptions whose filter is `col = constant` on an INT column are indexed by (table, column, value): a record
 /// reaches them through one hash lookup per indexed column instead of a scan over every subscriber.
@@ -43,7 +45,7 @@ impl State {
 /// it alive forever after the first subscription (E44).
 pub struct Reactor { sql: std::sync::Weak<Sql>, log: Arc<crate::table::GLog>, state: Arc<Mutex<State>>, pub debounce: Duration, pub reruns: AtomicU64, pub rerun_us: AtomicU64, pub events: AtomicU64, pub last_seq: AtomicU64, stop: Arc<AtomicBool>, thread: Mutex<Option<std::thread::JoinHandle<()>>> }
 
-fn session_like(s: &Session) -> Session { Session { txn: None, user: s.user.clone(), roles: s.roles.clone(), attrs: s.attrs.clone(), assumed: s.assumed, last_seq: 0, last_insert_id: 0, last_insert_key: None } }
+fn session_like(s: &Session) -> Session { Session { txn: None, user: s.user.clone(), roles: s.roles.clone(), attrs: s.attrs.clone(), assumed: s.assumed, last_seq: 0, last_insert_id: 0, last_insert_key: None, token: s.token.clone() } }
 /// The predicates a single-table plan applies, including the ones hidden in its access path.
 fn plan_preds(sql: &Sql, sess: &Session, sp: &SelectPlan, params: &[Value]) -> Result<Vec<CPred>, String> {
     let mut preds: Vec<Pred> = sp.preds.clone(); let sch = &sp.table.schema;
@@ -85,6 +87,7 @@ impl Reactor {
     }
     fn run(&self, start: u64) {
         let mut feed = { let Some(sql) = self.sql.upgrade() else { return }; sql.subscribe(start) };
+        let mut auth_seen = { let Some(sql) = self.sql.upgrade() else { return }; sql.auth_epoch() };
         loop {
             if self.stop.load(Ordering::Relaxed) { return; }
             // sleep until something is appended, or until a dirty query is due
@@ -92,6 +95,17 @@ impl Reactor {
             self.log.wait_feed(feed.last_seq(), due.unwrap_or(Duration::from_millis(20)).min(Duration::from_millis(20)));
             let Some(sql) = self.sql.upgrade() else { return };   // the database is gone
             let recs = feed.poll_raw(); let now = Instant::now();
+            // sign-in state changed: a subscription or live query whose token no longer holds, or whose identity changed
+            // (another role, other attributes), ends; the client sees it dropped and subscribes again
+            let ep = sql.auth_epoch();
+            if ep != auth_seen {
+                auth_seen = ep; let last = self.last_seq.load(Ordering::Relaxed);
+                let mut st = self.state.lock().unwrap();
+                let changed = |s: &mut Session| { let before = (s.roles.clone(), s.attrs.clone()); sql.check_identity(s).is_err() || before != (s.roles.clone(), s.attrs.clone()) };
+                for sub in st.subs.iter_mut() { if let Some(id) = sub.ident.as_mut() { if changed(id) { let _ = sub.q.push(Event::Overflow { last_seq: last }); sub.q.closed.store(true, Ordering::Relaxed); } } }
+                for live in st.lives.iter_mut() { if live.sess.token.is_some() && changed(&mut live.sess) { let _ = live.q.push(Event::Overflow { last_seq: last }); live.q.closed.store(true, Ordering::Relaxed); } }
+                let before = st.subs.len(); st.subs.retain(|s| !s.q.closed.load(Ordering::Relaxed)); if st.subs.len() != before { st.reindex(); } st.lives.retain(|l| !l.q.closed.load(Ordering::Relaxed));
+            }
             if !recs.is_empty() {
                 let mut st = self.state.lock().unwrap();
                 for (seq, t, op, payload) in &recs {
@@ -129,7 +143,10 @@ impl Reactor {
             for live in st.lives.iter_mut() {
                 let Some(d) = live.dirty_since else { continue }; if now.saturating_duration_since(d) < self.debounce { continue; }
                 let t0 = Instant::now();
-                let rows = match sql.execute_s(&mut live.sess, &live.prepared, &live.params) { Ok(r) => r, Err(_) => { live.dirty_since = None; continue; } };
+                let rows = match sql.execute_s(&mut live.sess, &live.prepared, &live.params) { Ok(r) => r, Err(_) => {
+                    // a session from a token that no longer holds ends the live query (the client sees it dropped)
+                    if live.sess.token.is_some() { let _ = live.q.push(Event::Overflow { last_seq: self.last_seq.load(Ordering::Relaxed) }); live.q.closed.store(true, Ordering::Relaxed); }
+                    live.dirty_since = None; continue; } };
                 self.reruns.fetch_add(1, Ordering::Relaxed); self.rerun_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 live.dirty_since = None;
                 if rows != live.result {
@@ -148,12 +165,13 @@ impl Reactor {
         let Plan::Select(sp) = &p.plan else { return Err("subscribe needs a SELECT".into()) };
         if sp.join.is_some() || !sp.subs.is_empty() { return Err("subscribe needs a single-table SELECT (watch handles joins)".into()); }
         if !sp.filters.is_empty() { return Err("subscribe filters by columns compared with values (=, <, IN, IS NULL …); use watch for other conditions".into()); }
+        let mut s0 = session_like(sess); sql.check_identity(&mut s0)?; let sess = &s0;
         let preds = plan_preds(&sql, sess, sp, params)?; let policies = sql.guard(sess, &sp.table, P_SELECT)?;
         // an equality on an INT column with a constant makes the subscription indexable
         let key = { let mut all: Vec<Pred> = sp.preds.clone(); match &sp.access { Access::Pk(e) => all.push(Pred { col: sp.table.schema.pk, cmp: Cmp::Eq, rhs: e.clone() }), Access::Index(ix, e) => all.push(Pred { col: ix.col, cmp: Cmp::Eq, rhs: e.clone() }), _ => {} }
             all.iter().find_map(|p| if p.cmp == Cmp::Eq && sp.table.schema.columns[p.col].ty == crate::table::ColType::Int { match &p.rhs { Expr::Lit(Value::Int(v)) => Some((p.col, *v)), Expr::Param(i) => match params.get(*i) { Some(Value::Int(v)) => Some((p.col, *v)), _ => None }, _ => None } } else { None }) };
         let q = Arc::new(Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), cap: sql.cfg.live.queue, closed: AtomicBool::new(false), delivered: AtomicU64::new(0) });
-        { let mut st = self.state.lock().unwrap(); st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq() }); st.reindex(); }
+        { let mut st = self.state.lock().unwrap(); st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)) }); st.reindex(); }
         Ok(Subscription { q })
     }
     /// Watch a query: returns its current result and a handle that receives `Event::Live` whenever the result changes.
@@ -161,6 +179,7 @@ impl Reactor {
         let sql = self.sql.upgrade().ok_or("database is closed")?; let p = sql.prepare(text)?;
         let Plan::Select(sp) = &p.plan else { return Err("watch needs a SELECT".into()) };
         let mut tables = vec![]; tables_of(sp, &mut tables);
+        let mut s0 = session_like(sess); sql.check_identity(&mut s0)?; let sess = &s0;
         let single = if sp.join.is_none() && sp.subs.is_empty() { Some((sp.table.id, plan_preds(&sql, sess, sp, params)?, sql.guard(sess, &sp.table, P_SELECT)?)) } else { None };
         let key_col = if sp.join.is_none() && sp.post.is_none() { sp.proj.iter().position(|pr| matches!(pr, Proj::Col(c) if *c == sp.table.schema.pk)).map(|i| (i, sp.table.schema.columns[sp.table.schema.pk].ty.clone())) } else { None };
         let mut s = session_like(sess); let result = sql.execute_s(&mut s, &p, params)?;
