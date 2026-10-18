@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2 — 2026-10-17
+
+### Fixed
+- **A sign-out could fail to end a session that was running a statement at that moment.** The sign-in
+  state counter moved when the sign-out was logged, before it was visible. A session that checked its
+  token in between could record the new count against the old rows and never check again. The counter
+  now moves only once a write is visible. A test signs out 300 times while another thread keeps
+  querying through the session. On 0.4.1 it fails in the first round, with the database writing to
+  disk on every commit.
+
 ## 0.4.1 — 2026-10-17
 
 **Upgrade from 0.4.0 if you use sign-in** (see Fixed).

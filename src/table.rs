@@ -524,6 +524,9 @@ pub struct Table {
 /// The target of an online ALTER TABLE: a table with the new schema and a row converter old -> new.
 #[derive(Clone)] pub struct Shadow { pub table: Arc<Table>, pub convert: Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync> }
 impl Table { #[inline] fn base_is_some(&self) -> bool { self.base.get().is_some() }
+    /// Bump the watch counter (see `watch`). Called once a write is visible, never before: a session that checked its
+    /// token between the log append and the publish would otherwise record the new count against the old rows and
+    /// never check again.
     #[inline] fn touched(&self) { if let Some(w) = self.watch.get() { w.fetch_add(1, Ordering::Release); } } }
 impl Table {
     pub fn new(id: u16, schema: Schema, log: Arc<GLog>, durable: bool) -> Table {
@@ -698,10 +701,11 @@ impl Table {
             let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
             let (v, p) = Self::hdr_at(d, off); if v == 0 || self.pk_of(&d[off + 16..off + self.stride]) != pk { return Err(Abort::NotFound); } if p != 0 { return Err(Abort::Conflict); }
             let row = d[off + 16..off + self.stride].to_vec();
-            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &row); self.touched(); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
+            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &row); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
         match guard { Some(mut m) => { m.remove(&pk); drop(m); if let Some(k) = self.unique_key(&row) { self.uniq_remove(k, slot); } self.idx_remove(&row, slot); } None => self.unpublish(slot, &row) }
+        self.touched();
         self.free_slot(slot);
         self.mirror_delete(pk);
         self.fk_apply(pk, todo)?;
@@ -848,7 +852,7 @@ impl Table {
             let mut secm = ukey.as_ref().map(|_| self.sec()[Self::sec_shard_h(h)].write().unwrap());
             if let (Some(m), Some(k)) = (&secm, &ukey) { if self.uniq_contains_locked(m, h, k) { self.free_slot(slot); return Err(Abort::Duplicate); } }
             let mut c = self.chunks()[ck].write().unwrap();
-            seq = self.log.append(OP_INSERT, self.id, row); self.touched();
+            seq = self.log.append(OP_INSERT, self.id, row);
             pkm.insert(pk, slot);
             if let Some(m) = &mut secm { Self::uniq_insert_locked(m, h, slot); }
             let d = Self::alloc(&mut c, self.stride);
@@ -858,6 +862,7 @@ impl Table {
         { let mut c = self.chunks()[ck].write().unwrap();
           let d = Self::alloc(&mut c, self.stride);
           d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); }
+        self.touched();
         self.idx_add(row, slot);
         self.mirror_insert(row);
         Ok(seq)
@@ -902,13 +907,14 @@ impl Table {
             let d = Self::alloc(&mut c, self.stride);
             let v = u64::from_le_bytes(d[off..off + 8].try_into().unwrap()); let p = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
             if p != 0 || v != ver { return Err(Abort::Conflict); }
-            seq = self.log.append(OP_UPDATE, self.id, &new); self.touched();
+            seq = self.log.append(OP_UPDATE, self.id, &new);
             d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes());
             if let Some(m) = &mut secm { Self::uniq_insert_locked(m, nh.unwrap(), slot); }
         }
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
           d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(&new); }
+        self.touched();
         if key_changed { if let Some(k) = old_key { self.uniq_remove(&k, slot); } }
         self.idx_replace(&row, &new, slot);
         self.mirror_update(&new);
@@ -1391,7 +1397,7 @@ impl Database {
             let mut ring = Vec::with_capacity(payload.capacity() + 64);
             for w in &txn.writes { let key; let bytes: &[u8] = if let TxnWrite::Delete { table, row, .. } = w { key = table.schema.key_record(row); &key } else { w.row() }; payload.extend_from_slice(&w.table().id.to_le_bytes()); payload.push(w.op()); payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); payload.extend_from_slice(bytes);
                                     ring.extend_from_slice(&w.table().id.to_le_bytes()); ring.push(w.op()); ring.extend_from_slice(&(w.row().len() as u32).to_le_bytes()); ring.extend_from_slice(w.row()); }
-            seq = self.log.append_with_ring(OP_TXN, u16::MAX, &payload, &ring); for w in &txn.writes { w.table().touched(); }
+            seq = self.log.append_with_ring(OP_TXN, u16::MAX, &payload, &ring);
             for w in &txn.writes {
                 let (t, slot) = (w.table(), w.slot());
                 let i = idx(t.id, slot as usize / CHUNK_ROWS); let d = t.alloc_in(&mut guards[i]); let off = (slot as usize % CHUNK_ROWS) * t.stride;
@@ -1413,6 +1419,7 @@ impl Database {
             match (w, old) { (TxnWrite::Insert { row, .. }, _) => t.idx_add(row, slot), (TxnWrite::Update { row, .. }, Some(old)) => t.idx_replace(&old, row, slot), _ => {} }
         }
         for w in &txn.writes { if let TxnWrite::Update { table, row, old_key: Some(k), slot, .. } = w { if table.unique_key(row) != Some(&k[..]) { table.uniq_remove(k, *slot); } } }
+        for w in &txn.writes { w.table().touched(); }   // after publishing: a sign-in check before this sees the change next time
         for w in &txn.writes { match w { TxnWrite::Insert { table, row, .. } => table.mirror_insert(row), TxnWrite::Update { table, row, .. } => table.mirror_update(row), TxnWrite::Delete { table, row, .. } => table.mirror_delete(table.pk_of(row)) } }
         Ok(seq)
     }

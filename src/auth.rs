@@ -430,6 +430,27 @@ mod tests {
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test] fn a_sign_out_racing_a_statement_still_ends_the_session() {
+        // durable, on disk: a delete then waits for its fsync between the log append and the publish, which is where
+        // a statement could check the token too early (the counter has to move after the publish)
+        let d = std::path::PathBuf::from(format!("data/nocow/auth-revrace-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Arc::new(Sql::open_with(&d, Config::default().durable(crate::config::Durability::Fsync)).unwrap()); setup(&s);
+        s.sign_up("users", &[("email".into(), text("a@x"))], "password a").unwrap();
+        for round in 0..300 {
+            let t = s.sign_in("users", "a@x", "password a").unwrap().token;
+            let mut held = as_token(&s, &t).unwrap();
+            let (stop, s2) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), s.clone());
+            let st = stop.clone();
+            let h = std::thread::spawn(move || { while !st.load(std::sync::atomic::Ordering::Relaxed) { if s2.exec_s(&mut held, "SELECT count(*) FROM notes", &[]).is_err() { return true; } } false });
+            s.sign_out(&t).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !h.is_finished() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(1)); }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(h.join().unwrap(), "round {round}: the session went on after its sign-out");
+            if round % 50 == 49 { s.auth.failures.lock().unwrap().clear(); }
+        }
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
     #[test] fn subscriptions_from_a_token_end_with_it() {
         let d = tmp("subs"); let s = Arc::new(Sql::open_with(&d, Config::default()).unwrap()); setup(&s);
         let a = s.sign_up("users", &[("email".into(), text("a@x"))], "password a").unwrap();
