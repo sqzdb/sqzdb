@@ -11,6 +11,11 @@ export class SqweezError extends Error {
   constructor(code, message) { super(message); this.name = 'SqweezError'; this.code = code; }
 }
 const err = (e) => new SqweezError(e.code || 'ERROR', e.error || String(e));
+const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+// the verifier of a provider sign-in this tab started (sessionStorage: it survives the trip to the provider)
+const verifiers = { mem: new Map(),
+  put(k, v) { try { globalThis.sessionStorage.setItem(k, v); } catch { this.mem.set(k, v); } },
+  take(k) { let v = null; try { v = globalThis.sessionStorage.getItem(k); globalThis.sessionStorage.removeItem(k); } catch {} if (v === null) { v = this.mem.get(k) ?? null; this.mem.delete(k); } return v; } };
 const toObjects = (r) => r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
 
 class Auth {
@@ -24,10 +29,14 @@ class Auth {
   async methods() { const r = await this._c._fetch(`/api/auth/${this.table}/methods`); const v = await r.json(); if (v.error) throw err(v); return v; }
   /** Sign in with a provider configured on the server (auth.oauth.<provider>): the browser leaves for the provider
    *  and comes back to `returnTo` (this page by default), where `connect` finishes the sign-in. */
-  signInWith(provider, { returnTo } = {}) {
+  async signInWith(provider, { returnTo } = {}) {
     const back = returnTo || globalThis.location?.href.split('#')[0];
     if (!back) throw new SqweezError('ARGUMENTS', 'signInWith needs returnTo outside a browser');
-    const to = `${this._c.url}/api/auth/${this.table}/oauth/${encodeURIComponent(provider)}?return=${encodeURIComponent(back)}`;
+    // the code that comes back works only with this verifier, so a code planted in a link signs no one in
+    const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+    verifiers.put(`${this._c._key}:verifier`, verifier);
+    const to = `${this._c.url}/api/auth/${this.table}/oauth/${encodeURIComponent(provider)}?return=${encodeURIComponent(back)}&challenge=${challenge}`;
     if (globalThis.location) globalThis.location.assign(to); return to;
   }
   async signOut() {
@@ -68,7 +77,9 @@ class Client {
     if (!code && !e) return;
     globalThis.history?.replaceState(null, '', loc.href.split('#')[0]);
     if (e) throw new SqweezError('AUTH', e);
-    this.auth._took(await this._post('/api/auth/exchange', { code }, false));
+    const verifier = verifiers.take(`${this._key}:verifier`);
+    if (!verifier) throw new SqweezError('AUTH', 'sign-in failed: this page did not start this sign-in');
+    this.auth._took(await this._post('/api/auth/exchange', { code, verifier }, false));
   }
   _fetch(path, init) { return this._fetchImpl(this.url + path, init); }
   async _post(path, body, signed = true) {

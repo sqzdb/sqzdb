@@ -5,9 +5,12 @@
 //! - `POST /api/auth/<table>/sign-up` `{fields, password}`, `POST /api/auth/<table>/sign-in` `{login, password}`,
 //!   `POST /api/auth/sign-out`, `GET /api/me`, and `GET /api/auth/<table>/methods`: whether clients may sign up
 //!   there, and the providers they may sign in with (for a sign-in page).
-//! - `GET /api/auth/<table>/oauth/<provider>?return=<url>` sends the browser to the provider; the provider comes back
-//!   to `…/callback`, which sends the browser to `return` with `#sqz_code=…`, a one-time code (60 s) that the client
-//!   trades for a session at `POST /api/auth/exchange` (the session token never sits in a URL or the history).
+//! - `GET /api/auth/<table>/oauth/<provider>?return=<url>&challenge=<c>` sends the browser to the provider; the
+//!   provider comes back to `…/callback`, which sends the browser to `return` with `#sqz_code=…`, a one-time code
+//!   (60 s) that the client trades for a session at `POST /api/auth/exchange` `{code, verifier}` (the session token
+//!   never sits in a URL or the history). The code works only with the verifier the starting page kept, whose
+//!   SHA-256 is `challenge` (as in PKCE): a code someone else got for their own account and planted in a link
+//!   signs nobody in.
 //! - `POST /api/sql` `{sql, params}`, `POST /api/batch` `{statements: [{sql, params}…]}` (one transaction).
 //! - `GET /api/socket`: a WebSocket carrying JSON messages: `auth`, `sql`, `batch`, `live` and `unlive`. A live
 //!   query sends its rows at once and again whenever they change; one socket carries any number of them. `auth`
@@ -66,7 +69,7 @@ const OUT_QUEUE: usize = 64;
 
 /// Shared by every connection of one listener. `hashing`: sign-ups and sign-ins running at once (a password hash
 /// takes 19 MB and a core); the rest wait here as tasks rather than as blocked threads.
-struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (String, J, Instant)>>, hashing: tokio::sync::Semaphore }
+struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore }
 impl AppState {
     /// A token bucket per client address for sign-up, sign-in and code exchange: 10 at once, then one every 3 s.
     fn allow(&self, ip: IpAddr) -> bool {
@@ -249,6 +252,9 @@ fn user_json(sql: &Sql, table: &str, user: &[(String, Value)]) -> J {
 fn signed_json(sql: &Sql, table: &str, si: &crate::auth::SignedIn) -> J { json!({"token": si.token, "user": user_json(sql, table, &si.user), "created": si.created}) }
 fn body_json(req: &Req) -> Result<J, J> { serde_json::from_slice(&req.body).map_err(|e| json!({"error": format!("bad JSON: {e}"), "code": "ARGUMENTS"})) }
 fn cookie(req: &Req, name: &str) -> Option<String> { req.headers.get("cookie")?.split(';').filter_map(|c| c.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| url_decode(v)) }
+/// The PKCE-style challenge for a verifier: base64url (no padding) of its SHA-256.
+fn challenge_of(verifier: &str) -> String { crate::util::base64(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()).as_ref()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string() }
+fn is_challenge(c: &str) -> bool { c.len() == 43 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') }
 fn enc(s: &str) -> String { s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect() }
 /// A URL to send the browser back to after a provider sign-in: on an allowed origin, so the API is no open redirect,
 /// and printable ASCII only (it goes into a Location header).
@@ -305,8 +311,12 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
         })),
         ("POST", ["api", "auth", "sign-out"]) => { if let Some(t) = bearer(req) { let _ = sql.sign_out(&t); } json_resp(200, &json!({}), &h) }
         ("POST", ["api", "auth", "exchange"]) => reply(if !st.allow(ip) { Err(limited()) } else { body_json(req).and_then(|v| {
-            let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
-            match st.codes.lock().unwrap().remove(code) { Some((_, signed, at)) if at.elapsed() < CODE_TTL => Ok(signed), _ => Err(json!({"error": "sign-in failed: unknown or expired sign-in code; sign in again", "code": "AUTH"})) }
+            let code = v.get("code").and_then(|c| c.as_str()).unwrap_or(""); let verifier = v.get("verifier").and_then(|c| c.as_str()).unwrap_or("");
+            let held = st.codes.lock().unwrap().remove(code);   // one attempt per code, whatever the verifier
+            match held {
+                Some((signed, challenge, at)) if at.elapsed() < CODE_TTL && verifier.len() >= 43 && crate::net::same_secret(challenge_of(verifier).as_bytes(), challenge.as_bytes()) => Ok(signed),
+                _ => Err(json!({"error": "sign-in failed: an unknown or expired sign-in code, or one this page did not start; sign in again", "code": "AUTH"})),
+            }
         }) }),
         ("POST", ["api", "auth", table, op @ ("sign-up" | "sign-in")]) => reply(if !st.allow(ip) { Err(limited()) } else { body_json(req).and_then(|v| {
             let pw = v.get("password").and_then(|p| p.as_str()).unwrap_or("");
@@ -317,27 +327,31 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
             let back = req.query.get("return").cloned().unwrap_or_default();
             let Some(base) = sql.cfg.app.public_url.clone() else { return json_resp(400, &json!({"error": "set app.publicUrl to sign in with a provider", "code": "CONFIG"}), &h) };
             if !return_ok(sql, &back) { return json_resp(400, &json!({"error": "return must be a URL on one of app.origins", "code": "ARGUMENTS"}), &h); }
+            let challenge = req.query.get("challenge").cloned().unwrap_or_default();
+            if !is_challenge(&challenge) { return json_resp(400, &json!({"error": "challenge must be the base64url SHA-256 of a verifier the page keeps (the client's signInWith makes both)", "code": "ARGUMENTS"}), &h); }
             let callback = format!("{base}/api/auth/{table}/oauth/{provider}/callback");
             match sql.oauth_start(table, provider, &callback, None) {
                 Ok(start) => {
                     let attrs = format!("Path=/api/auth/; HttpOnly; SameSite=Lax; Max-Age=600{}", if base.starts_with("https://") { "; Secure" } else { "" });
-                    redirect(&start.url, &[format!("sqz_oauth={}; {attrs}", start.cookie), format!("sqz_return={}; {attrs}", enc(&back))])
+                    redirect(&start.url, &[format!("sqz_oauth={}; {attrs}", start.cookie), format!("sqz_return={}; {attrs}", enc(&back)), format!("sqz_challenge={challenge}; {attrs}")])
                 }
                 Err(e) => json_resp(400, &err_json(e), &h),
             }
         }
         ("GET", ["api", "auth", table, "oauth", provider, "callback"]) => {
             let back = cookie(req, "sqz_return").filter(|b| return_ok(sql, b));
-            let clear = vec!["sqz_oauth=; Path=/api/auth/; HttpOnly; Max-Age=0".to_string(), "sqz_return=; Path=/api/auth/; HttpOnly; Max-Age=0".to_string()];
+            let clear: Vec<String> = ["sqz_oauth", "sqz_return", "sqz_challenge"].iter().map(|c| format!("{c}=; Path=/api/auth/; HttpOnly; Max-Age=0")).collect();
+            let challenge = cookie(req, "sqz_challenge").filter(|c| is_challenge(c));
             let result = match (req.query.get("error"), req.query.get("code"), req.query.get("state")) {
                 (Some(e), _, _) => Err(format!("sign-in failed: the provider answered {e}")),
+                _ if challenge.is_none() => Err("sign-in failed: this browser did not start this sign-in".into()),
                 (None, Some(code), Some(state)) => { let create = sql.cfg.app.sign_up.contains_key(&table.to_ascii_lowercase()); sql.oauth_finish_as(table, provider, code, state, &cookie(req, "sqz_oauth").unwrap_or_default(), create) }
                 _ => Err("sign-in failed: the provider sent no code".into()),
             };
             match (back, result) {
                 (Some(b), Ok(si)) => {
                     let code = { let mut raw = [0u8; 24]; getrandom::fill(&mut raw).expect("random"); raw.iter().map(|x| format!("{x:02x}")).collect::<String>() };
-                    { let mut codes = st.codes.lock().unwrap(); codes.retain(|_, (_, _, at)| at.elapsed() < CODE_TTL); codes.insert(code.clone(), (table.to_string(), signed_json(sql, table, &si), Instant::now())); }
+                    { let mut codes = st.codes.lock().unwrap(); codes.retain(|_, (_, _, at)| at.elapsed() < CODE_TTL); codes.insert(code.clone(), (signed_json(sql, table, &si), challenge.unwrap_or_default(), Instant::now())); }
                     redirect(&format!("{b}#sqz_code={code}"), &clear)
                 }
                 (Some(b), Err(e)) => redirect(&format!("{b}#sqz_error={}", enc(&e)), &clear),

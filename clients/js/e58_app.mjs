@@ -97,28 +97,49 @@ try {
   // sign-in with a provider: the API sends the browser there, and back to the app with a one-time code
   const get = (path, cookie) => fetch(url + path, { redirect: 'manual', headers: cookie ? { cookie } : {} });
   const cookiesOf = (res) => res.headers.getSetCookie().map((c) => c.split(';')[0]).join('; ');
-  const back = 'http://localhost:5173/app';
-  assert.equal((await get(`/api/auth/users/oauth/idp?return=${encodeURIComponent('https://evil.example/')}`)).status, 400);   // no open redirect
-  assert.equal((await get(`/api/auth/users/oauth/idp?return=${encodeURIComponent(`${back}\r\nRefresh: 0`)}`)).status, 400);   // nothing to break the Location header
-  const startOAuth = async () => { const r = await get(`/api/auth/users/oauth/idp?return=${encodeURIComponent(back)}`); assert.equal(r.status, 302); return { to: r.headers.get('location'), cookies: cookiesOf(r) }; };
-  let st = await startOAuth(); assert.ok(st.to.startsWith(`${idpUrl}/authorize?`));
-  const cb = await get(`/api/auth/users/oauth/idp/callback?code=code-1&state=${encodeURIComponent(approve(st.to, 'code-1', 'idp-carol', 'Carol@IdP.test'))}`, st.cookies);
-  assert.equal(cb.status, 302); const landed = new URL(cb.headers.get('location'));
+  const back = 'http://localhost:5173/app', C = 'A'.repeat(43);   // C: a well-formed challenge, for refusals that come first
+  assert.equal((await get(`/api/auth/users/oauth/idp?return=${encodeURIComponent('https://evil.example/')}&challenge=${C}`)).status, 400);   // no open redirect
+  assert.equal((await get(`/api/auth/users/oauth/idp?return=${encodeURIComponent(`${back}\r\nRefresh: 0`)}&challenge=${C}`)).status, 400);   // nothing to break the Location header
+  assert.equal((await get(`/api/auth/users/oauth/idp?return=${encodeURIComponent(back)}`)).status, 400);   // no challenge
+  // a browser tab: its address bar, history and sessionStorage (where signInWith keeps the verifier)
+  const tab = () => { const m = new Map(); return { getItem: (k) => m.get(k) ?? null, setItem: (k, v) => m.set(k, v), removeItem: (k) => m.delete(k) }; };
+  const inTab = async (t, href, fn) => {
+    const bar = []; Object.assign(globalThis, { location: { href, hash: new URL(href).hash, assign() {} }, history: { replaceState: (_, __, u) => bar.push(u) }, sessionStorage: t });
+    try { return [await fn(), bar]; } finally { delete globalThis.location; delete globalThis.history; delete globalThis.sessionStorage; }
+  };
+  /** The page in tab `t` starts a provider sign-in: the API's redirect to the provider, and its cookies. */
+  const start = async (t) => {
+    const [to] = await inTab(t, back, () => connect(url, { storage: null }).auth.signInWith('idp')); const u = new URL(to);
+    const r = await get(u.pathname + u.search); assert.equal(r.status, 302); return { to: r.headers.get('location'), cookies: cookiesOf(r) };
+  };
+  /** …and the provider approves `sub`: where the browser lands back on the app. */
+  const signInAt = async (t, code, sub, email) => {
+    const st = await start(t);
+    const cb = await get(`/api/auth/users/oauth/idp/callback?code=${code}&state=${encodeURIComponent(approve(st.to, code, sub, email))}`, st.cookies);
+    assert.equal(cb.status, 302); return new URL(cb.headers.get('location'));
+  };
+  const carolTab = tab(); const landed = await signInAt(carolTab, 'code-1', 'idp-carol', 'Carol@IdP.test');
   assert.equal(landed.origin + landed.pathname, back); const code = new URLSearchParams(landed.hash.slice(1)).get('sqz_code'); assert.ok(code);
-  // the client on that page trades the code for a session and takes it out of the address bar
-  const bar = []; globalThis.location = { href: landed.href, hash: landed.hash }; globalThis.history = { replaceState: (_, __, u) => bar.push(u) };
-  const carol = connect(url, { storage: null }); await carol.ready; delete globalThis.location; delete globalThis.history;
+  // back in the same tab, the client trades the code (with the tab's verifier) and takes it out of the address bar
+  const [carol, bar] = await inTab(carolTab, landed.href, async () => { const c = connect(url, { storage: null }); await c.ready; return c; });
   assert.equal(carol.auth.user.email, 'carol@idp.test'); assert.deepEqual(bar, [back]);
   assert.deepEqual(await carol.sql('SELECT count(*) AS n FROM notes'), [{ n: 0 }]);   // a new user: no rows of anyone else's
-  const exchange = (c) => fetch(`${url}/api/auth/exchange`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: c }) });
-  assert.equal((await exchange(code)).status, 401);   // the code works once
-  // the provider's answer delivered to another browser (without the cookie from the start): an error back on the page
-  st = await startOAuth(); const st2 = approve(st.to, 'code-2', 'idp-carol', 'carol@idp.test');
+  const exchange = (c, verifier) => fetch(`${url}/api/auth/exchange`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: c, verifier }) });
+  assert.equal((await exchange(code, 'v'.repeat(43))).status, 401);   // the code works once
+  // login CSRF: Mallory signs in with her own provider account and plants the code in a link to the app. A tab that
+  // started a sign-in of its own has another verifier, and the API refuses it; a tab that started none refuses itself
+  const planted = await signInAt(tab(), 'code-4', 'idp-mallory', 'mallory@idp.test');
+  const victim = tab(); await start(victim);
+  await assert.rejects(inTab(victim, planted.href, () => connect(url, { storage: null }).ready), (e) => e.code === 'AUTH');
+  const planted2 = await signInAt(tab(), 'code-5', 'idp-mallory', 'mallory@idp.test');
+  await assert.rejects(inTab(tab(), planted2.href, () => connect(url, { storage: null }).ready), (e) => e.code === 'AUTH' && /did not start/.test(e.message));
+  // the provider's answer delivered to another browser (without the cookies from the start): an error back on the page
+  const st = await start(tab()); const st2 = approve(st.to, 'code-2', 'idp-carol', 'carol@idp.test');
   const elsewhere = await get(`/api/auth/users/oauth/idp/callback?code=code-2&state=${encodeURIComponent(st2)}`, st.cookies.split('; ').filter((c) => c.startsWith('sqz_return=')).join('; '));
   const h = new URLSearchParams(new URL(elsewhere.headers.get('location')).hash.slice(1)); assert.ok(h.get('sqz_error') && !h.get('sqz_code'), String(h));
   assert.equal((await get(`/api/auth/users/oauth/idp/callback?code=code-2&state=${encodeURIComponent(st2)}`)).status, 400);   // no cookies at all
   // a table not open to sign-up: a provider account not linked to one of its users is refused, not made a user
-  const toStaff = await get(`/api/auth/staff/oauth/idp?return=${encodeURIComponent(back)}`); const sc = cookiesOf(toStaff);
+  const toStaff = await get(`/api/auth/staff/oauth/idp?return=${encodeURIComponent(back)}&challenge=${C}`); const sc = cookiesOf(toStaff);
   const staffBack = await get(`/api/auth/staff/oauth/idp/callback?code=code-3&state=${encodeURIComponent(approve(toStaff.headers.get('location'), 'code-3', 'idp-mal', 'mal@idp.test'))}`, sc);
   assert.match(new URL(staffBack.headers.get('location')).hash, /^#sqz_error=.*not%20made%20here/);
   carol.close();

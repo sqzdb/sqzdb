@@ -16,8 +16,9 @@ export interface Auth {
   signIn(login: string, password: string): Promise<SignedIn>;
   /** Whether users may make an account in this table from the client, and the providers they may sign in with. */
   methods(): Promise<{ signUp: boolean; providers: string[] }>;
-  /** Leave for the provider (auth.oauth.<provider> on the server); `connect` finishes the sign-in on return. */
-  signInWith(provider: string, opts?: { returnTo?: string }): string;
+  /** Leave for the provider (auth.oauth.<provider> on the server); `connect` finishes the sign-in on return, in the
+   *  same tab (the tab keeps the verifier the returned code needs). Resolves to the URL it went to. */
+  signInWith(provider: string, opts?: { returnTo?: string }): Promise<string>;
   signOut(): Promise<void>;
   onChange(fn: (user: Row | null) => void): () => void;
 }

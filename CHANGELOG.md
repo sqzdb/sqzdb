@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.1 — 2026-10-18
+
+**Upgrade from 0.6.0 if you use provider sign-in through the app API.** Use the client the server serves
+(`/api/client.js`), or `clients/js` from this release.
+
+### Fixed
+- **A provider sign-in code could be planted in another browser (login CSRF).** Someone could sign in
+  with their own provider account, keep the one-time code from their address bar, and send a link to the
+  app carrying it. Whoever opened the link was signed in as them, and what they wrote went to that
+  account. The code now works only with a verifier the starting tab keeps, as in PKCE.
+
+### Changed
+- `auth.signInWith` returns a promise. `GET /api/auth/<table>/oauth/<provider>` requires `challenge` (the
+  base64url SHA-256 of the page's verifier), and `POST /api/auth/exchange` requires `verifier`. The client
+  does both.
+
 ## 0.6.0 — 2026-10-18
 
 ### Added

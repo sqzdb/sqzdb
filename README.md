@@ -126,7 +126,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.6.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.6.1` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -573,7 +573,10 @@ transaction, `live(text, params, fn)` and `close()`. [`demos/notes`](demos/notes
 - **Providers:** `signInWith('google')` sends the browser to the API, which sends it to Google. Google
   sends it back to the API, which returns it to the app's page with a one-time code in the URL fragment. The
   client trades the code for a session (once, within 60 seconds) and removes it from the address bar, so
-  a session token never sits in a URL. The page must be on `app.origins` or `app.publicUrl`.
+  a session token never sits in a URL. The code works only in the tab that started the sign-in:
+  `signInWith` keeps a random verifier in that tab's `sessionStorage` and sends only its SHA-256, and the
+  exchange needs the verifier (as in PKCE). A code someone else got for their own account and planted in
+  a link signs no one in. The page must be on `app.origins` or `app.publicUrl`.
 - **Origins:** browsers may call from the API's own origin and from `app.origins`. Requests and
   WebSockets from other pages are refused.
 - **Live queries:** up to 64 per connection. They end when their session does, or when a change to the
@@ -582,8 +585,8 @@ transaction, `live(text, params, fn)` and `close()`. [`demos/notes`](demos/notes
 | Endpoint | Returns |
 |---|---|
 | `POST /api/auth/<table>/sign-up` `{fields, password}` and `…/sign-in` `{login, password}` | `{token, user, created}` |
-| `GET /api/auth/<table>/oauth/<provider>?return=<url>` | the provider's sign-in page |
-| `POST /api/auth/exchange` `{code}` | `{token, user, created}`, for the code a provider sign-in returned |
+| `GET /api/auth/<table>/oauth/<provider>?return=<url>&challenge=<c>` | the provider's sign-in page; `c` is the base64url SHA-256 of the page's verifier |
+| `POST /api/auth/exchange` `{code, verifier}` | `{token, user, created}`, for the code a provider sign-in returned |
 | `POST /api/auth/sign-out`, `GET /api/me`, `GET /api/auth/<table>/methods` | |
 | `POST /api/sql` `{sql, params}` and `POST /api/batch` `{statements}` | `{columns, rows}`, and `lastInsertId` for an `INSERT` |
 | `GET /api/socket` | a WebSocket of JSON messages: `auth`, `sql`, `batch`, `live` and `unlive` |
@@ -935,7 +938,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.6.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.6.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 
