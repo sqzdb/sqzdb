@@ -109,7 +109,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.3.1` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.3.2` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -388,6 +388,10 @@ Nothing about the user is stored in the database.
 - Reads, writes, subscriptions and live queries are all filtered. A write outside the policy fails with
   `DENIED`, and asking for another tenant's row by its id returns nothing.
 - Grants from all of a session's roles add up, and every policy of those roles applies together.
+- A write that reads the rows it changes needs `SELECT` too, as in PostgreSQL, and reaches only the rows
+  the role's `SELECT` policies show: an `UPDATE` or `DELETE` with a condition beyond `id = ?`, an
+  `UPDATE` whose `SET` reads a column, `RETURNING`, and `ON CONFLICT … DO UPDATE`. `UPDATE … SET n = 1
+  WHERE id = ?` and `DELETE … WHERE id = ?` need only `UPDATE` or `DELETE`.
 - A missing attribute is an error, not an empty result. So is an unknown role, or an attribute that is
   `undefined`.
 - An identity can never change the schema, roles, grants or policies. Only the application's own handle can.
@@ -665,7 +669,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.3.1`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.3.2`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

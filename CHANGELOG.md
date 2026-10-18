@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.2 — 2026-10-17
+
+**Upgrade if you use roles and row policies.** A role could read rows through a write that its grants
+and policies hide from it (see Fixed).
+
+### Fixed
+- **A role could read rows it has no right to read through a write.** `UPDATE … RETURNING` returned
+  rows to a role without `SELECT` on the table, or outside its `SELECT` policies, and the row count of an
+  `UPDATE`, `DELETE` or upsert with a condition on other columns told it whether rows with given values
+  exist (0.3.1 for `UPDATE`, 0.3.0 for `ON CONFLICT … DO UPDATE`, earlier versions for `DELETE`). A
+  write that reads the rows it changes now needs `SELECT` as well and reaches only the rows the role's
+  `SELECT` policies show, as in PostgreSQL. A write by primary key with values from the statement still
+  needs only `UPDATE` or `DELETE`.
+
 ## 0.3.1 — 2026-10-17
 
 **Upgrade from 0.3.0:** any role allowed to run a `SELECT` could crash a 0.3.0 server by exhausting its

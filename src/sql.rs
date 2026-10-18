@@ -182,6 +182,8 @@ fn literal_name(id: &ast::Ident) -> Result<(), String> {
     if id.quote_style.is_none() && ["true", "false", "null"].contains(&id.value.to_lowercase().as_str()) { return Err(format!("a column can't be named {} without quotes; write \"{}\"", id.value, id.value)); }
     Ok(())
 }
+/// Does this expression read a column of the row (rather than only parameters, literals and functions)?
+fn reads_row(x: &SExpr) -> bool { let mut r = false; x.walk(&mut |n| if matches!(n, SExpr::Col(_)) { r = true; }); r }
 /// The columns of a RETURNING list: names and `*`.
 fn returning_cols(items: &[SelectItem], schema: &Schema) -> Result<Vec<usize>, String> {
     let mut cols = vec![];
@@ -2076,6 +2078,12 @@ impl Sql {
                     if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); }
                 }
                 let policy = self.guard(sess, table, P_UPDATE)?;
+                // reading the rows' values (a WHERE beyond the key, a SET over the row, RETURNING) needs SELECT, as in
+                // PostgreSQL, and reaches only rows the SELECT policy shows; otherwise RETURNING or the count would
+                // show what the role cannot read
+                let reads = matches!(at, UpdWhere::Rows { .. }) || returning.is_some() || sets.iter().any(|(_, v)| matches!(v, SetVal::Row(x) if reads_row(x)));
+                let sel = if reads { Some(self.guard(sess, table, P_SELECT)?) } else { None };
+                let shown = |row: &[u8]| sel.as_ref().map(|ps| ps.iter().all(|p| p.eval(row))).unwrap_or(true);
                 let schema = &table.schema;
                 let vals = sets.iter().filter_map(|(c, v)| if let SetVal::Value(e) = v { Some(self.resolve(sess, e, params).map(|v| (*c, v))) } else { None }).collect::<Result<Vec<_>, _>>()?;
                 let rowx: Vec<(usize, SExpr)> = if !sets.iter().any(|(_, v)| matches!(v, SetVal::Row(_))) { vec![] } else { let xs: Vec<(usize, SExpr)> = sets.iter().filter_map(|(c, v)| if let SetVal::Row(x) = v { Some((*c, x.clone())) } else { None }).collect(); let bound = self.bind(sess, &xs.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?; xs.into_iter().map(|(c, _)| c).zip(bound).collect() };
@@ -2087,12 +2095,12 @@ impl Sql {
                     UpdWhere::Pk(e) => {
                         let kv = self.resolve(sess, e, params)?; let pk = table.schema.key_from_value(&kv)?;
                         let missing = |a: Abort| if matches!(a, Abort::NotFound) { format!("NotFound: no row in {} has {} = {}", schema.name, schema.columns[schema.pk].name, crate::expr::num_text(&kv)) } else { a.to_string() };
-                        let f = |row: &[u8]| -> Result<Vec<u8>, Abort> { for p in &policy { if !p.eval(row) { return Err(Abort::NotFound); } } let new = make(row)?; if returning.is_some() { changed.push(new.clone()); } Ok(new) };
+                        let f = |row: &[u8]| -> Result<Vec<u8>, Abort> { for p in &policy { if !p.eval(row) { return Err(Abort::NotFound); } } if !shown(row) { return Err(Abort::NotFound); } let new = make(row)?; if returning.is_some() { changed.push(new.clone()); } Ok(new) };
                         match &mut sess.txn { Some(t) => { table.txn_update(t, pk, f).map_err(missing)?; } None => { sess.last_seq = table.update_by_pk(pk, f).map_err(missing)?; } }
                         if returning.is_none() { return Ok(vec![vec![Value::Int(1)]]); }
                     }
                     UpdWhere::Rows { access, preds, filters } => {
-                        let mut cp = preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?; cp.append(&mut self.guard(sess, table, P_UPDATE)?);
+                        let mut cp = preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?; cp.append(&mut self.guard(sess, table, P_UPDATE)?); cp.append(&mut self.guard(sess, table, P_SELECT)?);
                         let filters = self.bind(sess, filters, params)?;
                         let pks = self.matching_keys(sess, table, access, &cp, &filters, params)?;
                         // a row is changed only if it still matches when it is updated (a concurrent writer may have changed it since)
@@ -2119,6 +2127,8 @@ impl Sql {
                     if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); }
                 }
                 let mut policy = self.guard(sess, table, P_DELETE)?;
+                // a condition beyond `key = value` reads the rows: SELECT, and its policy, as for UPDATE
+                if !(matches!(access, Access::Pk(_)) && preds.is_empty() && filters.is_empty()) { policy.append(&mut self.guard(sess, table, P_SELECT)?); }
                 let schema = &table.schema;
                 let mut cp = preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?; cp.append(&mut policy);
                 let filters = self.bind(sess, filters, params)?;
@@ -2142,7 +2152,9 @@ impl Sql {
     /// update the existing row, or replace it. All rows in one transaction; returns the rows inserted or updated.
     fn upsert(&self, sess: &mut Session, table: &Arc<Table>, conflict: &Conflict, all: &[Vec<Value>], encoded: &[Vec<u8>], params: &[Value]) -> Result<Vec<Vec<u8>>, String> {
         let schema = &table.schema; let n = schema.columns.len();
-        let upd_policy = if matches!(conflict, Conflict::Update { .. } | Conflict::Replace) { Some(self.guard(sess, table, if matches!(conflict, Conflict::Replace) { P_DELETE } else { P_UPDATE })?) } else { None };
+        let mut upd_policy = if matches!(conflict, Conflict::Update { .. } | Conflict::Replace) { Some(self.guard(sess, table, if matches!(conflict, Conflict::Replace) { P_DELETE } else { P_UPDATE })?) } else { None };
+        // DO UPDATE reads the existing row (its SET, its WHERE, RETURNING): SELECT, and the row must pass its policy
+        if let (Conflict::Update { .. }, Some(ps)) = (conflict, upd_policy.as_mut()) { ps.append(&mut self.guard(sess, table, P_SELECT)?); }
         let (sets, cond) = match conflict {
             Conflict::Update { sets, cond, .. } => (self.bind(sess, &sets.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?, match cond { Some(c) => Some(self.bind(sess, std::slice::from_ref(c), params)?.remove(0)), None => None }),
             _ => (vec![], None),
@@ -3326,6 +3338,36 @@ mod insert_tests {
         let s = Sql::open_with(&d, Config::default()).unwrap();
         assert_eq!(rows(&s, "SELECT k, n, email FROM kv WHERE k = 4"), vec![vec![i(4), i(99), Value::Text("dd@y".into())]]);
         assert_eq!(rows(&s, "SELECT k FROM kv WHERE email = 'a@x'"), vec![vec![i(3)]]);
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn writes_that_read_rows_need_select() {
+        let (s, d) = db("readguard");
+        let i = |v: i64| Value::Int(v);
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (3, 'c@x', 30), (4, 'd@x', 40)");
+        for q in ["CREATE ROLE writer", "GRANT UPDATE, DELETE, INSERT ON kv TO writer",                    // no SELECT
+                  "CREATE ROLE peer", "GRANT SELECT, UPDATE, DELETE, INSERT ON kv TO peer",
+                  "CREATE POLICY peer_sees ON kv FOR SELECT TO peer USING (k = SESSION.k)",               // reads one row,
+                  "CREATE POLICY peer_updates ON kv FOR UPDATE TO peer USING (n >= 0)",                   // may write any
+                  "CREATE POLICY peer_deletes ON kv FOR DELETE TO peer USING (n >= 0)", "CREATE POLICY peer_inserts ON kv FOR INSERT TO peer USING (n >= 0)"] {
+            rows(&s, q);
+        }
+        let as_role = |r: &str| { let mut x = Session::default(); s.assume(&mut x, &[r.to_string()], [("k".to_string(), i(3))].into_iter().collect()).unwrap(); x };
+        let run = |r: &str, q: &str| s.exec_s(&mut as_role(r), q, &[]);
+        // without SELECT: writes by key with values from the statement only
+        assert_eq!(run("writer", "UPDATE kv SET n = 1 WHERE k = 1").unwrap(), vec![vec![i(1)]]);
+        assert_eq!(run("writer", "DELETE FROM kv WHERE k = 2").unwrap(), vec![vec![i(1)]]);
+        for q in ["UPDATE kv SET n = n + 1 WHERE k = 1", "UPDATE kv SET n = 1 WHERE k = 1 RETURNING email", "UPDATE kv SET n = 1 WHERE email LIKE 'c%'",
+                  "UPDATE kv SET n = 1 WHERE n > 0", "DELETE FROM kv WHERE email = 'c@x'", "INSERT INTO kv (k, email, n) VALUES (3, 'x', 0) ON CONFLICT (k) DO UPDATE SET n = kv.n + 1"] {
+            let e = run("writer", q).unwrap_err(); assert!(e.contains("lacks SELECT"), "{q}: {e}"); assert_eq!(error_code(&e), "DENIED");
+        }
+        // with SELECT on one row: the rows a write reads are the rows the role can read
+        assert_eq!(run("peer", "UPDATE kv SET n = n + 1 WHERE n > 0").unwrap(), vec![vec![i(1)]], "only k = 3 is visible");
+        for q in ["UPDATE kv SET n = n WHERE k = 4 RETURNING email", "UPDATE kv SET n = n WHERE k = 4"] { assert_eq!(error_code(&run("peer", q).unwrap_err()), "NOT_FOUND", "{q}: k = 4 is not shown"); }
+        assert!(run("peer", "UPDATE kv SET n = n WHERE k >= 4 RETURNING email").unwrap().is_empty());
+        assert_eq!(run("peer", "UPDATE kv SET n = 0 WHERE k = 4").unwrap(), vec![vec![i(1)]], "a blind write by key is still allowed");
+        assert_eq!(run("peer", "DELETE FROM kv WHERE email LIKE '%@x'").unwrap(), vec![vec![i(1)]], "deletes only the visible row");
+        assert!(run("peer", "INSERT INTO kv (k, email, n) VALUES (4, 'x', 0) ON CONFLICT (k) DO UPDATE SET n = kv.n + 1").unwrap_err().contains("outside your policy"));
+        assert_eq!(rows(&s, "SELECT k, n FROM kv ORDER BY k"), vec![vec![i(1), i(1)], vec![i(4), i(0)]]);
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
     #[test] fn deletes_in_a_transaction_survive_a_restart() {
