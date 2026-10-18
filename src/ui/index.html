@@ -230,7 +230,7 @@ table.data tr.flash td { animation:flash 1.4s ease-out }
 .state.ok { color:var(--ok); background:var(--ok-bg); border-color:rgba(92,201,143,.35) } .state.ok .dot { background:var(--ok) }
 .state.warn { color:var(--warn); background:var(--warn-bg); border-color:rgba(232,181,92,.35) } .state.warn .dot { background:var(--warn) }
 .state.bad { color:var(--bad); background:var(--bad-bg); border-color:rgba(255,112,112,.35) } .state.bad .dot { background:var(--bad) }
-.tiles { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:12px }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:12px }
 .tile { padding:14px 16px }
 .tile .k { color:var(--text-3); font-size:12px }
 .tile .v { margin-top:4px; font-size:20px; font-weight:650; letter-spacing:-.01em; font-variant-numeric:tabular-nums; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
@@ -752,6 +752,8 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
       b.resumed ? ['Behind', b.behind === 0 ? 'In sync' : fmtN(b.behind), b.behind === 0 ? 'every commit is in the bucket' : 'commits not uploaded yet'] : ['Behind', 'Unknown', 'the bucket has not been read yet'],
       ['Uploaded', fmtBytes(b.bytes), fmtN(b.objects) + ' objects'], ['Compression', b.compress ? ratio : 'Off', b.compress ? fmtBytes(b.rawBytes) + ' before zstd' : 'objects are stored as they are'],
       ['Snapshots', fmtN(b.snapshots), `${fmtN(b.merges)} merges · ${fmtN(b.deletes)} retired`]];
+    const f = b.files;
+    if (f) tiles.push(['Files', f.pending ? fmtN(f.pending) + ' waiting' : 'In sync', `${fmtN(f.uploaded)} uploaded (${fmtBytes(f.bytes)}) · ${fmtN(f.deleted)} deleted` + (f.fetched ? ` · ${fmtN(f.fetched)} fetched back` : '') + (f.missing ? ` · ${fmtN(f.missing)} missing` : '')]);
     $('bktiles').innerHTML = tiles.map(([k, v, sub]) => `<div class="card tile"><div class="k">${k}</div><div class="v" title="${esc(v)}">${esc(v)}</div><div class="s" title="${esc(sub)}">${esc(sub)}</div></div>`).join('');
     if (b.lastError) { $('bkerr').classList.remove('hidden'); $('bkerr').classList.toggle('past', !b.failures); $('bkerr').innerHTML = `<h3>${icon('alert')}Last error<span class="dim">${since(b.errorAt, b.now)} · ${b.failures ? fmtN(b.failures) + ' failed in a row · ' : 'recovered since · '}${fmtN(b.failuresTotal)} in total</span></h3><pre>${esc(b.lastError)}</pre>`; }
     else $('bkerr').classList.add('hidden');

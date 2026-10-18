@@ -2,6 +2,7 @@
 //! in time), and followers that read only the bucket. The on-disk backup format of E26 is uploaded as immutable objects:
 //!   snap/{s0:020}                       the snapshot file (self-contained table image + catalog)
 //!   log/{segment:020}/{offset:020}      a chunk of a log segment: the bytes [offset, offset+len), complete records
+//!   files/{id}                          an uploaded file (a FILE column's bytes), written once (see `put_file`)
 //! A chunk is uploaded whenever new records have been written (bounded by `interval`); the active segment grows as a
 //! series of chunks; restore concatenates them. Nothing in the bucket is ever rewritten.
 use crate::table::{parse_glog, GLog, SNAP_MAGIC};
@@ -22,17 +23,30 @@ pub struct CloudConfig { pub endpoint: String, pub bucket: String, pub prefix: S
 /// A frame of an encrypted object: [len u32][nonce 12][ciphertext + 16-byte tag]; objects start with "ENC1".
 const FRAME: usize = 16 << 20; const ENC_MAGIC: &[u8; 4] = b"ENC1";
 fn encrypt(data: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    use aes_gcm::{aead::{Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm};
+    use aes_gcm::{aead::KeyInit, Aes256Gcm};
     let cipher = Aes256Gcm::new(key.into()); let mut out = Vec::with_capacity(data.len() + 64); out.extend_from_slice(ENC_MAGIC);
-    for part in data.chunks(FRAME).chain(if data.is_empty() { Some(&data[..]) } else { None }) { let nonce = Aes256Gcm::generate_nonce(&mut OsRng); let ct = cipher.encrypt(&nonce, part).unwrap(); out.extend_from_slice(&(ct.len() as u32).to_le_bytes()); out.extend_from_slice(&nonce); out.extend_from_slice(&ct); }
+    for part in data.chunks(FRAME).chain(if data.is_empty() { Some(&data[..]) } else { None }) { seal_frame(&cipher, part, &mut out); }
     out
 }
 fn decrypt(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
-    use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+    use aes_gcm::{aead::KeyInit, Aes256Gcm};
     if data.len() < 4 || &data[..4] != ENC_MAGIC { return Err("object is not encrypted the way this key expects".into()); }
     let cipher = Aes256Gcm::new(key.into()); let mut out = Vec::with_capacity(data.len()); let mut p = 4;
-    while p < data.len() { if p + 16 > data.len() { return Err("truncated encrypted object".into()); } let len = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize; let nonce = Nonce::from_slice(&data[p + 4..p + 16]); p += 16; if p + len > data.len() { return Err("truncated encrypted object".into()); } out.extend(cipher.decrypt(nonce, &data[p..p + len]).map_err(|_| "object failed authentication: wrong key, or the data was altered in the bucket".to_string())?); p += len; }
+    while p < data.len() { match open_frame(&cipher, &data[p..])? { Some((pt, n)) => { out.extend(pt); p += n; } None => return Err("truncated encrypted object".into()) } }
     Ok(out)
+}
+fn seal_frame(cipher: &aes_gcm::Aes256Gcm, part: &[u8], out: &mut Vec<u8>) {
+    use aes_gcm::{aead::{Aead, AeadCore, OsRng}, Aes256Gcm};
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); let ct = cipher.encrypt(&nonce, part).unwrap();
+    out.extend_from_slice(&(ct.len() as u32).to_le_bytes()); out.extend_from_slice(&nonce); out.extend_from_slice(&ct);
+}
+/// The frame at the start of `data` decrypted, and the bytes it took; None while `data` holds less than a frame.
+fn open_frame(cipher: &aes_gcm::Aes256Gcm, data: &[u8]) -> Result<Option<(Vec<u8>, usize)>, String> {
+    use aes_gcm::{aead::Aead, Nonce};
+    if data.len() < 16 { return Ok(None); }
+    let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize; if data.len() < 16 + len { return Ok(None); }
+    let pt = cipher.decrypt(Nonce::from_slice(&data[4..16]), &data[16..16 + len]).map_err(|_| "object failed authentication: wrong key, or the data was altered in the bucket".to_string())?;
+    Ok(Some((pt, 16 + len)))
 }
 /// Chunk keys: `log/{segment:020}/{offset:020}-{len:020}[.zst]`; they sort like the log, and the uncompressed length is in the name.
 pub fn chunk_key(seg: u64, off: u64, len: u64, suffix: &str) -> String { format!("log/{seg:020}/{off:020}-{len:020}{suffix}") }
@@ -265,9 +279,14 @@ pub fn clear_prefix(cfg: &CloudConfig) -> usize {
     let rt = rt(); let store = cfg.store(); let keys = rt.block_on(futures_lite_shim::collect_list(&*store, &cfg.key(""))); let mut n = 0;
     for k in keys { if rt.block_on(store.delete(&k)).is_ok() { n += 1; } } n
 }
-/// Rebuild a database directory from the bucket: the latest snapshot plus every chunk after it, in order.
-/// Returns (snapshot s0, chunks downloaded, bytes). The caller opens it with `Sql::open` / `recover_upto`.
+/// Rebuild a database directory from the bucket: the latest snapshot plus every chunk after it, in order, and the
+/// uploaded files. Returns (snapshot s0, chunks downloaded, bytes). The caller opens it with `Sql::open` / `recover_upto`.
 pub fn download(cfg: &CloudConfig, dest: &Path) -> Result<(u64, usize, u64), String> {
+    let (s0, n, bytes) = download_log(cfg, dest)?; let (_, fb) = download_files(cfg, dest)?;
+    Ok((s0, n, bytes + fb))
+}
+/// `download` without the files: the snapshot and the log, into a `dest` emptied first.
+pub fn download_log(cfg: &CloudConfig, dest: &Path) -> Result<(u64, usize, u64), String> {
     let rt = rt(); let store = cfg.store();
     let _ = fs::remove_dir_all(dest); fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     let snaps = rt.block_on(futures_lite_shim::collect_list(&*store, &cfg.key("snap")));
@@ -290,6 +309,145 @@ pub fn download(cfg: &CloudConfig, dest: &Path) -> Result<(u64, usize, u64), Str
         f.write_all(&data[skip..]).map_err(|e| e.to_string())?; *have += (data.len() - skip) as u64; n += 1;
     }
     Ok((s0, n, bytes))
+}
+
+// ---- uploaded files
+
+/// Uploaded files (the bytes of FILE columns) are objects too: `files/{id}`, `.zst` when compressed, `.enc` when
+/// encrypted, written once. Compressed only when it pays (the first megabyte must shrink by a tenth: photos, video and
+/// archives are compressed already), encrypted like the rest, and streamed in 8 MB parts, so a large file is never in
+/// memory whole.
+pub fn file_key(id: &str, z: bool, cfg: &CloudConfig) -> OPath { cfg.key(&format!("files/{id}{}{}", if z { ".zst" } else { "" }, if cfg.key.is_some() { ".enc" } else { "" })) }
+/// The file id of a key under `files/`, and whether its object is compressed and encrypted.
+pub fn parse_file_key(key: &str) -> Option<(String, bool, bool)> {
+    let name = key.rsplit('/').next()?; let (z, e) = flags(name); let id = name.trim_end_matches(".enc").trim_end_matches(".zst");
+    (id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')).then(|| (id.to_string(), z, e))
+}
+/// Parts of a file's upload, and its encryption frames (smaller than other objects', so little is held at once).
+const PART: usize = 8 << 20; const FILE_FRAME: usize = 1 << 20;
+/// `encrypt` as a stream: bytes in, frames of FILE_FRAME bytes out (the format `decrypt` reads), collected in `out`.
+struct Seal { cipher: Option<aes_gcm::Aes256Gcm>, pending: Vec<u8>, out: Vec<u8>, frames: usize }
+impl Seal {
+    fn new(key: Option<&[u8; 32]>) -> Seal { use aes_gcm::aead::KeyInit; let cipher = key.map(|k| aes_gcm::Aes256Gcm::new(k.into())); Seal { out: if cipher.is_some() { ENC_MAGIC.to_vec() } else { vec![] }, cipher, pending: Vec::with_capacity(FILE_FRAME), frames: 0 } }
+    fn seal(&mut self, n: usize) { let Some(c) = &self.cipher else { return }; seal_frame(c, &self.pending[..n], &mut self.out); self.pending.drain(..n); self.frames += 1; }
+    /// What is left to send, the last frame included (an empty object still has one).
+    fn finish(mut self) -> Vec<u8> { if self.cipher.is_some() && (!self.pending.is_empty() || self.frames == 0) { self.seal(self.pending.len()); } self.out }
+}
+impl Write for Seal {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.cipher.is_none() { self.out.extend_from_slice(b); return Ok(b.len()); }
+        let mut rest = b;
+        while !rest.is_empty() { let n = (FILE_FRAME - self.pending.len()).min(rest.len()); self.pending.extend_from_slice(&rest[..n]); rest = &rest[n..]; if self.pending.len() == FILE_FRAME { self.seal(FILE_FRAME); } }
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+enum Pack { Plain(Seal), Z(zstd::stream::write::Encoder<'static, Seal>) }
+impl Pack {
+    fn sink(&mut self) -> &mut Seal { match self { Pack::Plain(s) => s, Pack::Z(z) => z.get_mut() } }
+    fn finish(self) -> std::io::Result<Vec<u8>> { Ok(match self { Pack::Plain(s) => s, Pack::Z(z) => z.finish()? }.finish()) }
+}
+impl Write for Pack {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { match self { Pack::Plain(s) => s.write(b), Pack::Z(z) => z.write(b) } }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+/// `unpack` as a stream: an object's bytes in as they arrive, the file's bytes out.
+struct Unseal { cipher: Option<aes_gcm::Aes256Gcm>, buf: Vec<u8>, magic: bool, out: Unpack }
+enum Unpack { Plain(File), Z(zstd::stream::zio::Writer<File, zstd::stream::raw::Decoder<'static>>) }
+impl Unseal {
+    fn push(&mut self, b: &[u8]) -> Result<(), String> {
+        let Some(c) = &self.cipher else { return self.out.write_all(b).map_err(|e| e.to_string()) };
+        self.buf.extend_from_slice(b);
+        if !self.magic { if self.buf.len() < 4 { return Ok(()); } if &self.buf[..4] != ENC_MAGIC { return Err("object is not encrypted the way this key expects".into()); } self.magic = true; self.buf.drain(..4); }
+        let mut p = 0; while let Some((pt, n)) = open_frame(c, &self.buf[p..])? { self.out.write_all(&pt).map_err(|e| e.to_string())?; p += n; }
+        self.buf.drain(..p); Ok(())
+    }
+    /// The end of the object: it must not stop inside a frame, encrypted or compressed.
+    fn finish(self) -> Result<(), String> {
+        if self.cipher.is_some() && (!self.magic || !self.buf.is_empty()) { return Err("truncated encrypted object".into()); }
+        if let Unpack::Z(mut z) = self.out { z.finish().map_err(|e| format!("object failed to decompress: {e}"))?; }
+        Ok(())
+    }
+}
+impl Write for Unpack {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { match self { Unpack::Plain(f) => f.write(b), Unpack::Z(z) => z.write(b) } }
+    fn flush(&mut self) -> std::io::Result<()> { match self { Unpack::Plain(f) => f.flush(), Unpack::Z(z) => z.flush() } }
+}
+/// Upload the file at `path` as file `id`, giving up between parts once `stop` is set. Returns the bytes sent.
+pub async fn put_file(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, path: &Path, stop: &AtomicBool) -> Result<u64, String> {
+    let mut upload = None;
+    let r = put_file_parts(store, cfg, id, path, stop, &mut upload).await;
+    if r.is_err() { if let Some(mut u) = upload { let _ = u.abort().await; } }
+    r
+}
+async fn put_file_parts(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, path: &Path, stop: &AtomicBool, upload: &mut Option<Box<dyn object_store::MultipartUpload>>) -> Result<u64, String> {
+    let err = |e: std::io::Error| format!("{}: {e}", path.display()); let up = |e: object_store::Error| format!("uploading a file: {e}");
+    let mut f = File::open(path).map_err(err)?; let mut buf = vec![0u8; 1 << 20]; let mut n = f.read(&mut buf).map_err(err)?;
+    let z = cfg.compress && n > 0 && zstd::bulk::compress(&buf[..n], 3).is_ok_and(|c| c.len() * 10 < n * 9);
+    let key = file_key(id, z, cfg);
+    let mut pack = if z { let mut e = zstd::stream::write::Encoder::new(Seal::new(cfg.key.as_ref()), 3).map_err(err)?; e.include_checksum(true).map_err(err)?; Pack::Z(e) } else { Pack::Plain(Seal::new(cfg.key.as_ref())) };
+    let mut sent = 0u64;
+    while n > 0 {
+        pack.write_all(&buf[..n]).map_err(err)?;
+        while pack.sink().out.len() >= PART {
+            if stop.load(Ordering::Relaxed) { return Err("stopping".into()); }
+            let rest = pack.sink().out.split_off(PART); let part = std::mem::replace(&mut pack.sink().out, rest);
+            if upload.is_none() { *upload = Some(store.put_multipart(&key).await.map_err(up)?); }
+            upload.as_mut().unwrap().put_part(PutPayload::from(part)).await.map_err(up)?; sent += PART as u64;
+        }
+        n = f.read(&mut buf).map_err(err)?;
+    }
+    let last = pack.finish().map_err(err)?; sent += last.len() as u64;
+    match upload {
+        None => { store.put(&key, PutPayload::from(last)).await.map_err(up)?; }
+        Some(u) => { if !last.is_empty() { u.put_part(PutPayload::from(last)).await.map_err(up)?; } u.complete().await.map_err(up)?; }
+    }
+    Ok(sent)
+}
+/// Download the file object `key` (as listed under `files/`) to `dest`, by way of `dest.part`. Returns the bytes received.
+pub async fn get_file(store: &dyn ObjectStore, cfg: &CloudConfig, key: &OPath, dest: &Path) -> Result<u64, String> {
+    let part = dest.with_extension("part");
+    let r = get_file_to(store, cfg, key, &part).await.map_err(|e| format!("{}: {e}", key.as_ref()))
+        .and_then(|n| fs::rename(&part, dest).map(|()| n).map_err(|e| format!("{}: {e}", dest.display())));
+    if r.is_err() { let _ = fs::remove_file(&part); }
+    r
+}
+async fn get_file_to(store: &dyn ObjectStore, cfg: &CloudConfig, key: &OPath, path: &Path) -> Result<u64, String> {
+    use aes_gcm::aead::KeyInit; use futures_util::StreamExt;
+    let (_, z, e) = parse_file_key(key.as_ref()).ok_or("not a file's object")?;
+    if e && cfg.key.is_none() { return Err("object is encrypted and no key was given".into()); }
+    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+    if let Some(d) = path.parent() { fs::create_dir_all(d).map_err(err)?; }
+    let f = File::create(path).map_err(err)?;
+    let out = if z { Unpack::Z(zstd::stream::zio::Writer::new(f, zstd::stream::raw::Decoder::new().map_err(err)?)) } else { Unpack::Plain(f) };
+    let mut un = Unseal { cipher: if e { cfg.key.as_ref().map(|k| aes_gcm::Aes256Gcm::new(k.into())) } else { None }, buf: vec![], magic: false, out };
+    let mut s = store.get(key).await.map_err(|e| e.to_string())?.into_stream(); let mut n = 0u64;
+    while let Some(b) = s.next().await { let b = b.map_err(|e| e.to_string())?; n += b.len() as u64; un.push(&b)?; }
+    un.finish()?;
+    Ok(n)
+}
+/// Delete a file's object, compressed or not; one that is not there is no error.
+pub async fn delete_file(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str) -> Result<(), String> {
+    for k in [file_key(id, false, cfg), file_key(id, true, cfg)] { delete_object(store, &k).await?; }
+    Ok(())
+}
+pub async fn delete_object(store: &dyn ObjectStore, key: &OPath) -> Result<(), String> {
+    match store.delete(key).await { Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()), Err(e) => Err(format!("deleting {}: {e}", key.as_ref())) }
+}
+/// The files in the bucket: (id, key).
+pub async fn list_files(store: &dyn ObjectStore, cfg: &CloudConfig) -> Result<Vec<(String, OPath)>, String> {
+    Ok(futures_lite_shim::try_list_sized(store, &cfg.key("files")).await?.into_iter().filter_map(|(k, _)| parse_file_key(k.as_ref()).map(|(id, ..)| (id, k))).collect())
+}
+/// Download every file in the bucket into `dest`'s `files/`, 16 at a time. Returns (files, bytes).
+pub fn download_files(cfg: &CloudConfig, dest: &Path) -> Result<(usize, u64), String> {
+    use futures_util::StreamExt;
+    let rt = rt(); let store = cfg.store();
+    rt.block_on(async {
+        let files = list_files(&*store, cfg).await?;
+        let got: Vec<Result<u64, String>> = futures_util::stream::iter(&files).map(|(id, k)| { let (store, to) = (&*store, crate::files::file_path_in(dest, id)); async move { get_file(store, cfg, k, &to).await } }).buffer_unordered(16).collect().await;
+        let mut bytes = 0; for r in got { bytes += r?; }
+        Ok((files.len(), bytes))
+    })
 }
 
 /// A follower fed only by the bucket: polls for new chunks, appends them to local segment files, and the ordinary
@@ -329,6 +487,57 @@ pub fn start_puller(cfg: CloudConfig, dir: PathBuf, poll: Duration) -> BucketPul
         }
     });
     BucketPuller { pulled, chunks, stop, thread: Some(h) }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    fn cfg(pass: Option<&str>) -> CloudConfig { let c = CloudConfig::local("b", "db"); match pass { Some(p) => c.with_passphrase(p), None => c } }
+    fn tmp(n: &str) -> PathBuf { let d = std::env::temp_dir().join(format!("sqweezdb-cloudfiles-{}-{n}", std::process::id())); let _ = fs::remove_dir_all(&d); fs::create_dir_all(&d).unwrap(); d }
+    fn noise(n: usize) -> Vec<u8> { let mut v = vec![0u8; n]; getrandom::fill(&mut v).unwrap(); v }
+    const ID: &str = "0123abcd-89ab-4def-8123-456789abcdef";
+
+    #[test] fn files_go_up_and_come_back_streamed() {
+        let d = tmp("roundtrip"); let rt = rt(); let stop = AtomicBool::new(false);
+        let text: Vec<u8> = (0..300_000).flat_map(|i: u32| format!("line {i} of a note that compresses well\n").into_bytes()).take(3 << 20).collect();
+        // empty, small text, a photo-like 20 MB (multipart, past an encryption frame), text past a part
+        for (name, data) in [("empty", vec![]), ("small", b"hello".to_vec()), ("photo", noise(20 << 20)), ("text", text)] {
+            for pass in [None, Some("pw")] {
+                let (store, c) = (InMemory::new(), cfg(pass)); let src = d.join(name); fs::write(&src, &data).unwrap();
+                let sent = rt.block_on(put_file(&store, &c, ID, &src, &stop)).unwrap();
+                let listed = rt.block_on(list_files(&store, &c)).unwrap(); assert_eq!(listed.len(), 1, "{name}");
+                let (id, key) = &listed[0]; assert_eq!(id, ID);
+                let (z, e) = flags(key.as_ref());
+                assert_eq!(z, name == "text", "{name}: compressed only when it pays"); assert_eq!(e, pass.is_some());
+                let obj = rt.block_on(async { store.get(key).await.unwrap().bytes().await.unwrap() });
+                assert_eq!(obj.len() as u64, sent);
+                assert_eq!(unpack(&obj, z, e, &c).unwrap(), data, "{name}: the format `unpack` reads");
+                let back = d.join("back").join(name);
+                assert_eq!(rt.block_on(get_file(&store, &c, key, &back)).unwrap(), sent);
+                assert!(fs::read(&back).unwrap() == data, "{name} {pass:?}"); assert!(!back.with_extension("part").exists());
+                rt.block_on(delete_file(&store, &c, ID)).unwrap(); assert!(rt.block_on(list_files(&store, &c)).unwrap().is_empty());
+                rt.block_on(delete_file(&store, &c, ID)).unwrap();   // gone already: no error
+            }
+        }
+    }
+    #[test] fn a_damaged_file_object_is_refused() {
+        let d = tmp("damaged"); let rt = rt(); let stop = AtomicBool::new(false); let src = d.join("f");
+        let text: Vec<u8> = (0..100_000).flat_map(|i: u32| format!("row {i}\n").into_bytes()).collect(); fs::write(&src, &text).unwrap();
+        for pass in [None, Some("pw")] {
+            let (store, c) = (InMemory::new(), cfg(pass)); rt.block_on(put_file(&store, &c, ID, &src, &stop)).unwrap();
+            let (_, key) = rt.block_on(list_files(&store, &c)).unwrap().remove(0);
+            let obj = rt.block_on(async { store.get(&key).await.unwrap().bytes().await.unwrap() });
+            let dest = d.join("out");
+            // cut short, or one bit changed
+            for bad in [obj[..obj.len() - 7].to_vec(), { let mut b = obj.to_vec(); let i = b.len() / 2; b[i] ^= 1; b }] {
+                rt.block_on(store.put(&key, PutPayload::from(bad))).unwrap();
+                assert!(rt.block_on(get_file(&store, &c, &key, &dest)).is_err(), "{pass:?}");
+                assert!(!dest.exists() && !dest.with_extension("part").exists());
+            }
+            if pass.is_some() { rt.block_on(store.put(&key, PutPayload::from(obj.clone()))).unwrap(); assert!(rt.block_on(get_file(&store, &cfg(Some("other")), &key, &dest)).unwrap_err().contains("authentication")); }
+        }
+    }
 }
 
 #[cfg(test)]

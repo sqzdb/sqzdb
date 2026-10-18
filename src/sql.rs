@@ -1581,7 +1581,7 @@ impl<'a> Sink<'a> {
 
 pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>, pub acl: std::sync::RwLock<Acl>, pub epoch: Arc<std::sync::atomic::AtomicU64>, alters: Mutex<Vec<std::thread::JoinHandle<Result<(), String>>>>, pub live: std::sync::OnceLock<Arc<crate::live::Reactor>>,
     /// The configuration this database was opened with (defaults when opened through the lab constructors).
-    pub cfg: crate::config::Config, services: Mutex<Option<Services>>,
+    pub cfg: crate::config::Config, pub(crate) services: Mutex<Option<Services>>,
     /// Sign-in bookkeeping (failed attempts, the session sweep): see `auth.rs`.
     pub(crate) auth: crate::auth::AuthState,
     /// Provider sign-ins in progress and cached signing keys: see `oauth.rs`.
@@ -1594,7 +1594,7 @@ pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Pre
     /// (and with it the log threads) has gone.
     dir_lock: Mutex<Option<std::fs::File>> }
 /// Background work `open_with` started for this database; stopped by `close` (or when the last handle drops).
-#[derive(Default)] pub struct Services { pub uploader: Option<crate::cloud::Uploader>, pub puller: Option<crate::cloud::BucketPuller>, pub follower: Option<Follower>, snapshotter: Option<(Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>, listeners: Vec<crate::net::Listener>, pub snapshots: Arc<std::sync::atomic::AtomicU64> }
+#[derive(Default)] pub struct Services { pub uploader: Option<crate::cloud::Uploader>, pub files_backup: Option<crate::files::FilesBackup>, pub puller: Option<crate::cloud::BucketPuller>, pub follower: Option<Follower>, snapshotter: Option<(Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>, listeners: Vec<crate::net::Listener>, pub snapshots: Arc<std::sync::atomic::AtomicU64> }
 impl Drop for Sql { fn drop(&mut self) { self.close(); } }
 impl Sql { /// The reactive layer for this database (started on first use).
     pub fn reactor(self: &Arc<Self>) -> Arc<crate::live::Reactor> { self.live.get_or_init(|| crate::live::Reactor::start(self.clone())).clone() } }
@@ -1768,6 +1768,7 @@ impl Sql {
         if let Some(b) = &cfg.backup {
             let up = crate::cloud::start_uploader(b.cloud(), dir.to_path_buf(), db.log.clone());
             if cfg.durable == Durability::Cloud { db.log.set_cloud_wait(true, Some(up.kick.clone())); }
+            sv.files_backup = Some(crate::files::FilesBackup::start(db.clone(), b.cloud(), up.stats.clone()));
             sv.uploader = Some(up);
         }
         if let Some(p) = &cfg.listen.socket { sv.listeners.push(crate::net::Server::start(sql.clone(), p).map_err(|e| e.to_string())?); }
@@ -1790,6 +1791,8 @@ impl Sql {
     pub fn snapshot_rows(&self) -> u64 { let mut sess = Session::default(); self.db.table_names().iter().map(|n| self.exec_s(&mut sess, &format!("SELECT count(*) FROM {n}"), &[]).ok().and_then(|r| r.first().and_then(|r| r.first()).and_then(|v| if let Value::Int(i) = v { Some(*i as u64) } else { None })).unwrap_or(0)).sum() }
     /// Upload counters of the configured backup, if any.
     pub fn backup_stats(&self) -> Option<Arc<crate::cloud::CloudStats>> { self.services.lock().unwrap().as_ref().and_then(|s| s.uploader.as_ref().map(|u| u.stats.clone())) }
+    /// Counters of the files half of the backup, if any.
+    pub fn files_backup_stats(&self) -> Option<Arc<crate::files::FilesStats>> { self.services.lock().unwrap().as_ref().and_then(|s| s.files_backup.as_ref().map(|b| b.stats.clone())) }
     /// Snapshots the policy thread has written since open.
     pub fn snapshots_taken(&self) -> u64 { self.services.lock().unwrap().as_ref().map(|s| s.snapshots.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) }
     /// Rows the follower has applied (follower mode), or None.
@@ -1803,7 +1806,7 @@ impl Sql {
             sv.listeners.clear();
             if let Some((stop, h)) = sv.snapshotter.take() { stop.store(true, std::sync::atomic::Ordering::Relaxed); h.thread().unpark(); if h.thread().id() != std::thread::current().id() { h.join().ok(); } }
             self.db.log.set_cloud_wait(false, None);
-            sv.uploader.take(); sv.puller.take(); sv.follower.take();
+            sv.files_backup.take(); sv.uploader.take(); sv.puller.take(); sv.follower.take();
         }
         if let Some(r) = self.live.get() { r.shutdown(); }
     }
@@ -1868,16 +1871,18 @@ impl Sql {
     /// Subscribe to committed changes after `after_seq` (0 = everything still in the log). Resumable: keep `Feed::last_seq`.
     pub fn subscribe(&self, after_seq: u64) -> Feed { self.db.log.feeds.fetch_add(1, std::sync::atomic::Ordering::Relaxed); Feed { cursor: LogCursor::new(&self.db.dir, after_seq), db: self.db.clone(), last: after_seq, on_ring: false } }
     pub fn current_seq(&self) -> u64 { self.db.log.st.lock().unwrap().seq }
-    /// Copy the snapshot and the log segments to another directory (a consistent backup as long as no snapshot runs meanwhile).
+    /// Copy the snapshot, the log segments and the files to another directory (a consistent backup as long as no
+    /// snapshot runs meanwhile).
     pub fn backup(&self, dest: &std::path::Path) -> Result<u64, String> {
         std::fs::create_dir_all(dest).map_err(|e| e.to_string())?; crate::table::write_meta_if_missing(dest).map_err(|e| e.to_string())?; let mut bytes = 0;
         for e in std::fs::read_dir(&self.db.dir).map_err(|e| e.to_string())?.flatten() { let n = e.file_name(); let n = n.to_string_lossy(); if n == "snap" || n.starts_with("log.") { bytes += std::fs::copy(e.path(), dest.join(&*n)).map_err(|e| e.to_string())?; } }
-        Ok(bytes)
+        Ok(bytes + crate::files::copy_files(&self.db.dir, dest)?)
     }
     /// Restore a backup directory to the state just after log sequence `upto`, writing a fresh snapshot there.
     pub fn restore(src: &std::path::Path, dest: &std::path::Path, upto: u64, threads: usize) -> Result<(Sql, RecStats), String> {
         let _ = std::fs::remove_dir_all(dest); std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
         for e in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() { let n = e.file_name(); let n = n.to_string_lossy(); if n == "snap" || n.starts_with("log.") { std::fs::copy(e.path(), dest.join(&*n)).map_err(|e| e.to_string())?; } }
+        crate::files::copy_files(src, dest)?;
         let db = Arc::new(Database::open(dest, false));
         let sql = Sql::new(db.clone());
         let st = db.recover_upto(threads, &mut |text| sql.apply_meta(text), upto)?;
@@ -2643,11 +2648,12 @@ enum Store { Empty, Set(KeySet), Dense { min: i64, max: i64, es: usize, data: Ve
 /// a scratch directory and moves the files over; a bucket with nothing in it leaves `dir` empty.
 fn bootstrap_from_bucket(dir: &std::path::Path, b: &crate::config::Backup) -> Result<(), String> {
     let scratch = dir.join(".bootstrap");
-    let (s0, chunks, bytes) = crate::cloud::download(&b.cloud(), &scratch)?;
+    let (s0, chunks, bytes) = crate::cloud::download_log(&b.cloud(), &scratch)?;
     if s0 == 0 && chunks == 0 { let _ = std::fs::remove_dir_all(&scratch); return Ok(()); }
+    let (files, file_bytes) = crate::cloud::download_files(&b.cloud(), &scratch)?;
     for e in std::fs::read_dir(&scratch).map_err(|e| e.to_string())? { let e = e.map_err(|e| e.to_string())?; std::fs::rename(e.path(), dir.join(e.file_name())).map_err(|e| e.to_string())?; }
     let _ = std::fs::remove_dir_all(&scratch);
-    eprintln!("sqweezdb: bootstrapped {} from the bucket ({chunks} log objects, {:.1} MB)", dir.display(), bytes as f64 / 1e6);
+    eprintln!("sqweezdb: bootstrapped {} from the bucket ({chunks} log objects, {files} files, {:.1} MB)", dir.display(), (bytes + file_bytes) as f64 / 1e6);
     Ok(())
 }
 /// The snapshot policy thread: a snapshot once the log written since the last one exceeds max(`log_bytes`, size of that

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0 — 2026-10-18
+
+### Added
+- **Uploaded files are in the backup.** With `[backup]` set, each file a `FILE` column holds is uploaded to
+  the bucket as it arrives (`files/<id>`), encrypted with the backup's passphrase. It is compressed only
+  when that helps, and streamed in parts, so a large file is never in memory whole. A file the cleanup
+  deletes is deleted from the bucket too. A bootstrap from the bucket brings the files back with the rows.
+- When a database with a backup opens, it compares its files with the bucket's. It uploads what the
+  bucket lacks (files from before the backup was set up), fetches back files missing from the directory,
+  and deletes objects of files it no longer has.
+- With `durable = "cloud"`, an upload returns once its file is in the bucket.
+- The console's Backup tab shows the files: uploaded, waiting, deleted, fetched back.
+- `Sql::backup` and `Sql::restore` copy the files too (as hard links when they can).
+
 ## 0.7.1 — 2026-10-18
 
 **Upgrade from 0.7.0 if you use files, `[embed]` or provider sign-in through the app API.**

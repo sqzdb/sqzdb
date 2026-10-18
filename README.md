@@ -130,7 +130,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.7.1` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.8.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -677,9 +677,11 @@ img.src = note.attachment.url        // { id, name, type, size, url }
   on the API's origin.
 - **Cleanup.** A file no row refers to is deleted once it is a day old and has gone an hour unreferenced.
   A file whose row changed or went is therefore gone within about a day.
-- **Not built yet:** files in the backup bucket (back the `files/` directory up yourself until then), files
-  stored in S3, image thumbnails, upload quotas per user, and files through the Node, Python and Go
-  libraries.
+- **Backup.** With [`backup`](#backup-restore-and-replication) set, each file is uploaded to the bucket
+  as it arrives, encrypted like the rest, and deleted there when it is deleted here. Restoring from the
+  bucket brings the files back with the rows.
+- **Not built yet:** files stored only in S3 (they are kept on the database's disk, and the bucket holds a
+  copy), image thumbnails, upload quotas per user, and files through the Node, Python and Go libraries.
 
 #### HTTPS, with certificates from Let's Encrypt
 
@@ -718,7 +720,7 @@ redirect = "0.0.0.0:80"             # optional: send http:// visitors to https:/
   doesn't ask for.
 
 **Not built yet:** a trusted-proxy setting (behind a proxy, the sign-in rate limit sees every user as the
-proxy's address), HTTP/2, files and vectors as columns, email verification and password reset.
+proxy's address), HTTP/2, email verification and password reset.
 
 ### Backup, restore and replication
 
@@ -727,13 +729,19 @@ Everything is built on the change log, so backups never pause the database.
 - **Continuous backup** to any S3-compatible bucket with the `backup` option. Objects are compressed
   with zstd and, with a `passphrase`, encrypted with AES-256-GCM before upload. Small objects are
   compacted in the bucket automatically. 1 million rows take about 6 MB in the bucket.
+- **Uploaded files** go to the same bucket, under `files/`, as they arrive: compressed when that helps (not
+  photos, video or archives, which already are), encrypted, and streamed, so a large file is never held
+  in memory whole. A file deleted here is deleted there. When the database opens, it checks the bucket
+  against its files. It uploads what is missing there, fetches back what is missing here, and deletes
+  objects of files it no longer has. With `durable: 'cloud'`, an upload returns once its file is in the
+  bucket. On a local S3 server, a 100 KB file was in the bucket 0.8 ms after its upload (E63).
 - **Bootstrap.** With `backup.bootstrap: true`, opening an empty directory restores the latest state
-  from the bucket first; a 1M-row bucket was restored and answering queries in 0.28 s.
+  from the bucket first, files included; a 1M-row bucket was restored and answering queries in 0.28 s.
 - **Followers.** The `follow` option opens a read-only replica of another directory on the same host,
   or of a bucket. With a 20 ms `poll`, new rows reached the follower about 38 ms after the primary
   committed them.
 - **Point-in-time restore** to any log position is available from the Rust API
-  (`Sql::backup` and `Sql::restore`).
+  (`Sql::backup` and `Sql::restore`). Both take the files along, as hard links when they can.
 - **Outages.** If the bucket stops answering, writes continue and the uploader retries with a growing
   pause, up to 30 seconds; when the bucket is back it catches up on its own. With `durable: 'cloud'`,
   commits wait for the bucket instead. A malformed `endpoint` is refused when the database opens.
@@ -803,7 +811,7 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `backup.interval` | `1s` | How often new log records are uploaded. |
 | `backup.compress` | `true` | Compress uploads with zstd. |
 | `backup.compactAfter` / `compactEvery` | `1m` / `30s` | When small objects are merged in the bucket. |
-| `backup.bootstrap` | `false` | Restore from the bucket when opening an empty directory. |
+| `backup.bootstrap` | `false` | Restore from the bucket, files included, when opening an empty directory. |
 | `follow.dir` or `follow.bucket` | none | Open as a read-only replica of a directory or a bucket. |
 | `follow.poll` | `100ms` | How often a follower checks for new records. |
 | `snapshot.logBytes` | `64MB` | Snapshot once the log since the last snapshot exceeds this size, or that snapshot's own size if larger. |
@@ -1031,7 +1039,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.7.1`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.8.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

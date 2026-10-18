@@ -158,7 +158,8 @@ fn api_status(sql: &Sql) -> J {
             "objects": st.puts.load(Relaxed), "bytes": st.bytes.load(Relaxed), "rawBytes": st.raw_bytes.load(Relaxed), "snapshots": st.snapshots.load(Relaxed), "merges": st.merges.load(Relaxed), "deletes": st.deletes.load(Relaxed),
             "cloudSeq": st.cloud_seq.load(Relaxed), "behind": seq.saturating_sub(st.cloud_seq.load(Relaxed)),
             "state": st.state(), "resumed": st.resumed.load(Relaxed), "okAt": ms(st.ok_at_ms.load(Relaxed)), "uploadAt": ms(st.upload_at_ms.load(Relaxed)), "errorAt": ms(st.err_at_ms.load(Relaxed)),
-            "lastError": last_error, "failures": st.failures.load(Relaxed).min(1_000_000), "failuresTotal": st.failures_total.load(Relaxed), "now": crate::cloud::now_ms() })
+            "lastError": last_error, "failures": st.failures.load(Relaxed).min(1_000_000), "failuresTotal": st.failures_total.load(Relaxed), "now": crate::cloud::now_ms(),
+            "files": sql.files_backup_stats().map(|f| json!({ "uploaded": f.uploaded.load(Relaxed), "bytes": f.bytes.load(Relaxed), "deleted": f.deleted.load(Relaxed), "fetched": f.fetched.load(Relaxed), "pending": f.pending.load(Relaxed), "missing": f.missing.load(Relaxed) })) })
     });
     json!({ "dir": sql.db.dir.display().to_string(), "durable": match cfg.durable { Durability::Visible => "visible", Durability::Fsync => "fsync", Durability::Cloud => "cloud" }, "seq": seq, "durableSeq": durable, "logBytes": bytes,
             "snapshotsByPolicy": sql.snapshots_taken(), "snapshotPolicy": {"logBytes": cfg.snapshot.log_bytes, "idleAfterMs": cfg.snapshot.idle_after.map(|d| d.as_millis() as u64)},

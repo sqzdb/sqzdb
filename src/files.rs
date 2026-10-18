@@ -9,14 +9,18 @@
 //!   (`app.rs`), so whoever may read the row may fetch the file, under the same policies.
 //! - A file no row refers to is deleted once it is a day old and has gone unreferenced for an hour: a scan of every
 //!   FILE column, hourly, finds them. A file whose row changes or goes therefore stays up to a day.
+//! - With a backup bucket, every file is uploaded to it as it arrives and deleted from it with the file
+//!   (`FilesBackup`); a restore brings the files back with the rows.
+use crate::cloud::{CloudConfig, CloudStats};
 use crate::sql::{Session, Sql};
-use crate::table::{decode_col, encode_row, now_micros, Schema, Value};
-use std::collections::{HashMap, HashSet};
+use crate::table::{decode_col, encode_row, now_micros, Database, Schema, Value};
+use object_store::{path::Path as OPath, ObjectStore};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 pub const FILES: &str = "_sqz_files";
 const DDL: &str = "CREATE TABLE _sqz_files (id UUID PRIMARY KEY, owner VARCHAR(200) NOT NULL, name VARCHAR(255) NOT NULL, type VARCHAR(127) NOT NULL, size INT NOT NULL, sha256 BYTES(32) NOT NULL, created TIMESTAMP NOT NULL)";
@@ -52,7 +56,7 @@ fn new_id() -> String { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("r
 impl Sql {
     pub fn files_dir(&self) -> PathBuf { self.db.dir.join("files") }
     /// Where a file's bytes are: `files/<first two hex digits>/<id>`. `id` must be a canonical UUID (a FILE value).
-    pub fn file_path(&self, id: &str) -> PathBuf { self.files_dir().join(id.get(..2).unwrap_or("00")).join(id) }
+    pub fn file_path(&self, id: &str) -> PathBuf { file_path_in(&self.db.dir, id) }
     fn files_table(&self) -> Result<Arc<crate::table::Table>, String> {
         if let Some(t) = self.db.table(FILES) { return Ok(t); }
         let _one = self.files_lock().lock().unwrap();
@@ -96,7 +100,14 @@ impl Sql {
         let row = encode_row(&t.schema, &[Value::Text(meta.id.clone()), Value::Text(meta.owner.clone()), Value::Text(meta.name.clone()), Value::Text(meta.ctype.clone()), Value::Int(meta.size), Value::Bytes(sha256.to_vec()), Value::Int(meta.created)])?;
         if let Err(e) = t.insert(&row) { let _ = std::fs::remove_file(&dest); return Err(e.to_string()); }
         self.files_gc_start();
+        self.file_to_bucket(&meta.id)?;
         Ok(meta)
+    }
+    /// Hand a new file to the backup, if there is one; with `durable = "cloud"`, return once it is in the bucket.
+    fn file_to_bucket(&self, id: &str) -> Result<(), String> {
+        let wait = self.cfg.durable == crate::config::Durability::Cloud;
+        let rx = match self.services.lock().unwrap().as_ref().and_then(|s| s.files_backup.as_ref()) { Some(b) => b.put(id, wait), None => return Ok(()) };
+        rx.map_or(Ok(()), |rx| rx.recv().unwrap_or_else(|_| Err("files: the backup stopped before the file reached the bucket".into())))
     }
     pub fn file_meta(&self, id: &str) -> Option<FileMeta> {
         let t = self.db.table(FILES)?; let k = t.schema.key_from_value(&Value::Text(id.to_string())).ok()?;
@@ -157,7 +168,10 @@ impl Sql {
         let (mut n, mut bytes) = (0, 0u64);
         for m in gone {
             let k = ft.schema.key_from_value(&Value::Text(m.id.clone()))?;
-            if ft.delete_by_pk(k).is_ok() { let _ = std::fs::remove_file(self.file_path(&m.id)); since.remove(&m.id); n += 1; bytes += m.size as u64; }
+            if ft.delete_by_pk(k).is_ok() {
+                let _ = std::fs::remove_file(self.file_path(&m.id)); since.remove(&m.id); n += 1; bytes += m.size as u64;
+                if let Some(b) = self.services.lock().unwrap().as_ref().and_then(|s| s.files_backup.as_ref()) { b.delete(&m.id); }
+            }
         }
         // staged uploads that never became files
         if let Ok(rd) = std::fs::read_dir(self.files_dir().join("tmp")) {
@@ -166,6 +180,149 @@ impl Sql {
         Ok((n, bytes))
     }
 }
+/// Where file `id`'s bytes are in the database directory `dir`: `files/<first two hex digits>/<id>`.
+pub fn file_path_in(dir: &Path, id: &str) -> PathBuf { dir.join("files").join(id.get(..2).unwrap_or("00")).join(id) }
+/// Copy a database directory's files to another (not uploads still being staged): hard links when both are on one
+/// file system, as a file never changes once written, else copies. Returns their bytes.
+pub fn copy_files(src: &Path, dest: &Path) -> Result<u64, String> {
+    let err = |e: std::io::Error| format!("files: {e}");
+    let Ok(dirs) = std::fs::read_dir(src.join("files")) else { return Ok(0) };
+    let mut bytes = 0;
+    for d in dirs.flatten() {
+        if d.file_name() == "tmp" || !d.path().is_dir() { continue; }
+        let to = dest.join("files").join(d.file_name()); std::fs::create_dir_all(&to).map_err(err)?;
+        for f in std::fs::read_dir(d.path()).map_err(err)?.flatten() {
+            if f.path().extension().is_some() { continue; }   // a download in progress (`.part`)
+            let t = to.join(f.file_name()); let _ = std::fs::remove_file(&t);
+            bytes += f.metadata().map_err(err)?.len();
+            if std::fs::hard_link(f.path(), &t).is_err() { std::fs::copy(f.path(), &t).map_err(err)?; }
+        }
+    }
+    Ok(bytes)
+}
+
+// ---- files in the backup bucket
+
+/// The files half of the backup (`[backup]`): a new file is uploaded as it arrives (`cloud::put_file`, 8 at a time),
+/// and a file the sweep deletes is deleted from the bucket too. At start the bucket is compared with `_sqz_files`:
+/// files it lacks are uploaded, files this directory lacks are fetched back, and objects of files that are gone are
+/// deleted. Its failures count in the backup's health.
+pub struct FilesBackup { q: Arc<(Mutex<Queue>, Condvar)>, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>>, pub stats: Arc<FilesStats> }
+/// Since start: files uploaded (and their bytes in the bucket), deleted there, fetched back from it; files waiting; files
+/// that are in neither place.
+#[derive(Default)] pub struct FilesStats { pub uploaded: AtomicU64, pub bytes: AtomicU64, pub deleted: AtomicU64, pub fetched: AtomicU64, pub pending: AtomicU64, pub missing: AtomicU64 }
+enum Op { Put(String), Delete(String), Fetch(String, OPath), Drop(OPath) }
+/// Work waiting for the thread, and who waits for which upload (`durable = "cloud"`). `dead` once it can't run.
+#[derive(Default)] struct Queue { ops: VecDeque<Op>, waiting: HashMap<String, Vec<mpsc::Sender<Result<(), String>>>>, dead: Option<String> }
+const AT_ONCE: usize = 8;
+
+impl FilesBackup {
+    pub fn start(db: Arc<Database>, cfg: CloudConfig, health: Arc<CloudStats>) -> FilesBackup {
+        match cfg.try_store(3) {
+            Ok(store) => FilesBackup::start_with(db, cfg, store, health),
+            Err(e) => { let q = Queue { dead: Some(e), ..Default::default() }; FilesBackup { q: Arc::new((Mutex::new(q), Condvar::new())), stop: Default::default(), thread: None, stats: Default::default() } }
+        }
+    }
+    /// The same, with the bucket client given (tests use an in-memory one).
+    pub fn start_with(db: Arc<Database>, cfg: CloudConfig, store: Arc<dyn ObjectStore>, health: Arc<CloudStats>) -> FilesBackup {
+        let (q, stop, stats) = (Arc::new((Mutex::new(Queue::default()), Condvar::new())), Arc::new(AtomicBool::new(false)), Arc::new(FilesStats::default()));
+        let (q2, stop2, st2) = (q.clone(), stop.clone(), stats.clone());
+        let thread = std::thread::Builder::new().name("sqweezdb-files-backup".into()).spawn(move || backup_files(&db, &cfg, &*store, &q2, &stop2, &st2, &health)).expect("a thread");
+        FilesBackup { q, stop, thread: Some(thread), stats }
+    }
+    /// Upload a new file; with `wait`, the receiver hears once it is in the bucket.
+    pub fn put(&self, id: &str, wait: bool) -> Option<mpsc::Receiver<Result<(), String>>> {
+        let (m, cv) = &*self.q; let mut q = m.lock().unwrap();
+        let rx = wait.then(|| { let (tx, rx) = mpsc::channel(); match &q.dead { Some(e) => { let _ = tx.send(Err(format!("files: no backup: {e}"))); } None => q.waiting.entry(id.into()).or_default().push(tx) } rx });
+        if q.dead.is_none() { q.ops.push_back(Op::Put(id.into())); self.stats.pending.store(q.ops.len() as u64, Ordering::Relaxed); cv.notify_all(); }
+        rx
+    }
+    /// Delete a file from the bucket.
+    pub fn delete(&self, id: &str) { let (m, cv) = &*self.q; let mut q = m.lock().unwrap(); q.ops.push_back(Op::Delete(id.into())); self.stats.pending.store(q.ops.len() as u64, Ordering::Relaxed); cv.notify_all(); }
+}
+impl Drop for FilesBackup {
+    fn drop(&mut self) {
+        // under the queue's lock, so the thread is either before its check of `stop` or already waiting
+        { let _q = self.q.0.lock().unwrap(); self.stop.store(true, Ordering::Relaxed); } self.q.1.notify_all();
+        if let Some(h) = self.thread.take() { h.join().ok(); }
+        for (_, ws) in self.q.0.lock().unwrap().waiting.drain() { for w in ws { let _ = w.send(Err("files: the database closed before the file reached the bucket".into())); } }
+    }
+}
+
+fn backup_files(db: &Database, cfg: &CloudConfig, store: &dyn ObjectStore, q: &(Mutex<Queue>, Condvar), stop: &AtomicBool, st: &FilesStats, health: &CloudStats) {
+    let rt = crate::cloud::rt(); let mut failures = 0u32;
+    // at start: what the bucket holds against what the database holds (until the bucket answers)
+    loop {
+        if stop.load(Ordering::Relaxed) { return; }
+        match rt.block_on(crate::cloud::list_files(store, cfg)) {
+            Ok(listed) => { health.contact(); reconcile(db, listed, q, st); break; }
+            Err(e) => { health.fail(format!("listing the files in the bucket: {e}")); failures += 1; if !pause(stop, failures) { return; } }
+        }
+    }
+    failures = 0;
+    loop {
+        let batch: Vec<Op> = {
+            let mut g = q.0.lock().unwrap();
+            while g.ops.is_empty() && !stop.load(Ordering::Relaxed) { g = q.1.wait(g).unwrap(); }
+            if stop.load(Ordering::Relaxed) { return; }
+            let n = g.ops.len().min(64); g.ops.drain(..n).collect()
+        };
+        let done: Vec<(Op, Result<u64, String>)> = rt.block_on(async {
+            use futures_util::StreamExt;
+            futures_util::stream::iter(batch).map(|op| async move { let r = run(db, cfg, store, &op, stop, st).await; (op, r) }).buffer_unordered(AT_ONCE).collect().await
+        });
+        let (mut error, mut put) = (None, false); let mut g = q.0.lock().unwrap();
+        for (op, r) in done {
+            match (r, op) {
+                (Ok(n), Op::Put(id)) => { put = true; st.uploaded.fetch_add(1, Ordering::Relaxed); st.bytes.fetch_add(n, Ordering::Relaxed); for w in g.waiting.remove(&id).unwrap_or_default() { let _ = w.send(Ok(())); } }
+                (Ok(_), Op::Delete(_) | Op::Drop(_)) => { st.deleted.fetch_add(1, Ordering::Relaxed); }
+                (Ok(_), Op::Fetch(..)) => { st.fetched.fetch_add(1, Ordering::Relaxed); }
+                (Err(e), op) => { error = Some(e); g.ops.push_front(op); }   // again, after a pause
+            }
+        }
+        st.pending.store(g.ops.len() as u64, Ordering::Relaxed); drop(g);
+        match error {
+            None => { if put { health.uploaded(); } else { health.contact(); } failures = 0; }
+            Some(e) => { health.fail(e); failures += 1; if !pause(stop, failures) { return; } }
+        }
+    }
+}
+/// One piece of work; Ok with the bytes moved.
+async fn run(db: &Database, cfg: &CloudConfig, store: &dyn ObjectStore, op: &Op, stop: &AtomicBool, st: &FilesStats) -> Result<u64, String> {
+    match op {
+        Op::Put(id) => {
+            let path = file_path_in(&db.dir, id);
+            // deleted before it got there (the bucket was down for a day): nothing to upload
+            if !path.exists() { st.missing.fetch_add(1, Ordering::Relaxed); eprintln!("files: {id} left {} before reaching the bucket", db.dir.display()); return Ok(0); }
+            crate::cloud::put_file(store, cfg, id, &path, stop).await
+        }
+        Op::Delete(id) => crate::cloud::delete_file(store, cfg, id).await.map(|()| 0),
+        Op::Fetch(id, key) => crate::cloud::get_file(store, cfg, key, &file_path_in(&db.dir, id)).await,
+        Op::Drop(key) => crate::cloud::delete_object(store, key).await.map(|()| 0),
+    }
+}
+/// Queue what makes the bucket and `_sqz_files` agree.
+fn reconcile(db: &Database, listed: Vec<(String, OPath)>, q: &(Mutex<Queue>, Condvar), st: &FilesStats) {
+    // no file was ever uploaded here: leave the bucket alone (it may not be this database's)
+    let Some(t) = db.table(FILES) else { return };
+    let mut rows = HashSet::new(); t.scan(|r| { if let Value::Text(id) = decode_col(&t.schema, r, 0) { rows.insert(id); } true });
+    let (mut ops, mut there) = (vec![], HashSet::new());
+    for (id, k) in listed {
+        if !rows.contains(&id) { ops.push(Op::Drop(k)); }
+        else if there.insert(id.clone()) && !file_path_in(&db.dir, &id).exists() { ops.push(Op::Fetch(id, k)); }
+    }
+    let mut missing = 0;
+    for id in rows { if !there.contains(&id) { if file_path_in(&db.dir, &id).exists() { ops.push(Op::Put(id)); } else { missing += 1; } } }
+    if missing > 0 { st.missing.fetch_add(missing, Ordering::Relaxed); eprintln!("files: {missing} files are neither in {} nor in the bucket", db.dir.display()); }
+    let mut g = q.0.lock().unwrap(); g.ops.extend(ops); st.pending.store(g.ops.len() as u64, Ordering::Relaxed); q.1.notify_all();
+}
+/// After a failure: 1, 2, 4 … up to 30 s, waking early only to stop. False when stopping.
+fn pause(stop: &AtomicBool, failures: u32) -> bool {
+    let end = Instant::now() + Duration::from_secs(1 << (failures.clamp(1, 6) - 1)).min(Duration::from_secs(30));
+    while Instant::now() < end { if stop.load(Ordering::Relaxed) { return false; } std::thread::sleep(Duration::from_millis(50)); }
+    !stop.load(Ordering::Relaxed)
+}
+
 fn meta_of(s: &Schema, r: &[u8]) -> Option<FileMeta> {
     let t = |c| match decode_col(s, r, c) { Value::Text(x) => Some(x), _ => None };
     let (Value::Int(size), Value::Bytes(sha), Value::Int(created)) = (decode_col(s, r, 4), decode_col(s, r, 5), decode_col(s, r, 6)) else { return None };
@@ -252,5 +409,46 @@ mod tests {
         q(&s, &mut ann, "UPDATE notes SET attachment = NULL WHERE body = 'k'", &[]).unwrap();
         s.files_sweep(day + 2 * UNREFERENCED_US, &mut since).unwrap();
         assert_eq!(s.files_sweep(day + 3 * UNREFERENCED_US, &mut since).unwrap(), (1, 4));
+    }
+
+    // ---- the backup, against an in-memory bucket
+    fn bucket(s: &Arc<Sql>, store: &Arc<object_store::memory::InMemory>) -> Arc<FilesStats> {
+        let b = FilesBackup::start_with(s.db.clone(), CloudConfig::local("b", "db").with_passphrase("pw"), store.clone(), Arc::new(CloudStats::default()));
+        let st = b.stats.clone(); let mut sv = crate::sql::Services::default(); sv.files_backup = Some(b); *s.services.lock().unwrap() = Some(sv); st
+    }
+    fn in_bucket(store: &object_store::memory::InMemory) -> Vec<String> { let c = CloudConfig::local("b", "db"); crate::cloud::rt().block_on(crate::cloud::list_files(store, &c)).unwrap().into_iter().map(|(id, _)| id).collect() }
+    fn until(what: &str, f: impl Fn() -> bool) { let t = Instant::now(); while !f() { assert!(t.elapsed() < Duration::from_secs(10), "waited for {what}"); std::thread::sleep(Duration::from_millis(5)); } }
+    #[test] fn files_follow_the_database_into_the_bucket() {
+        let d = tmp("bk"); let s = Arc::new(Sql::open_with(&d, Config::default()).unwrap()); setup(&s);
+        let store = Arc::new(object_store::memory::InMemory::new()); let st = bucket(&s, &store);
+        let (ann, _) = user(&s, "ann@x");
+        let (a, b) = (put(&s, &ann, b"first"), put(&s, &ann, &vec![7u8; 900 << 10]));
+        until("two uploads", || st.uploaded.load(Ordering::Relaxed) == 2);
+        let mut ids = in_bucket(&store); ids.sort(); let mut want = vec![a.id.clone(), b.id.clone()]; want.sort(); assert_eq!(ids, want);
+        // the sweep deletes a file: so does the bucket
+        let mut since = HashMap::new(); let later = now_micros() + KEEP_US + 1;
+        s.files_sweep(later, &mut since).unwrap(); assert_eq!(s.files_sweep(later + UNREFERENCED_US, &mut since).unwrap().0, 2);
+        until("two deletes", || st.deleted.load(Ordering::Relaxed) == 2); assert!(in_bucket(&store).is_empty());
+        s.close();
+    }
+    #[test] fn at_start_the_bucket_and_the_directory_are_made_to_agree() {
+        let d = tmp("agree"); let s = Arc::new(Sql::open_with(&d, Config::default()).unwrap()); setup(&s);
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (ann, _) = user(&s, "ann@x");
+        let (up, lost, before) = (put(&s, &ann, b"backed up"), put(&s, &ann, b"lost here"), put(&s, &ann, b"from before the backup"));
+        // `up` and `lost` are in the bucket, `before` is not, and an object of a file that is gone is
+        let c = CloudConfig::local("b", "db").with_passphrase("pw"); let (rt, stop) = (crate::cloud::rt(), AtomicBool::new(false));
+        for f in [&up, &lost] { rt.block_on(crate::cloud::put_file(&*store, &c, &f.id, &s.file_path(&f.id), &stop)).unwrap(); }
+        let gone = "0123abcd-89ab-4def-8123-456789abcdef"; rt.block_on(crate::cloud::put_file(&*store, &c, gone, &s.file_path(&up.id), &stop)).unwrap();
+        std::fs::remove_file(s.file_path(&lost.id)).unwrap();
+        let st = bucket(&s, &store);
+        until("reconciled", || st.uploaded.load(Ordering::Relaxed) == 1 && st.fetched.load(Ordering::Relaxed) == 1 && st.deleted.load(Ordering::Relaxed) == 1);
+        let mut ids = in_bucket(&store); ids.sort(); let mut want = vec![up.id.clone(), lost.id.clone(), before.id.clone()]; want.sort(); assert_eq!(ids, want);
+        assert_eq!(std::fs::read(s.file_path(&lost.id)).unwrap(), b"lost here", "fetched back");
+        // with durable = "cloud", an upload returns once its file is in the bucket
+        let rx = s.services.lock().unwrap().as_ref().unwrap().files_backup.as_ref().unwrap().put(&before.id, true).unwrap();
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+        s.close();
+        assert!(FilesBackup::start(s.db.clone(), { let mut c = c.clone(); c.endpoint = "not a url".into(); c }, Arc::new(CloudStats::default())).put(&up.id, true).unwrap().recv().unwrap().is_err(), "no bucket: an error, not a wait");
     }
 }
