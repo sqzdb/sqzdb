@@ -1084,7 +1084,8 @@ impl Database {
         *old.shadow.write().unwrap() = None; sh.clear(); Ok(())
     }
     /// Names of the tables, in creation order (for tools).
-    pub fn table_names(&self) -> Vec<String> { let n = self.names.read().unwrap(); let t = self.tables.read().unwrap(); let mut v: Vec<(usize, String)> = n.values().filter_map(|&i| t.get(i).map(|tb| (i, tb.schema.name.clone()))).collect(); v.sort(); v.into_iter().map(|(_, s)| s).collect() }
+    /// The tables SQL can name, in creation order (the engine's own `_auth_` tables are left out).
+    pub fn table_names(&self) -> Vec<String> { let n = self.names.read().unwrap(); let t = self.tables.read().unwrap(); let mut v: Vec<(usize, String)> = n.values().filter_map(|&i| t.get(i).map(|tb| (i, tb.schema.name.clone()))).filter(|(_, s)| !crate::auth::is_system(s)).collect(); v.sort(); v.into_iter().map(|(_, s)| s).collect() }
     pub fn tables_with_shadow(&self) -> Vec<(String, Arc<Table>)> { let names = self.names.read().unwrap(); let t = self.tables.read().unwrap(); names.iter().filter(|(k, _)| !k.starts_with('\u{0}')).filter_map(|(k, &i)| if t[i].shadow.read().unwrap().is_some() { Some((k.clone(), t[i].clone())) } else { None }).collect() }
     pub fn table_by_id(&self, id: u16) -> Option<Arc<Table>> { self.tables.read().unwrap().get(id as usize).cloned() }
 

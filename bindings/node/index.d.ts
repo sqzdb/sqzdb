@@ -74,7 +74,27 @@ export class Database {
   /** Act as an identity your app vouches for after its own login: existing roles, plus attributes that row policies
    *  read as SESSION.<name>. Nothing is stored; cheap enough per request. */
   as(identity: IdentityInput): Database;
+  /** Sign-up, sign-in and sessions for a table marked `ALTER TABLE <table> ENABLE AUTH`. */
+  auth(table: string): Auth;
+  /** Act as the user a session token belongs to: their role, and their row's columns as SESSION attributes.
+   *  Throws AUTH for an unknown, signed-out, ended or expired token. */
+  session(token: string): Database;
   close(): void;
+}
+
+export interface SignedIn { token: string; user: Row; }
+export class Auth {
+  readonly table: string;
+  /** Insert a user (fields must include the login column) and set their password. */
+  signUp(fields: Record<string, Value>, password: string): Promise<SignedIn>;
+  /** Check a login and password; rejects with AUTH when they don't match. */
+  signIn(login: string, password: string): Promise<SignedIn>;
+  /** Set a user's password by primary key and end all their sessions. */
+  setPassword(key: Value, password: string): Promise<void>;
+  /** End one session; an unknown token is not an error. */
+  signOut(token: string): void;
+  /** End every session of a user, by primary key. */
+  signOutEverywhere(key: Value): void;
 }
 
 export class SqweezError extends Error {

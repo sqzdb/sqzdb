@@ -99,3 +99,44 @@ pub struct Sub { s: crate::live::Subscription }
 
 /// Primary key of the last row this session inserted (an automatic id, or the one given); 0 before any insert.
 #[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_last_insert_id(s: *mut Sess) -> i64 { if s.is_null() { 0 } else { unsafe { &*s }.s.last_insert_id } }
+
+// ---------- sign-in (see auth.rs); structured values cross as JSON ----------
+fn json_value(v: &serde_json::Value) -> Result<Value, String> {
+    Ok(match v { serde_json::Value::Null => Value::Null, serde_json::Value::Bool(b) => Value::Bool(*b), serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Number(n) => match n.as_i64() { Some(i) => Value::Int(i), None => Value::Float(n.as_f64().unwrap_or(f64::NAN)) }, _ => return Err("values are numbers, text, true/false or null".into()) })
+}
+fn signed_in_json(si: crate::auth::SignedIn) -> *mut c_char {
+    let user: serde_json::Map<String, serde_json::Value> = si.user.into_iter().map(|(k, v)| (k, match v { Value::Null => serde_json::Value::Null, Value::Int(i) => i.into(), Value::Float(f) => serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null), Value::Bool(b) => b.into(), Value::Text(s) => s.into(), Value::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>().into() })).collect();
+    CString::new(serde_json::json!({ "token": si.token, "user": user }).to_string()).unwrap().into_raw()
+}
+fn auth_result(db: &Db, r: Result<crate::auth::SignedIn, String>) -> *mut c_char { match r { Ok(si) => signed_in_json(si), Err(e) => { set_err(db, e); std::ptr::null_mut() } } }
+fn auth_status(db: &Db, r: Result<(), String>) -> c_int { match r { Ok(()) => 0, Err(e) => { set_err(db, e); 1 } } }
+/// Insert a user (`fields`: a JSON object that includes the login column) and set the password. Returns a JSON string
+/// `{"token": …, "user": {…}}` to free with sqweezdb_free_string, or null on error (see sqweezdb_last_error).
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_sign_up(db: *mut Db, table: *const c_char, fields: *const c_char, password: *const c_char) -> *mut c_char {
+    let db = unsafe { &*db };
+    let f = (|| -> Result<Vec<(String, Value)>, String> { match serde_json::from_str::<serde_json::Value>(&unsafe { cstr(fields) }).map_err(|e| format!("fields: {e}"))? { serde_json::Value::Object(m) => m.iter().map(|(k, v)| Ok((k.clone(), json_value(v)?))).collect(), _ => Err("fields: a JSON object".into()) } })();
+    auth_result(db, f.and_then(|f| db.sql.sign_up(&unsafe { cstr(table) }, &f, &unsafe { cstr(password) })))
+}
+/// Check a login and password; the result is as for sqweezdb_sign_up.
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_sign_in(db: *mut Db, table: *const c_char, login: *const c_char, password: *const c_char) -> *mut c_char {
+    let db = unsafe { &*db }; auth_result(db, db.sql.sign_in(&unsafe { cstr(table) }, &unsafe { cstr(login) }, &unsafe { cstr(password) }))
+}
+/// End one session (0); an unknown token is not an error.
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_sign_out(db: *mut Db, token: *const c_char) -> c_int { let db = unsafe { &*db }; auth_status(db, db.sql.sign_out(&unsafe { cstr(token) })) }
+/// Set a user's password by primary key (`key`: a JSON number or string) and end their sessions.
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_set_password(db: *mut Db, table: *const c_char, key: *const c_char, password: *const c_char) -> c_int {
+    let db = unsafe { &*db };
+    let k = serde_json::from_str::<serde_json::Value>(&unsafe { cstr(key) }).map_err(|e| format!("key: {e}")).and_then(|v| json_value(&v));
+    auth_status(db, k.and_then(|k| db.sql.set_password(&unsafe { cstr(table) }, &k, &unsafe { cstr(password) })))
+}
+/// End every session of a user (`key` as for sqweezdb_set_password).
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_sign_out_everywhere(db: *mut Db, table: *const c_char, key: *const c_char) -> c_int {
+    let db = unsafe { &*db };
+    let k = serde_json::from_str::<serde_json::Value>(&unsafe { cstr(key) }).map_err(|e| format!("key: {e}")).and_then(|v| json_value(&v));
+    auth_status(db, k.and_then(|k| db.sql.sign_out_everywhere(&unsafe { cstr(table) }, &k)))
+}
+/// Make the session act as the user a token belongs to (0), or 1 (see sqweezdb_last_error).
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_use_token(db: *mut Db, s: *mut Sess, token: *const c_char) -> c_int { let (db, s) = unsafe { (&*db, &mut *s) }; auth_status(db, db.sql.session_from_token(&mut s.s, &unsafe { cstr(token) })) }
+/// Free a string this library returned.
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqweezdb_free_string(p: *mut c_char) { if !p.is_null() { drop(unsafe { CString::from_raw(p) }); } }

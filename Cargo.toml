@@ -1,6 +1,6 @@
 [package]
 name = "sqweezdb"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 
@@ -24,6 +24,7 @@ getrandom = "0.3"   # UUIDs: the operating system's secure random source
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+argon2 = "0.5"
 
 # The static Linux builds use musl, whose allocator made the engine 2x slower (measured in E45); the command uses
 # mimalloc there. Library builds keep the host allocator.

@@ -9,6 +9,8 @@ typedef struct Db Db; typedef struct Stmt Stmt; typedef struct Sess Sess; typede
 typedef struct { int tag; long long i; double f; const unsigned char* ptr; size_t len; } CValue;
 Db* sqweezdb_open(const char* path, int durable); long long sqweezdb_last_insert_id(Sess*); Db* sqweezdb_open_with(const char* path, const char* json); const char* sqweezdb_open_error(); void sqweezdb_close(Db*); const char* sqweezdb_last_error(Db*);
 Sess* sqweezdb_session(Db*); void sqweezdb_session_free(Sess*); int sqweezdb_login(Db*, Sess*, const char*); int sqweezdb_assume(Db*, Sess*, const char*);
+char* sqweezdb_sign_up(Db*, const char*, const char*, const char*); char* sqweezdb_sign_in(Db*, const char*, const char*, const char*); int sqweezdb_sign_out(Db*, const char*);
+int sqweezdb_set_password(Db*, const char*, const char*, const char*); int sqweezdb_sign_out_everywhere(Db*, const char*, const char*); int sqweezdb_use_token(Db*, Sess*, const char*); void sqweezdb_free_string(char*);
 Stmt* sqweezdb_prepare(Db*, const char*); void sqweezdb_finalize(Stmt*);
 Rows* sqweezdb_exec(Db*, Sess*, Stmt*, const CValue*, int); Rows* sqweezdb_exec_text(Db*, Sess*, const char*, const CValue*, int);
 int sqweezdb_rows_count(Rows*); int sqweezdb_rows_cols(Rows*); int sqweezdb_rows_get(Rows*, int, int, CValue*); int sqweezdb_rows_all(Rows*, CValue*, int); void sqweezdb_rows_free(Rows*);
@@ -116,6 +118,7 @@ func (db *DB) Prepare(sql string) (*Stmt, error) {
 	return &Stmt{p: p}, nil
 }
 func (st *Stmt) Close() { C.sqweezdb_finalize(st.p) }
+
 // LastInsertID is the primary key of the last row this session inserted (an automatic id, or the one given).
 func (s *Session) LastInsertID() int64 { return int64(C.sqweezdb_last_insert_id(s.p)) }
 
@@ -142,6 +145,127 @@ func (s *Session) Assume(roles []string, attrs map[string]any) error {
 	defer C.free(unsafe.Pointer(cj))
 	if C.sqweezdb_assume(s.db.p, s.p, cj) != 0 {
 		return s.db.lastError()
+	}
+	return nil
+}
+
+// UseToken makes the session act as the user a session token belongs to (from Auth.SignIn or Auth.SignUp): their role,
+// and their row's columns as the attributes row policies read (SESSION.id). It fails for an unknown, signed-out, ended
+// or expired token.
+func (s *Session) UseToken(token string) error {
+	ct := C.CString(token)
+	defer C.free(unsafe.Pointer(ct))
+	if C.sqweezdb_use_token(s.db.p, s.p, ct) != 0 {
+		return s.db.lastError()
+	}
+	return nil
+}
+
+// Auth signs users of one table in: a table marked ALTER TABLE <table> ENABLE AUTH. A password hash takes a few
+// milliseconds; call these from your request goroutines.
+type Auth struct {
+	db    *DB
+	table string
+}
+
+// SignedIn is a new session: its token, and the user's row by column name (integers as int64).
+type SignedIn struct {
+	Token string
+	User  map[string]any
+}
+
+// Auth returns the sign-in functions for a table marked ALTER TABLE <table> ENABLE AUTH.
+func (db *DB) Auth(table string) *Auth { return &Auth{db: db, table: table} }
+
+func (a *Auth) result(p *C.char) (SignedIn, error) {
+	if p == nil {
+		return SignedIn{}, a.db.lastError()
+	}
+	defer C.sqweezdb_free_string(p)
+	var out struct {
+		Token string                     `json:"token"`
+		User  map[string]json.RawMessage `json:"user"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(p)), &out); err != nil {
+		return SignedIn{}, err
+	}
+	user := make(map[string]any, len(out.User))
+	for k, raw := range out.User {
+		var n json.Number
+		if json.Unmarshal(raw, &n) == nil {
+			if i, err := n.Int64(); err == nil {
+				user[k] = i
+			} else if f, err := n.Float64(); err == nil {
+				user[k] = f
+			}
+			continue
+		}
+		var v any
+		_ = json.Unmarshal(raw, &v)
+		user[k] = v
+	}
+	return SignedIn{Token: out.Token, User: user}, nil
+}
+
+// SignUp inserts a user (fields must include the login column) and sets their password.
+func (a *Auth) SignUp(fields map[string]any, password string) (SignedIn, error) {
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return SignedIn{}, err
+	}
+	ct, cf, cp := C.CString(a.table), C.CString(string(b)), C.CString(password)
+	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(cf))
+	defer C.free(unsafe.Pointer(cp))
+	return a.result(C.sqweezdb_sign_up(a.db.p, ct, cf, cp))
+}
+
+// SignIn checks a login and password and starts a session.
+func (a *Auth) SignIn(login, password string) (SignedIn, error) {
+	ct, cl, cp := C.CString(a.table), C.CString(login), C.CString(password)
+	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(cl))
+	defer C.free(unsafe.Pointer(cp))
+	return a.result(C.sqweezdb_sign_in(a.db.p, ct, cl, cp))
+}
+
+// SignOut ends one session; an unknown token is not an error.
+func (a *Auth) SignOut(token string) error {
+	ct := C.CString(token)
+	defer C.free(unsafe.Pointer(ct))
+	if C.sqweezdb_sign_out(a.db.p, ct) != 0 {
+		return a.db.lastError()
+	}
+	return nil
+}
+
+// SetPassword sets a user's password by primary key (an int64 or a string) and ends all their sessions.
+func (a *Auth) SetPassword(key any, password string) error {
+	b, err := json.Marshal(key)
+	if err != nil {
+		return err
+	}
+	ct, ck, cp := C.CString(a.table), C.CString(string(b)), C.CString(password)
+	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(ck))
+	defer C.free(unsafe.Pointer(cp))
+	if C.sqweezdb_set_password(a.db.p, ct, ck, cp) != 0 {
+		return a.db.lastError()
+	}
+	return nil
+}
+
+// SignOutEverywhere ends every session of a user, by primary key.
+func (a *Auth) SignOutEverywhere(key any) error {
+	b, err := json.Marshal(key)
+	if err != nil {
+		return err
+	}
+	ct, ck := C.CString(a.table), C.CString(string(b))
+	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(ck))
+	if C.sqweezdb_sign_out_everywhere(a.db.p, ct, ck) != 0 {
+		return a.db.lastError()
 	}
 	return nil
 }

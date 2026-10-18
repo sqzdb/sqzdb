@@ -10,6 +10,35 @@ use std::sync::{Arc, Mutex};
 #[pyclass(name = "Statement")] struct PyStmt { p: Arc<Prepared> }
 #[pyclass(name = "Session")] struct PySess { sql: Arc<Sql>, s: Mutex<Session> }
 #[pyclass(name = "Subscription")] struct PySub { s: sqweezdb::live::Subscription }
+/// Sign-up, sign-in and sessions for one table marked `ALTER TABLE <table> ENABLE AUTH` (`db.auth("users")`).
+#[pyclass(name = "Auth")] struct PyAuth { sql: Arc<Sql>, table: String }
+fn auth_err(e: String) -> PyErr { match sqweezdb::sql::error_code(&e) { "AUTH" | "DENIED" => pyo3::exceptions::PyPermissionError::new_err(e), "TYPE" | "DUPLICATE" | "SCHEMA" => pyo3::exceptions::PyValueError::new_err(e), _ => pyo3::exceptions::PyRuntimeError::new_err(e) } }
+fn signed_in<'py>(py: Python<'py>, si: sqweezdb::auth::SignedIn) -> PyResult<Bound<'py, PyTuple>> {
+    let user = pyo3::types::PyDict::new(py); for (k, v) in &si.user { user.set_item(k, to_py(py, v)?)?; }
+    PyTuple::new(py, [si.token.into_pyobject(py)?.into_any(), user.into_any()])
+}
+#[pymethods] impl PyAuth {
+    /// Insert a user (`fields` must include the login column) and set their password: returns (token, user).
+    fn sign_up<'py>(&self, py: Python<'py>, fields: &Bound<'py, pyo3::types::PyDict>, password: &str) -> PyResult<Bound<'py, PyTuple>> {
+        let mut f = vec![]; for (k, v) in fields.iter() { f.push((k.extract::<String>()?, to_value(&v)?)); }
+        let (sql, table, pw) = (self.sql.clone(), self.table.clone(), password.to_string());
+        let r = py.detach(|| sql.sign_up(&table, &f, &pw)).map_err(auth_err)?; signed_in(py, r)
+    }
+    /// Check a login and password: returns (token, user); raises PermissionError when they don't match.
+    fn sign_in<'py>(&self, py: Python<'py>, login: &str, password: &str) -> PyResult<Bound<'py, PyTuple>> {
+        let (sql, table, l, pw) = (self.sql.clone(), self.table.clone(), login.to_string(), password.to_string());
+        let r = py.detach(|| sql.sign_in(&table, &l, &pw)).map_err(auth_err)?; signed_in(py, r)
+    }
+    /// Set a user's password by primary key (no old password is asked for) and end all their sessions.
+    fn set_password(&self, py: Python<'_>, key: &Bound<'_, PyAny>, password: &str) -> PyResult<()> {
+        let (sql, table, k, pw) = (self.sql.clone(), self.table.clone(), to_value(key)?, password.to_string());
+        py.detach(|| sql.set_password(&table, &k, &pw)).map_err(auth_err)
+    }
+    /// End one session; an unknown token is not an error.
+    fn sign_out(&self, token: &str) -> PyResult<()> { self.sql.sign_out(token).map_err(auth_err) }
+    /// End every session of a user, by primary key.
+    fn sign_out_everywhere(&self, key: &Bound<'_, PyAny>) -> PyResult<()> { self.sql.sign_out_everywhere(&self.table, &to_value(key)?).map_err(auth_err) }
+}
 #[pymethods] impl PySub {
     /// Wait up to timeout_ms for the next change: (op, table, key, columns...) with op 1 insert, 2 update, 3 delete; None on timeout.
     #[pyo3(signature = (timeout_ms = 1000))]
@@ -57,11 +86,16 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
     fn close(&self) { self.sql.close() }
     fn prepare(&self, sql: &str) -> PyResult<PyStmt> { Ok(PyStmt { p: self.sql.prepare(sql).map_err(pyo3::exceptions::PyValueError::new_err)? }) }
     fn session(&self) -> PySess { PySess { sql: self.sql.clone(), s: Mutex::new(Session::default()) } }
+    /// Sign-up, sign-in and sessions for a table marked `ALTER TABLE <table> ENABLE AUTH`.
+    fn auth(&self, table: &str) -> PyAuth { PyAuth { sql: self.sql.clone(), table: table.to_string() } }
     fn snapshot(&self) -> u64 { self.sql.snapshot().rows }
 }
 #[pymethods] impl PySess {
     /// Primary key of the last row this session inserted (an automatic id, or the one given); 0 before any insert.
     #[getter] fn last_insert_id<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> { match self.s.lock().unwrap().last_insert_key.clone() { Some(v) => to_py(py, &v), None => Ok(py.None().into_bound(py)) } }
+    /// Act as the user a session token belongs to (from `db.auth(table).sign_in`): their role, and their row's columns
+    /// as SESSION attributes. Raises PermissionError for an unknown, signed-out, ended or expired token.
+    fn use_token(&self, token: &str) -> PyResult<()> { self.sql.session_from_token(&mut self.s.lock().unwrap(), token).map_err(auth_err) }
     fn login(&self, user: &str) -> PyResult<()> { self.sql.login(&mut self.s.lock().unwrap(), user).map_err(pyo3::exceptions::PyPermissionError::new_err) }
     /// Act as an identity your application vouches for after its own login: `roles` is a role name or a list of them,
     /// keyword arguments are the session attributes row policies read (SESSION.tenant). Nothing is stored in the database.
@@ -99,4 +133,4 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
         rows_to_py(py, r.map_err(pyo3::exceptions::PyRuntimeError::new_err)?)
     }
 }
-#[pymodule(name = "sqweezdb")] fn sqweezdb_module(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<PyDb>()?; m.add_class::<PyStmt>()?; m.add_class::<PySess>()?; m.add_class::<PySub>()?; Ok(()) }
+#[pymodule(name = "sqweezdb")] fn sqweezdb_module(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<PyDb>()?; m.add_class::<PyStmt>()?; m.add_class::<PySess>()?; m.add_class::<PySub>()?; m.add_class::<PyAuth>()?; Ok(()) }

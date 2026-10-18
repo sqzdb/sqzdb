@@ -31,9 +31,10 @@ pub struct Config {
     pub listen: Listen,
     pub live: LivePolicy,
     pub log: LogPolicy,
+    pub auth: AuthPolicy,
 }
 impl Default for Config {
-    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default() } }
+    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default() } }
 }
 impl Config {
     pub fn durable(mut self, d: Durability) -> Config { self.durable = d; self }
@@ -90,6 +91,9 @@ pub struct Listen { pub socket: Option<PathBuf>, pub tcp: Option<String>, pub ht
 #[derive(Clone, Debug)]
 pub struct LivePolicy { pub debounce: Duration, pub queue: usize }
 impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Duration::from_millis(5), queue: 65536 } } }
+/// Sign-in (see `auth.rs`): how long a session lasts, and the shortest password `signUp` and `setPassword` accept.
+#[derive(Clone, Debug)] pub struct AuthPolicy { pub session_ttl: Duration, pub password_min: usize }
+impl Default for AuthPolicy { fn default() -> AuthPolicy { AuthPolicy { session_ttl: Duration::from_secs(30 * 24 * 3600), password_min: 8 } } }
 #[derive(Clone, Debug, Default)]
 pub struct LogPolicy { /// Log threads leave after this long without writes and return on the next one (many idle databases per process).
     pub threads_idle_after: Option<Duration>,
@@ -110,7 +114,7 @@ pub struct ConfigFile {
     #[serde(alias = "config_file")] pub config_file: Option<String>,
     pub durable: Option<DurableIn>, pub create: Option<bool>,
     #[serde(alias = "recover_threads")] pub recover_threads: Option<usize>,
-    pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>,
+    pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>, pub auth: Option<AuthFile>,
 }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -135,6 +139,9 @@ pub struct ListenFile { pub socket: Option<String>, pub tcp: Option<String>, pub
 pub struct LiveFile { pub debounce: Option<Dur>, pub queue: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AuthFile { #[serde(alias = "session_ttl")] pub session_ttl: Option<Dur>, #[serde(alias = "password_min")] pub password_min: Option<usize> }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LogFile { #[serde(alias = "threads_idle_after")] pub threads_idle_after: Option<Dur>, #[serde(alias = "sync_delay")] pub sync_delay: Option<Dur> }
 
 fn pick<T>(base: Option<T>, over: Option<T>) -> Option<T> { over.or(base) }
@@ -151,6 +158,7 @@ impl ConfigFile {
             listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
             log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
+            auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min) }),
         }
     }
     /// Defaults, validation, and typed values. Errors name the key.
@@ -185,6 +193,10 @@ impl ConfigFile {
         if let Some(l) = self.log {
             if let Some(d) = l.threads_idle_after { let d = dur_of(d, "log.threadsIdleAfter")?; c.log.threads_idle_after = if d.is_zero() { None } else { Some(d) }; }
             if let Some(d) = l.sync_delay { let d = dur_of(d, "log.syncDelay")?; if d > Duration::from_secs(60) { return Err("log.syncDelay: at most 60s".into()); } c.log.sync_delay = if d.is_zero() { None } else { Some(d) }; }
+        }
+        if let Some(a) = self.auth {
+            if let Some(d) = a.session_ttl { let d = dur_of(d, "auth.sessionTtl")?; if d < Duration::from_secs(60) { return Err("auth.sessionTtl: at least 60s".into()); } c.auth.session_ttl = d; }
+            if let Some(n) = a.password_min { if !(1..=256).contains(&n) { return Err("auth.passwordMin: between 1 and 256".into()); } c.auth.password_min = n; }
         }
         Ok(c)
     }

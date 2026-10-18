@@ -1,0 +1,5 @@
+sign-up (create a user), one at a time (300)                     74.98 ms each
+sign-in, one at a time                                           p50 37.87 ms, p99 38.84 ms
+failed sign-in: wrong password / unknown login                   p50 37.42 ms / 37.48 ms
+200 sign-ins at once (64 client threads)                         791 ms (253/s)
+a request: /api/health / the user reading their own record       120 µs / 270 µs

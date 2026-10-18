@@ -38,6 +38,7 @@ schema changes without downtime, and backup to any S3-compatible bucket.
 | **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT(n)`, `BYTES(n)`, `TIMESTAMP`, `UUID`. A value of the wrong type is rejected, never stored. |
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
+| **Sign-in** | Email and password sign-up and sign-in for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
 | **Online schema changes** | `ALTER TABLE` adds, drops, renames or retypes a column while reads and writes continue. |
 | **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`. |
@@ -109,7 +110,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.3.2` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.4.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -400,8 +401,60 @@ Nothing about the user is stored in the database.
 
 Users can also be stored in the database with `CREATE USER alice IN ROLE customer WITH tenant = 7`, and
 used with `db.as('alice')`. A client of the TCP listener selects such a user by name after presenting
-the listener's token. Per-user passwords are not built yet, and a network client can never supply its
-own attributes.
+the listener's token, and a network client can never supply its own attributes. For end users who sign
+in with a password, use the next section instead.
+
+### Sign-in
+
+Mark a table you define as the one users sign in to. Its `UNIQUE` text column is the login, and each
+user's role comes from a column or is fixed. A signed-in user acts with their row's columns as
+`SESSION` attributes, so policies such as `USING (owner = SESSION.id)` apply per user.
+
+```sql
+CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, name TEXT, role TEXT DEFAULT 'member', tenant_id INT);
+ALTER TABLE users ENABLE AUTH (ROLE FROM role);         -- or (ROLE member) for one role for everyone
+CREATE POLICY own ON notes FOR ALL TO member USING (owner = SESSION.id);
+```
+
+```js
+const auth = db.auth('users')
+const { token, user } = await auth.signUp({ email: 'ann@example.com', name: 'Ann' }, password)
+const again = await auth.signIn('Ann@Example.com', password)        // rejects with AUTH when wrong
+
+app.use((req, res, next) => {                                       // on every request
+  try { req.db = db.session((req.get('authorization') ?? '').replace(/^Bearer /, '')) }
+  catch { return res.status(401).end() }                            // unknown, signed out or expired
+  next()                                                            // req.db acts as her: role, SESSION.id …
+})
+app.get('/notes', (req, res) => res.json(req.db.all('SELECT * FROM notes')))   // only her notes
+auth.signOut(again.token)
+```
+
+```python
+auth = db.auth("users"); token, user = auth.sign_in("ann@example.com", password)
+s = db.session(); s.use_token(token)
+```
+
+```go
+in, err := db.Auth("users").SignIn("ann@example.com", password)
+s := db.Session(); err = s.UseToken(in.Token)
+```
+
+- **Logins** are compared trimmed and lowercased; `signUp` stores them that way. If you insert users
+  yourself, store logins lowercased.
+- **Passwords** are hashed with Argon2id (19 MiB, 2 passes, OWASP's recommendation), about 9 ms each,
+  with as many at once as there are cores, up to 8. The hashes live in a system table no SQL can read, not even the application's.
+  In Node, `signUp`, `signIn` and `setPassword` run off the JavaScript thread and return promises.
+- **Sessions** are random 256-bit tokens (`sqz_…`). Only their SHA-256 is stored. `db.session(token)`
+  costs about 2 µs, so it can run on every request. A session lasts `auth.sessionTtl` (30 days).
+  `signOut` ends one session; `setPassword` and `signOutEverywhere` end all of a user's sessions.
+  Changing a user's role column applies on the next `db.session(token)`.
+- **Wrong passwords**: a wrong password and an unknown login fail the same way, in the same time. After
+  5 failures for one login, each further attempt waits 1 s, then 2, 4 and so on, up to 15 minutes.
+- **Deleting a user** ends their sessions. A new row that reuses a deleted user's key starts without a
+  password.
+- **Not built yet:** OAuth sign-in, email verification and password reset, and sign-in over the TCP
+  listener and the web console.
 
 ### Backup, restore and replication
 
@@ -494,6 +547,8 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `live.debounce` | `5ms` | How long a live query waits to batch changes before re-running. |
 | `live.queue` | `65536` | Events a subscriber may fall behind before it is dropped. |
 | `log.threadsIdleAfter` | off | Let log threads exit when idle; for many idle databases in one process. |
+| `auth.sessionTtl` | `30d` | How long a session from sign-in lasts. At least `60s`. |
+| `auth.passwordMin` | `8` | The shortest password `signUp` and `setPassword` accept, in characters. |
 | `log.syncDelay` | off | With `durable: false`, hold the background fsync up to this long so one fsync covers more writes. For hosts with thousands of small databases (one per tenant or agent) on one disk. A machine crash can then lose up to this much; a process crash still loses nothing, and anything that waits for durability syncs at once. At most `60s`. |
 
 Durations are written as `'5ms'`, `'1s'`, `'2m'`, `'1h'`, `'7d'` or a number of milliseconds. Sizes are
@@ -569,6 +624,8 @@ token = "${DB_TOKEN}"
 
 - `CREATE ROLE`, `CREATE USER … IN ROLE … [WITH attr = value]`, `GRANT … ON table TO role`, and
   `CREATE POLICY name ON table FOR cmd TO role USING (col = SESSION.attr [AND …])`.
+- `ALTER TABLE … ENABLE AUTH [(ROLE FROM column | ROLE name)]` and `DISABLE AUTH`: see
+  [sign-in](#sign-in).
 
 **Values**
 
@@ -597,6 +654,7 @@ Every binding reports errors with a stable code. In Node it is `err.code` on a `
 | `DUPLICATE` | A primary key or `UNIQUE` value already exists. |
 | `FOREIGN_KEY` | A referenced row is missing, or a delete is blocked by children. |
 | `DENIED` | The session lacks a grant, or a row falls outside its policy. |
+| `AUTH` | A wrong login or password, too many failed sign-ins, or a session token that is unknown, signed out, ended or expired. |
 | `CONFLICT` | A concurrent transaction changed the same rows; retry. |
 | `NOT_FOUND` | An `UPDATE` by primary key found no row. |
 | `TRANSACTION` | `BEGIN` inside a transaction, or `COMMIT` outside one. |
@@ -669,7 +727,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.3.2`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.4.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

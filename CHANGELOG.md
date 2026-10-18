@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-10-17
+
+### Added
+- **Sign-in.** `ALTER TABLE users ENABLE AUTH (ROLE FROM role)` marks a table you define as the one users
+  sign in to; its `UNIQUE` text column is the login. `db.auth('users').signUp(fields, password)` and
+  `signIn(login, password)` return a session token, and `db.session(token)` acts as that user: their
+  role, and their row's columns as `SESSION` attributes for row policies. Also `signOut`,
+  `setPassword` and `signOutEverywhere`, in Node, Python (`db.auth("users").sign_in`,
+  `session.use_token`), Go (`db.Auth("users").SignIn`, `Session.UseToken`) and C. Passwords are hashed
+  with Argon2id into a system table no SQL can read, and only a SHA-256 of each token is stored. Repeated
+  failures for one login slow down. Sessions last `auth.sessionTtl` (30 days), and passwords need
+  `auth.passwordMin` characters (8).
+- The `AUTH` error code.
+
+### Changed
+- Table names starting with `_auth_` are reserved for the engine.
+
 ## 0.3.2 — 2026-10-17
 
 **Upgrade if you use roles and row policies.** A role could read rows through a write that its grants

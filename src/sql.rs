@@ -250,7 +250,9 @@ pub const P_SELECT: u8 = 1; pub const P_INSERT: u8 = 2; pub const P_UPDATE: u8 =
 #[derive(Clone, Debug)] pub enum PolicyRhs { Lit(Value), Attr(String) }
 #[derive(Clone, Debug)] pub struct Policy { pub name: String, pub table: String, pub role: String, pub cmds: u8, pub preds: Vec<(String, Cmp, PolicyRhs)> }
 #[derive(Clone, Debug, Default)] pub struct UserRec { pub roles: Vec<String>, pub attrs: HashMap<String, Value> }
-#[derive(Default)] pub struct Acl { pub roles: std::collections::HashSet<String>, pub users: HashMap<String, UserRec>, pub grants: HashMap<(String, String), u8>, pub policies: Vec<Policy> }
+#[derive(Default)] pub struct Acl { pub roles: std::collections::HashSet<String>, pub users: HashMap<String, UserRec>, pub grants: HashMap<(String, String), u8>, pub policies: Vec<Policy>,
+    /// Tables users sign in to (`ALTER TABLE t ENABLE AUTH`), by lowercase name.
+    pub auth: HashMap<String, crate::auth::AuthTable> }
 
 fn tokens(s: &str) -> Vec<String> {
     let cs: Vec<char> = s.chars().collect(); let mut out = vec![]; let mut i = 0;
@@ -272,7 +274,7 @@ fn literal_tok(t: &str) -> Result<Value, String> {
     match t.to_uppercase().as_str() { "TRUE" => Ok(Value::Bool(true)), "FALSE" => Ok(Value::Bool(false)), _ => Err(format!("bad literal {t}")) }
 }
 fn priv_of(t: &str) -> Result<u8, String> { match t.to_uppercase().as_str() { "SELECT" => Ok(P_SELECT), "INSERT" => Ok(P_INSERT), "UPDATE" => Ok(P_UPDATE), "DELETE" => Ok(P_DELETE), "ALL" => Ok(P_SELECT | P_INSERT | P_UPDATE | P_DELETE), x => Err(format!("unknown privilege {x}")) } }
-pub fn is_admin_stmt(sql: &str) -> bool { let u = sql.trim_start().to_uppercase(); u.starts_with("CREATE ROLE ") || u.starts_with("CREATE USER ") || u.starts_with("GRANT ") || u.starts_with("CREATE POLICY ") || u.starts_with("CREATE INDEX ") }
+pub fn is_admin_stmt(sql: &str) -> bool { let u = sql.trim_start().to_uppercase(); (u.starts_with("ALTER TABLE ") && (u.contains(" ENABLE AUTH") || u.contains(" DISABLE AUTH"))) || u.starts_with("CREATE ROLE ") || u.starts_with("CREATE USER ") || u.starts_with("GRANT ") || u.starts_with("CREATE POLICY ") || u.starts_with("CREATE INDEX ") }
 
 fn obj_name(n: &ObjectName) -> String { n.0.iter().map(|p| match p { ObjectNamePart::Identifier(i) => i.value.clone(), other => format!("{other}") }).collect::<Vec<_>>().join(".") }
 /// A column default: a constant, or a generator evaluated per row. A constant is checked against the column type now.
@@ -352,6 +354,7 @@ fn values_count_error(schema: &Schema, table: &str, listed: Option<&[usize]>, go
 pub fn error_code(msg: &str) -> &'static str {
     let m = msg.trim_start();
     if m.starts_with("Conflict") { "CONFLICT" }
+    else if m.starts_with("sign-in failed:") || m.starts_with("session:") { "AUTH" }
     else if m.contains("in the same transaction") { "TRANSACTION" }
     else if m.contains(" VALUES gives ") { "SYNTAX" }
     else if m.starts_with("Duplicate") { "DUPLICATE" }
@@ -363,6 +366,7 @@ pub fn error_code(msg: &str) -> &'static str {
     else if m.starts_with("options:") || m.contains(".toml") || m.contains(" is required") || m.starts_with("no database in") || m.starts_with("durable") || m.starts_with("follow") || m.starts_with("listen.") || m.starts_with("snapshot.") || m.starts_with("live.") || m.starts_with("log.") || m.starts_with("backup.") { "CONFIG" }
     else if m.starts_with("already in a transaction") || m.starts_with("not in a transaction") { "TRANSACTION" }
     else if m.contains("can't be named ") { "SYNTAX" }
+    else if m.starts_with("the password is too ") { "TYPE" }
     // a value of the wrong type for an operator or function, or arithmetic out of range (PostgreSQL's "data exception")
     else if m.contains("-byte limit for a value") || m.contains("division by zero") || m.contains("integer overflow") || m.contains("does not fit a 64-bit integer") || m.contains("() needs ") || m.contains("() takes numbers")
         || m.contains("): not a number") || m.starts_with("LIKE needs") || m.starts_with("|| needs") || m.starts_with("-> needs") || m.starts_with("a date needs") || m.starts_with("cannot cast")
@@ -710,7 +714,7 @@ impl<'a> Planner<'a> {
         Ok(Plan::Const { exprs, names })
     }
     fn table_src(&self, tf: &TableFactor) -> Result<Src, String> {
-        match tf { TableFactor::Table { name, alias, .. } => { let n = obj_name(name); let table = self.db.table(&n).ok_or(format!("no such table {n}"))?; Ok(Src { table, alias: alias.as_ref().map(|a| a.name.value.clone()).unwrap_or(n) }) }, other => Err(format!("unsupported FROM {other}")) }
+        match tf { TableFactor::Table { name, alias, .. } => { let n = obj_name(name); if crate::auth::is_system(&n) { return Err(format!("no such table {n}")); } let table = self.db.table(&n).ok_or(format!("no such table {n}"))?; Ok(Src { table, alias: alias.as_ref().map(|a| a.name.value.clone()).unwrap_or(n) }) }, other => Err(format!("unsupported FROM {other}")) }
     }
     fn plan(&mut self, st: &Statement) -> Result<Plan, String> {
         match st {
@@ -869,6 +873,7 @@ impl<'a> Planner<'a> {
                 Ok(Plan::Update { table, sets, at, returning })
             }
             Statement::AlterTable(at) => {
+                if crate::auth::is_system(&obj_name(&at.name)) { return Err(format!("no such table {}", obj_name(&at.name))); }
                 let mut ops = vec![];
                 for op in &at.operations {
                     ops.push(match op {
@@ -1522,6 +1527,8 @@ impl<'a> Sink<'a> {
 pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>, pub acl: std::sync::RwLock<Acl>, pub epoch: Arc<std::sync::atomic::AtomicU64>, alters: Mutex<Vec<std::thread::JoinHandle<Result<(), String>>>>, pub live: std::sync::OnceLock<Arc<crate::live::Reactor>>,
     /// The configuration this database was opened with (defaults when opened through the lab constructors).
     pub cfg: crate::config::Config, services: Mutex<Option<Services>>,
+    /// Sign-in bookkeeping (failed attempts, the session sweep): see `auth.rs`.
+    pub(crate) auth: crate::auth::AuthState,
     /// `<dir>/.lock`, held while open. Declared last: fields drop in order, so the lock is released only after `db`
     /// (and with it the log threads) has gone.
     dir_lock: Mutex<Option<std::fs::File>> }
@@ -1587,7 +1594,7 @@ pub struct Follower { pub applied: Arc<std::sync::atomic::AtomicU64>, stop: Arc<
 impl Follower { pub fn applied(&self) -> u64 { self.applied.load(std::sync::atomic::Ordering::Acquire) } }
 impl Drop for Follower { fn drop(&mut self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); if let Some(h) = self.thread.take() { h.join().ok(); } } }
 impl Sql {
-    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), dir_lock: Mutex::new(None) } }
+    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), dir_lock: Mutex::new(None) } }
     /// Build the new schema and the old-row -> new-row converter for a list of ALTER operations.
     fn alter_schema(old: &Schema, ops: &[AlterOp]) -> Result<(Schema, Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>), String> {
         // working list: (column, source: Some(old index) | None, default, retyped from old type)
@@ -1815,6 +1822,13 @@ impl Sql {
             Plan::Alter { table, ops } => { let old = self.db.table(&table).ok_or(format!("no such table {table}"))?; let (schema, convert) = Self::alter_schema(&old.schema, &ops)?; self.db.alter_start(&table, schema, convert)?; Ok(()) }  // the copy resumes in open_arc
             _ => Err(format!("not a catalog statement: {text}")) }
     }
+    /// Create one of the engine's own tables (see `auth.rs`) and log the CREATE, so a restart replays it first.
+    pub(crate) fn create_system_table(&self, ddl: &str) -> Result<(), String> {
+        let stmts = Parser::parse_sql(&GenericDialect {}, ddl).map_err(|e| e.to_string())?;
+        let mut pl = Planner { db: &self.db, nparams: 0, outer: vec![], cur: vec![], corr: None, exists_mode: false, params_at: vec![] };
+        let Plan::CreateTable(schema, _) = pl.plan(&stmts[0])? else { return Err("not a CREATE TABLE".into()) };
+        self.db.create_table(schema)?; self.log_meta(ddl); self.cache.lock().unwrap().clear(); Ok(())
+    }
     fn log_meta(&self, text: &str) { let seq = self.db.log.append_meta(text); if self.db.durable { self.db.log.wait_durable(seq); } }
     /// Bind a session to a named user (roles and attributes are copied in). A session without a user is the embedding
     /// application itself and is unrestricted.
@@ -1848,6 +1862,20 @@ impl Sql {
     fn admin(&self, sess: &Session, sql: &str) -> Result<(), String> {
         if sess.user.is_some() { return Err("permission denied: only the application session can manage roles, users and policies".into()); }
         let t = tokens(sql); let up: Vec<String> = t.iter().map(|x| x.to_uppercase()).collect();
+        if up.len() >= 5 && up[0] == "ALTER" && up[1] == "TABLE" && up[4] == "AUTH" && (up[3] == "ENABLE" || up[3] == "DISABLE") {
+            // ALTER TABLE t ENABLE AUTH [(ROLE FROM column | ROLE name)] | ALTER TABLE t DISABLE AUTH
+            let table = t[2].to_lowercase();
+            if up[3] == "DISABLE" { if t.len() > 5 { return Err(format!("unexpected token {}", t[5])); } self.acl.write().unwrap().auth.remove(&table); return Ok(()); }
+            let role = match up.get(5).map(|x| x.as_str()) {
+                None => None,
+                Some("(") if up.get(6).map(|x| x.as_str()) == Some("ROLE") && up.get(7).map(|x| x.as_str()) == Some("FROM") && t.get(9).map(|x| x.as_str()) == Some(")") && t.len() == 10 => Some((true, t[8].clone())),
+                Some("(") if up.get(6).map(|x| x.as_str()) == Some("ROLE") && t.get(8).map(|x| x.as_str()) == Some(")") && t.len() == 9 => Some((false, t[7].clone())),
+                _ => return Err("expected ENABLE AUTH, ENABLE AUTH (ROLE FROM column) or ENABLE AUTH (ROLE name)".into()),
+            };
+            let cfg = self.enable_auth(&table, role)?;
+            self.acl.write().unwrap().auth.insert(table, cfg); return Ok(());
+        }
+        if let Some(n) = t.iter().find(|x| crate::auth::is_system(x)) { return Err(format!("{n} is a system table")); }
         let mut acl = self.acl.write().unwrap();
         let at = |i: usize| -> Result<&String, String> { t.get(i).ok_or(format!("unexpected end of statement: {sql}")) };
         match (up[0].as_str(), up.get(1).map(|x| x.as_str())) {
@@ -2012,7 +2040,7 @@ impl Sql {
         if p.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire) { let p2 = self.prepare(&p.text)?; return self.execute_s(sess, &p2, params); }  // a schema change swapped the table under this plan
         match &p.plan {
             Plan::Alter { table, ops } => { if sess.user.is_some() { return Err("permission denied: only the application session can alter tables".into()); } self.alter(&p.text, table, ops, true)?; Ok(vec![]) }
-            Plan::CreateTable(s, if_not_exists) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } if *if_not_exists && self.db.table(&s.name).is_some() { return Ok(vec![]); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
+            Plan::CreateTable(s, if_not_exists) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } if crate::auth::is_system(&s.name) { return Err(format!("{}: names starting with _auth_ are reserved for the engine", s.name)); } if *if_not_exists && self.db.table(&s.name).is_some() { return Ok(vec![]); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
             Plan::Const { exprs, .. } => { let xs = self.bind(sess, exprs, params)?; Ok(vec![xs.iter().map(|x| x.eval(&|_| Value::Null)).collect::<Result<Vec<_>, _>>()?]) }
             Plan::Begin => { if sess.txn.is_some() { return Err("already in a transaction".into()); } sess.txn = Some(Txn::new()); Ok(vec![]) }
             Plan::Rollback => { sess.txn = None; Ok(vec![]) }
@@ -2062,10 +2090,11 @@ impl Sql {
                     sess.last_insert_id = last_id; if let Some(k) = last_key { sess.last_insert_key = Some(k); }
                     return Ok(match returning { None => vec![], Some(cols) => out.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() });
                 }
+                let auth = self.acl.read().unwrap().auth.contains_key(&schema.name.to_lowercase());
                 match &mut sess.txn {
-                    Some(t) => { for row in &encoded { table.txn_insert(t, row).map_err(|a| a.to_string())?; } }
-                    None if encoded.len() == 1 => { sess.last_seq = table.insert(&encoded[0]).map_err(|a| a.to_string())?; }
-                    None => { let mut t = Txn::new(); for row in &encoded { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; }   // several rows: all or none
+                    Some(t) => { for row in &encoded { table.txn_insert(t, row).map_err(|a| a.to_string())?; if auth { self.forget_secret(t, table, row)?; } } }
+                    None if encoded.len() == 1 && !auth => { sess.last_seq = table.insert(&encoded[0]).map_err(|a| a.to_string())?; }
+                    None => { let mut t = Txn::new(); for row in &encoded { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; if auth { self.forget_secret(&mut t, table, row)?; } } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; }   // several rows: all or none
                 }
                 sess.last_insert_id = last_id; if let Some(k) = last_key { sess.last_insert_key = Some(k); }
                 Ok(match returning { None => vec![], Some(cols) => encoded.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() })
@@ -2171,11 +2200,11 @@ impl Sql {
                     Conflict::Nothing(target) => {
                         let hit = match target { Some(c) if *c == schema.pk => by_pk.is_some(), Some(_) => by_unique().is_some(), None => by_pk.is_some() || by_unique().is_some() };
                         if hit { continue; }
-                        table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; out.push(row.clone());
+                        table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone());
                     }
                     Conflict::Update { target, .. } => {
                         let old = if *target == schema.pk { by_pk } else { by_unique() };
-                        let Some(old) = old else { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; out.push(row.clone()); continue };
+                        let Some(old) = old else { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone()); continue };
                         if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); }
                         let get = |i: usize| if i < n { decode_col(schema, &old, i) } else { vals[i - n].clone() };
                         if let Some(c) = &cond { if crate::expr::truth(&c.eval(&get)?)? != Some(true) { continue; } }
@@ -2191,7 +2220,7 @@ impl Sql {
                         if let Some(old) = by_pk { if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(schema.key_of(&old)); }
                         if let Some(old) = by_unique() { let k = schema.key_of(&old); if !gone.contains(&k) { if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(k); } }
                         for k in gone { table.txn_delete(&mut t, k).map_err(|a| a.to_string())?; }
-                        table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; out.push(row.clone());
+                        table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone());
                     }
                 }
             }

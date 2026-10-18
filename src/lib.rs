@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod capi;
 pub mod cloud;
 pub mod config;

@@ -97,6 +97,24 @@ class Subscription {
   }
 }
 
+class Auth {
+  constructor(native, table) { this._n = native; this.table = table; }
+  /** Insert a user (fields must include the login column) and set their password: resolves to { token, user }. */
+  async signUp(fields, password) {
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) throw new SqweezError('TYPE', 'signUp() takes the new row as an object, such as { email, name }');
+    const keys = Object.keys(fields);
+    try { return await this._n.signUp(this.table, keys, keys.map((k) => fields[k]), String(password)); } catch (e) { throw wrap(e); }
+  }
+  /** Check a login and password: resolves to { token, user }, or rejects with AUTH. */
+  async signIn(login, password) { try { return await this._n.signIn(this.table, String(login), String(password)); } catch (e) { throw wrap(e); } }
+  /** Set a user's password (by primary key; no old password is asked for) and end all their sessions. */
+  async setPassword(key, password) { try { await this._n.setPassword(this.table, key, String(password)); } catch (e) { throw wrap(e); } }
+  /** End one session. An unknown token is not an error. */
+  signOut(token) { try { this._n.signOut(String(token)); } catch (e) { throw wrap(e); } }
+  /** End every session of a user (by primary key). */
+  signOutEverywhere(key) { try { this._n.signOutEverywhere(this.table, key); } catch (e) { throw wrap(e); } }
+}
+
 class Database {
   constructor(handle, sess, info) {
     this._db = handle; this._sess = sess; this._stmts = info.stmts || new Map();
@@ -185,6 +203,24 @@ class Database {
     } catch (e) { throw wrap(e); }
     return new Database(this._db, sess, { path: this.path, durable: this.durable, user, identity, stmts: this._stmts, rowMode: this.rowMode });
   }
+  /**
+   * Sign-up, sign-in and sessions for a table marked `ALTER TABLE <table> ENABLE AUTH`. A password hash takes a few
+   * milliseconds and runs off the JavaScript thread, so signUp, signIn and setPassword return promises.
+   */
+  auth(table) {
+    if (typeof table !== 'string') throw new SqweezError('TYPE', 'auth() takes the name of a table users sign in to');
+    return new Auth(this._db, table);
+  }
+  /**
+   * The same database as the user a session token belongs to (from `auth(table).signIn` or `signUp`): their role,
+   * and their row's columns as SESSION attributes for row policies. Throws AUTH when the token is unknown, signed out,
+   * ended by a password change, or expired. Cheap enough to call once per request.
+   */
+  session(token) {
+    if (typeof token !== 'string') throw new SqweezError('TYPE', 'session() takes a session token');
+    let sess; try { sess = this._db.session(); sess.useToken(token); } catch (e) { throw wrap(e); }
+    return new Database(this._db, sess, { path: this.path, durable: this.durable, user: null, identity: null, stmts: this._stmts, rowMode: this.rowMode });
+  }
   /** Rows in all tables (from the engine's own count). */
   get rowCount() { return this._db.rows(); }
   close() { this._db.close(); }
@@ -205,4 +241,4 @@ function open(path, opts) {
   return new Database(handle, sess, { path, durable: handle.isDurable(), rowMode });
 }
 
-module.exports = { open, Database, Statement, Subscription, RunResult, SqweezError };
+module.exports = { open, Database, Statement, Subscription, RunResult, SqweezError, Auth };

@@ -111,6 +111,18 @@ pub fn open(path: String, options: Option<String>) -> Result<Db> {
     #[napi] pub fn is_durable(&self) -> bool { self.durable }
     #[napi] pub fn rows(&self) -> Result<f64> { Ok(self.sql()?.snapshot().rows as f64) }
     /// Resolves once commit `seq` is on disk.
+    /// Sign-up, sign-in and password changes hash a password (milliseconds), so they run off the JavaScript thread.
+    #[napi(ts_return_type = "Promise<{ token: string, user: Record<string, unknown> }>")] pub fn sign_up(&self, table: String, keys: Vec<String>, values: Vec<JsUnknown>, password: String) -> Result<AsyncTask<AuthTask>> {
+        let vals = params(values)?; Ok(AsyncTask::new(AuthTask { sql: self.sql()?, table, op: Some(AuthOp::SignUp { fields: keys.into_iter().zip(vals).collect(), password }) }))
+    }
+    #[napi(ts_return_type = "Promise<{ token: string, user: Record<string, unknown> }>")] pub fn sign_in(&self, table: String, login: String, password: String) -> Result<AsyncTask<AuthTask>> {
+        Ok(AsyncTask::new(AuthTask { sql: self.sql()?, table, op: Some(AuthOp::SignIn { login, password }) }))
+    }
+    #[napi(ts_return_type = "Promise<void>")] pub fn set_password(&self, table: String, key: JsUnknown, password: String) -> Result<AsyncTask<AuthTask>> {
+        Ok(AsyncTask::new(AuthTask { sql: self.sql()?, table, op: Some(AuthOp::SetPassword { key: from_js(key)?, password }) }))
+    }
+    #[napi] pub fn sign_out(&self, token: String) -> Result<()> { self.sql()?.sign_out(&token).map_err(err) }
+    #[napi] pub fn sign_out_everywhere(&self, table: String, key: JsUnknown) -> Result<()> { self.sql()?.sign_out_everywhere(&table, &from_js(key)?).map_err(err) }
     #[napi(ts_return_type = "Promise<void>")] pub fn wait_durable(&self, seq: f64) -> AsyncTask<WaitDurable> { AsyncTask::new(WaitDurable { sql: self.sql.lock().unwrap().clone(), seq: seq as u64 }) }
 }
 #[napi] impl Stmt {
@@ -121,6 +133,8 @@ pub fn open(path: String, options: Option<String>) -> Result<Db> {
 }
 #[napi] impl Sess {
     fn sql(&self) -> Result<Arc<Sql>> { self.sql.upgrade().ok_or_else(|| err_code("CLOSED", "database is closed")) }
+    /// Act as the user a session token belongs to (see `auth.rs`).
+    #[napi] pub fn use_token(&self, token: String) -> Result<()> { self.sql()?.session_from_token(&mut self.s.lock().unwrap(), &token).map_err(err) }
     #[napi] pub fn login(&self, user: String) -> Result<()> { self.sql()?.login(&mut self.s.lock().unwrap(), &user).map_err(err) }
     /// An identity the app vouches for: roles, and session attributes as parallel keys and values.
     #[napi] pub fn assume(&self, roles: Vec<String>, keys: Vec<String>, values: Vec<JsUnknown>) -> Result<()> {
@@ -228,6 +242,26 @@ impl Task for WaitDurable {
     type Output = (); type JsValue = ();
     fn compute(&mut self) -> Result<()> { match &self.sql { Some(s) => { s.wait_durable(self.seq); Ok(()) } None => Err(err_code("CLOSED", "database is closed")) } }
     fn resolve(&mut self, _env: Env, _o: ()) -> Result<()> { Ok(()) }
+}
+pub enum AuthOp { SignUp { fields: Vec<(String, Value)>, password: String }, SignIn { login: String, password: String }, SetPassword { key: Value, password: String } }
+pub struct AuthTask { sql: Arc<Sql>, table: String, op: Option<AuthOp> }
+impl Task for AuthTask {
+    type Output = Option<sqweezdb::auth::SignedIn>; type JsValue = JsUnknown;
+    fn compute(&mut self) -> Result<Self::Output> {
+        let (sql, table) = (&self.sql, &self.table);
+        match self.op.take().ok_or_else(|| err_code("ERROR", "the task ran twice"))? {
+            AuthOp::SignUp { fields, password } => sql.sign_up(table, &fields, &password).map(Some),
+            AuthOp::SignIn { login, password } => sql.sign_in(table, &login, &password).map(Some),
+            AuthOp::SetPassword { key, password } => sql.set_password(table, &key, &password).map(|_| None),
+        }.map_err(err)
+    }
+    fn resolve(&mut self, env: Env, out: Self::Output) -> Result<JsUnknown> {
+        let Some(si) = out else { return Ok(env.get_undefined()?.into_unknown()) };
+        let types: std::collections::HashMap<String, ColType> = self.sql.db.table(&self.table).map(|t| t.schema.columns.iter().map(|c| (c.name.clone(), c.ty.clone())).collect()).unwrap_or_default();
+        let mut user = env.create_object()?; for (k, v) in &si.user { user.set_named_property(k, to_js(&env, v, types.get(k))?)?; }
+        let mut o = env.create_object()?; o.set_named_property("token", env.create_string(&si.token)?)?; o.set_named_property("user", user)?;
+        Ok(o.into_unknown())
+    }
 }
 pub struct Run { sql: Arc<Sql>, s: Arc<Mutex<Session>>, p: Arc<Prepared>, cols: Cols, vals: Vec<Value> }
 impl Task for Run {

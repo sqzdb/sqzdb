@@ -1,0 +1,8 @@
+API checks: ok
+sign-up, one at a time (300)                                     9.77 ms each
+sign-in, one at a time                                           p50 9.37 ms, p99 11.65 ms
+failed sign-in: wrong password / unknown login                   p50 9.28 ms / 9.37 ms
+200 sign-ins at once                                             625 ms (320/s); event loop stalled at most 13.3 ms
+db.session(token)                                                1.93 µs
+db.as({ role, id }) for comparison                               1.48 µs
+db.session(token) + a point read through the policy              3.48 µs
