@@ -33,9 +33,15 @@ pub struct Config {
     pub log: LogPolicy,
     pub auth: AuthPolicy,
     pub app: AppPolicy,
+    /// Embeddings for generated VECTOR columns and `embed()` (`vector.rs`); none unless configured.
+    pub embed: Option<EmbedPolicy>,
 }
+/// An OpenAI-compatible embeddings endpoint: `url` (such as https://api.openai.com/v1, or Ollama's
+/// http://localhost:11434/v1), its `model`, an `api_key`, the `dimensions` to ask for (for models that can shorten
+/// their vectors), and how many texts go in one request.
+#[derive(Clone, Debug)] pub struct EmbedPolicy { pub url: String, pub model: String, pub api_key: Option<String>, pub dimensions: Option<usize>, pub batch: usize }
 impl Default for Config {
-    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default() } }
+    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default(), embed: None } }
 }
 impl Config {
     pub fn durable(mut self, d: Durability) -> Config { self.durable = d; self }
@@ -97,8 +103,10 @@ impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Dura
 /// redirects), the role of a request without a session, the most rows one result may return, a directory of
 /// static files to serve beside it (the app itself), and the tables clients may make accounts in, each with the
 /// columns a client may set besides the login column (other tables are sign-in only).
-#[derive(Clone, Debug)] pub struct AppPolicy { pub origins: Vec<String>, pub public_url: Option<String>, pub anonymous_role: Option<String>, pub max_rows: usize, pub static_dir: Option<PathBuf>, pub sign_up: std::collections::BTreeMap<String, Vec<String>>, pub tls: Option<TlsPolicy> }
-impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None } } }
+#[derive(Clone, Debug)] pub struct AppPolicy { pub origins: Vec<String>, pub public_url: Option<String>, pub anonymous_role: Option<String>, pub max_rows: usize, pub static_dir: Option<PathBuf>, pub sign_up: std::collections::BTreeMap<String, Vec<String>>, pub tls: Option<TlsPolicy>,
+    /// FILE columns: the largest upload, and how long a link to a file that a query hands out works
+    pub file_max: u64, pub file_link_ttl: Duration }
+impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None, file_max: 25 << 20, file_link_ttl: Duration::from_secs(3600) } } }
 /// TLS for the app API (`app.tls`, see `tls.rs`): your own certificate (`cert` and `key`, PEM files), or one for
 /// `domains` from the ACME CA whose directory is `acme` (Let's Encrypt), kept in `dir` (the database's `tls/` when
 /// unset) under an account with `email` as its contact. `acme_root` is a root to trust for the CA itself (a private
@@ -140,11 +148,17 @@ pub struct ConfigFile {
     #[serde(alias = "config_file")] pub config_file: Option<String>,
     pub durable: Option<DurableIn>, pub create: Option<bool>,
     #[serde(alias = "recover_threads")] pub recover_threads: Option<usize>,
-    pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>, pub auth: Option<AuthFile>, pub app: Option<AppFile>,
+    pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>, pub auth: Option<AuthFile>, pub app: Option<AppFile>, pub embed: Option<EmbedFile>,
 }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile> }
+pub struct EmbedFile { pub url: Option<String>, pub model: Option<String>, #[serde(alias = "api_key")] pub api_key: Option<String>, pub dimensions: Option<usize>, pub batch: Option<usize> }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile>, pub files: Option<AppFilesFile> }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AppFilesFile { #[serde(alias = "max_size")] pub max_size: Option<Size>, #[serde(alias = "link_ttl")] pub link_ttl: Option<Dur> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TlsFile { pub domains: Option<Vec<String>>, pub email: Option<String>, pub cert: Option<String>, pub key: Option<String>, pub acme: Option<String>, #[serde(alias = "acme_root")] pub acme_root: Option<String>, pub dir: Option<String>, pub redirect: Option<String> }
@@ -221,7 +235,9 @@ impl ConfigFile {
             snapshot: nest(self.snapshot, o.snapshot, |a, b| SnapshotFile { log_bytes: pick(a.log_bytes, b.log_bytes), idle_after: pick(a.idle_after, b.idle_after) }),
             listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token), app: pick(a.app, b.app) }),
             app: nest(self.app, o.app, |a, b| AppFile { origins: pick(a.origins, b.origins), public_url: pick(a.public_url, b.public_url), anonymous_role: pick(a.anonymous_role, b.anonymous_role), max_rows: pick(a.max_rows, b.max_rows), static_dir: pick(a.static_dir, b.static_dir), sign_up: pick(a.sign_up, b.sign_up),
+                files: nest(a.files, b.files, |x, y| AppFilesFile { max_size: pick(x.max_size, y.max_size), link_ttl: pick(x.link_ttl, y.link_ttl) }),
                 tls: nest(a.tls, b.tls, |x, y| TlsFile { domains: pick(x.domains, y.domains), email: pick(x.email, y.email), cert: pick(x.cert, y.cert), key: pick(x.key, y.key), acme: pick(x.acme, y.acme), acme_root: pick(x.acme_root, y.acme_root), dir: pick(x.dir, y.dir), redirect: pick(x.redirect, y.redirect) }) }),
+            embed: nest(self.embed, o.embed, |a, b| EmbedFile { url: pick(a.url, b.url), model: pick(a.model, b.model), api_key: pick(a.api_key, b.api_key), dimensions: pick(a.dimensions, b.dimensions), batch: pick(a.batch, b.batch) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
             log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
             auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min), oauth: nest(a.oauth, b.oauth, |mut x, y| { for (k, v) in y { let merged = match x.remove(&k) { Some(old) => old.overlay(v), None => v }; x.insert(k, merged); } x }) }),
@@ -260,6 +276,15 @@ impl ConfigFile {
             if let Some(d) = l.threads_idle_after { let d = dur_of(d, "log.threadsIdleAfter")?; c.log.threads_idle_after = if d.is_zero() { None } else { Some(d) }; }
             if let Some(d) = l.sync_delay { let d = dur_of(d, "log.syncDelay")?; if d > Duration::from_secs(60) { return Err("log.syncDelay: at most 60s".into()); } c.log.sync_delay = if d.is_zero() { None } else { Some(d) }; }
         }
+        if let Some(e) = self.embed {
+            let url = e.url.filter(|u| !u.is_empty()).ok_or("embed.url: the endpoint, such as https://api.openai.com/v1 or http://localhost:11434/v1")?.trim_end_matches('/').to_string();
+            let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| url.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with(':') || r.starts_with('/')));
+            if !url.starts_with("https://") && !local { return Err("embed.url: https, or http on this machine (an API key goes with each request)".into()); }
+            let model = e.model.filter(|m| !m.is_empty()).ok_or("embed.model: the embedding model, such as text-embedding-3-small or nomic-embed-text")?;
+            if let Some(d) = e.dimensions { if !(1..=16_000).contains(&d) { return Err("embed.dimensions: between 1 and 16,000".into()); } }
+            let batch = e.batch.unwrap_or(64); if !(1..=2048).contains(&batch) { return Err("embed.batch: between 1 and 2048".into()); }
+            c.embed = Some(EmbedPolicy { url, model, api_key: e.api_key.filter(|k| !k.is_empty()), dimensions: e.dimensions, batch });
+        }
         if let Some(a) = self.app {
             if let Some(o) = a.origins { for x in &o { if x != "*" && !(x.starts_with("https://") || x.starts_with("http://")) { return Err(format!("app.origins: {x:?} is not an origin (https://app.example, or \"*\")")); } } c.app.origins = o.into_iter().map(|x| x.trim_end_matches('/').to_string()).collect(); }
             if let Some(u) = a.public_url.filter(|u| !u.is_empty()) { if !(u.starts_with("https://") || u.starts_with("http://")) { return Err("app.publicUrl: an http(s) URL".into()); } c.app.public_url = Some(u.trim_end_matches('/').to_string()); }
@@ -267,6 +292,10 @@ impl ConfigFile {
             if let Some(n) = a.max_rows { if n == 0 { return Err("app.maxRows: at least 1".into()); } c.app.max_rows = n; }
             c.app.static_dir = a.static_dir.filter(|d| !d.is_empty()).map(PathBuf::from);
             if let Some(m) = a.sign_up { c.app.sign_up = m.into_iter().map(|(t, cols)| (t.to_ascii_lowercase(), cols.into_iter().map(|c| c.to_ascii_lowercase()).collect())).collect(); }
+            if let Some(f) = a.files {
+                if let Some(m) = f.max_size { let m = size_of(m, "app.files.maxSize")?; if m == 0 { return Err("app.files.maxSize: at least 1 byte".into()); } c.app.file_max = m; }
+                if let Some(t) = f.link_ttl { let t = dur_of(t, "app.files.linkTtl")?; if t < Duration::from_secs(60) || t > Duration::from_secs(7 * 86400) { return Err("app.files.linkTtl: between 1m and 7d".into()); } c.app.file_link_ttl = t; }
+            }
             if let Some(t) = a.tls {
                 let some = |v: Option<String>| v.filter(|x| !x.is_empty());
                 let domains: Vec<String> = t.domains.unwrap_or_default().into_iter().map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase()).collect();

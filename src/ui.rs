@@ -141,7 +141,7 @@ fn api_tables(sql: &Sql) -> J {
         Some(json!({ "name": t.schema.name, "rows": rows, "columns": t.schema.columns.iter().enumerate().map(|(i, c)| {
             let fk = t.schema.fks.iter().find(|f| f.col == i).map(|f| json!({"table": f.parent, "onDelete": match f.on_delete { crate::table::FkAction::Restrict => "RESTRICT", crate::table::FkAction::Cascade => "CASCADE", crate::table::FkAction::SetNull => "SET NULL" }}));
             let default = match &c.generated { Some(g) => json!(g.sql()), None => value_json(&c.default, Some(&c.ty)) };
-            json!({"name": c.name, "type": c.ty.name(), "nullable": c.nullable, "pk": i == t.schema.pk, "auto": i == t.schema.pk && t.schema.auto, "unique": t.schema.unique == Some(i), "default": default, "references": fk})
+            json!({"name": c.name, "type": c.type_name(), "nullable": c.nullable, "pk": i == t.schema.pk, "auto": i == t.schema.pk && t.schema.auto, "unique": t.schema.unique == Some(i), "default": default, "references": fk})
         }).collect::<Vec<_>>(), "foreignKeys": t.schema.fks.len() }))
     }).collect())
 }

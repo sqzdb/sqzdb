@@ -1,0 +1,5 @@
+vectors: ok
+write -> embedded -> in the live search (the fake endpoint takes ~0) p50 2.1 ms, p99 3.9 ms
+the endpoint, for all of the above                               23 requests, 27 texts
+nearest 10 of 10,000 vectors (384 numbers), exact                p50 3.3 ms, p99 6.4 ms
+nearest 10 of 100,000 vectors (384 numbers), exact               p50 34.4 ms, p99 37.7 ms

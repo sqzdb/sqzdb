@@ -30,8 +30,8 @@ const FREE_FAILURES: u32 = 5;
 const LOCK_MAX: Duration = Duration::from_secs(15 * 60);
 const SWEEP_EVERY_US: i64 = 3_600_000_000;
 
-/// Names under `_auth_` are the engine's own: SQL can't create, read or change them.
-pub fn is_system(name: &str) -> bool { name.len() >= 6 && name[..6].eq_ignore_ascii_case("_auth_") }
+/// Names under `_auth_` and `_sqz_` are the engine's own: SQL can't create, read or change them.
+pub fn is_system(name: &str) -> bool { let n = name.as_bytes(); (n.len() >= 6 && n[..6].eq_ignore_ascii_case(b"_auth_")) || (n.len() >= 5 && n[..5].eq_ignore_ascii_case(b"_sqz_")) }
 
 /// Where a signed-in user's role comes from.
 #[derive(Clone, Debug)] pub enum RoleSrc { Column(usize), Fixed(String) }
@@ -191,6 +191,20 @@ impl Sql {
     pub fn session_from_token(&self, sess: &mut Session, token: &str) -> Result<(), String> {
         if sess.txn.is_some() { return Err("cannot change identity inside a transaction".into()); }
         self.bind_token(sess, token).inspect_err(|_| deny(sess))
+    }
+    /// Who a session is, as a stable name (files record it as their owner): the application is `app`; a signed-in
+    /// user is the row their sessions belong to, `<table>:<key>`; an identity the application asserted is its roles
+    /// and attributes. Longer than 200 bytes, it is a hash.
+    pub(crate) fn identity_of(&self, sess: &Session) -> String {
+        if sess.user.is_none() { return "app".into(); }
+        let name = match &sess.token {
+            Some((token, _)) => {
+                let secret = token_id(token).and_then(|id| { let s = self.system(SESSIONS).ok()?; let k = s.schema.key_from_value(&Value::Bytes(id.to_vec())).ok()?; s.with_pk(k, |r| decode_col(&s.schema, r, 1)) });
+                match secret { Some(Value::Text(s)) => s, _ => format!("ended:{}", hex(&token_id(token).unwrap_or_default())) }   // signed out since: owns nothing
+            }
+            None => { let mut a: Vec<String> = sess.attrs.iter().map(|(k, v)| format!("{k}={}", crate::expr::num_text(v))).collect(); a.sort(); format!("assumed:{}:{}", sess.roles.join(","), a.join(",")) }
+        };
+        if name.len() <= 200 { name } else { use sha2::Digest; format!("sha256:{}", hex(&sha2::Sha256::digest(name.as_bytes()))) }
     }
     /// The sign-in state counter (see `AuthState`).
     pub(crate) fn auth_epoch(&self) -> u64 { self.auth.epoch.load(std::sync::atomic::Ordering::Acquire) }

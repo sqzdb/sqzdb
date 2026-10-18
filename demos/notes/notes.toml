@@ -20,3 +20,14 @@ users = ["name"]                # anyone may make an account: their email (the l
 # domains = ["notes.example.com"]   # a certificate from Let's Encrypt, renewed automatically
 # email = "you@example.com"
 # redirect = "0.0.0.0:80"           # http:// to https://
+
+# Search by meaning: add the embedding column once (its size is the model's)
+#   ALTER TABLE notes ADD COLUMN embedding VECTOR(768) GENERATED ALWAYS AS (embed(body)) STORED;
+# and name the model. Ollama on this machine (ollama pull nomic-embed-text):
+# [embed]
+# url = "http://localhost:11434/v1"
+# model = "nomic-embed-text"
+# or OpenAI (VECTOR(1536)):
+# url = "https://api.openai.com/v1"
+# model = "text-embedding-3-small"
+# apiKey = "${OPENAI_API_KEY}"

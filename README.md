@@ -39,11 +39,13 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 |---|---|
 | **Concurrent writers** | Commits share one append-only log with group commit, so concurrent writers share each fsync: 256 writers make 130,000 to 165,000 durable commits per second, where SQLite stays near 2,300. Transactions conflict per row, not per database. |
 | **Lock-free reads** | Readers never take a lock. A point read costs about 0.4 µs in-process, and 8 threads make 17.5 million point reads per second. |
-| **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT(n)`, `BYTES(n)`, `TIMESTAMP`, `UUID`. A value of the wrong type is rejected, never stored. |
+| **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT(n)`, `BYTES(n)`, `TIMESTAMP`, `UUID`, `FILE`, `VECTOR(n)`. A value of the wrong type is rejected, never stored. |
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
 | **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
-| **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 17 KB. |
+| **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 20 KB. |
+| **Files as a column** | A `FILE` column holds an uploaded file. A browser uploads it with the row, and whoever may read the row gets a signed link that an `<img>` can load, with caching and byte ranges. Files no row refers to are cleaned up. |
+| **Vectors and search by meaning** | A `VECTOR(n)` column, searched with `cosine_distance` under the same policies as everything else. A column can be the embedding of other columns, filled in the background by OpenAI, Ollama or any OpenAI-compatible model, and `embed(?)` embeds the search text. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
 | **Online schema changes** | `ALTER TABLE` adds, drops, renames or retypes a column while reads and writes continue. |
 | **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`. |
@@ -95,11 +97,13 @@ rules ([`demos/notes`](demos/notes); PocketBase's range is with and without its 
 
 | Workload | PocketBase | sqweezdb |
 |---|---:|---:|
-| Notes created per second, 32 users writing at once | 5,774–8,364 | **38,941** |
-| Read one note over HTTP, p50 | 0.118–0.128 ms | **0.029 ms** |
-| A write on one device seen on another, p50 | 0.75–0.79 ms | **0.37 ms** |
-| Server memory with 1,000 devices connected | 158–251 MB | **42 MB** |
-| Writes per second while they are connected | 180–187 | **24,593** |
+| Notes created per second, 32 users writing at once | 4,972–5,761 | **47,548** |
+| Read one note over HTTP, p50 | 0.105–0.112 ms | **0.026 ms** |
+| A note with a 100 KB picture created, p50 | 0.602–0.617 ms | **0.180 ms** |
+| Download that picture, p50 | 0.177–0.182 ms | **0.074 ms** |
+| A write on one device seen on another, p50 | 0.67–0.70 ms | **0.27 ms** |
+| Server memory with 1,000 devices connected | 160–247 MB | **48 MB** |
+| Writes per second while they are connected | 205–211 | **22,431** |
 
 Where the others are ahead or even: Turso matches sqweezdb on durable commits up to about 64 writers;
 SQLite reopens slightly faster, uses far less memory after a load, bulk-loads faster one row
@@ -126,7 +130,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.6.1` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.7.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -352,6 +356,44 @@ sees the transaction's own writes; any other read of a table the transaction has
 With `durable: false`, Node's `run().durable` promise resolves at the moment a specific write is on disk. With
 `log.syncDelay` set, the background fsync may wait up to that long (see [configuration](#configuration)); a commit or
 `durable` promise that waits for the disk still gets its sync right away.
+
+### Vectors and search by meaning
+
+A `VECTOR(n)` column holds n numbers. Queries compare vectors with `cosine_distance`, `l2_distance` and
+`inner_product`, so the nearest rows are an `ORDER BY` with a `LIMIT`, under the same row policies as any query.
+
+```sql
+CREATE TABLE notes (id SERIAL PRIMARY KEY, owner INT, title TEXT, body TEXT,
+                    embedding VECTOR(768) GENERATED ALWAYS AS (embed(title || ' ' || body)) STORED);
+
+SELECT id, title, cosine_distance(embedding, embed(?)) AS d
+FROM notes WHERE embedding IS NOT NULL ORDER BY d LIMIT 10;     -- ? is the search text
+```
+
+```toml
+[embed]                           # any OpenAI-compatible embeddings endpoint
+url   = "http://localhost:11434/v1"
+model = "nomic-embed-text"        # Ollama on this machine: 768 numbers
+# url = "https://api.openai.com/v1"; model = "text-embedding-3-small"; apiKey = "${OPENAI_API_KEY}"   (1536)
+```
+
+- **Embedding on write.** A column `GENERATED ALWAYS AS (embed(<text expression>)) STORED` is the embedding
+  of that text. A write leaves it `NULL`, and an `UPDATE` that changes the text sets it back to `NULL`. A
+  background thread embeds those rows in batches and writes each vector only if the row still has the
+  text it embedded; live queries see it arrive (about 2 ms after the write, plus the model's time). No
+  statement writes that column. Rows written while the database was closed are embedded when it opens.
+- **Search text.** `embed(?)` in a query becomes the embedding of the parameter when the statement runs,
+  and is cached, so a live search re-run costs no request. Until a row is embedded its distance is `NULL`,
+  which sorts first: search with `WHERE embedding IS NOT NULL`.
+- **Values.** A vector is written as a JSON array of numbers (a client's array parameter is one) and
+  comes back as an array through the app API, as raw little-endian floats through the libraries.
+- **Cost.** The search is exact: it computes the distance for every row the query sees. The nearest 10 of
+  10,000 vectors of 384 numbers take 3.3 ms through the app API, of 100,000 take 34 ms (E62).
+- **Errors to fix.** A model whose vectors aren't the column's size is reported (set `embed.dimensions`
+  for models that can shorten theirs, or change the column). A text the endpoint refuses is skipped for
+  10 minutes; an endpoint that is down is tried again after 5 seconds, then less often.
+- **Not built yet:** an approximate index (HNSW) for millions of vectors, a model built in, and search
+  that mixes meaning with words.
 
 ### Live queries and subscriptions
 
@@ -590,6 +632,8 @@ transaction, `live(text, params, fn)` and `close()`. [`demos/notes`](demos/notes
 | `POST /api/auth/sign-out`, `GET /api/me`, `GET /api/auth/<table>/methods` | |
 | `POST /api/sql` `{sql, params}` and `POST /api/batch` `{statements}` | `{columns, rows}`, and `lastInsertId` for an `INSERT` |
 | `GET /api/socket` | a WebSocket of JSON messages: `auth`, `sql`, `batch`, `live` and `unlive` |
+| `POST /api/files?name=<name>` with the bytes as the body | the new file, `{id, name, type, size, url}` |
+| `GET /api/files/<id>?e=…&s=…` | the file, through a link a query handed out |
 | `GET /api/client.js` | the JavaScript client |
 
 Requests carry the session as `Authorization: Bearer <token>`. Errors are `{error, code}` with the
@@ -597,8 +641,43 @@ Requests carry the session as `Authorization: Bearer <token>`. Errors are `{erro
 and 400 otherwise.
 
 Connections are tasks on a small runtime, not threads. A connected user with two live queries costs the
-server about 17 KB, and a write reaches another device's live query in about 0.1 ms, or within
+server about 20 KB, and a write reaches another device's live query in about 0.1 ms, or within
 `live.debounce` when writes come back to back (E58, E59).
+
+#### Files
+
+A `FILE` column holds an uploaded file. The row stores the file's id; the bytes are kept in the database
+directory's `files/`, each file written once.
+
+```sql
+CREATE TABLE notes (id SERIAL PRIMARY KEY, owner INT, body TEXT, attachment FILE);
+```
+
+```js
+await db.sql('INSERT INTO notes (owner, body, attachment) VALUES (?, ?, ?)', [db.auth.user.id, text, file])   // a File or Blob: uploaded first
+const [note] = await db.sql('SELECT body, attachment FROM notes WHERE id = ?', [id])
+img.src = note.attachment.url        // { id, name, type, size, url }
+```
+
+- **Uploading.** A `File` or `Blob` passed as a parameter is uploaded, and its id goes in the statement.
+  `db.files.upload(blob)` uploads on its own and returns the file. A file from a result can be passed back
+  as a parameter. Only signed-in users upload, up to `app.files.maxSize` (25 MB).
+- **Who may put a file in a row.** A user may set a `FILE` column only to a file they uploaded within the
+  last hour, or leave it as the row has it. So a file id someone has seen, in a link say, can't be copied
+  into a row of their own. The application, through the library, may set any file.
+- **Who may download it.** Whoever may read the row. A `FILE` value in a query's result (live ones
+  included) comes with a signed `url`, valid for `app.files.linkTtl` (an hour), so `<img>` and `<a>` work
+  without headers, and SQL never sees anyone else's file. The link stays the same for half its lifetime,
+  so browsers cache it. An expression over a `FILE` column, or a `GROUP BY`, gives the plain id.
+- **How it is served:** with an `ETag` (`304` when unchanged), byte ranges (seeking in a video), and
+  `Content-Security-Policy: sandbox` with `nosniff`. Images, video, audio, PDF and plain text are shown in
+  place; anything else, HTML and SVG included, downloads as an attachment, so an upload can't run script
+  on the API's origin.
+- **Cleanup.** A file no row refers to is deleted once it is a day old and has gone an hour unreferenced.
+  A file whose row changed or went is therefore gone within about a day.
+- **Not built yet:** files in the backup bucket (back the `files/` directory up yourself until then), files
+  stored in S3, image thumbnails, upload quotas per user, and files through the Node, Python and Go
+  libraries.
 
 #### HTTPS, with certificates from Let's Encrypt
 
@@ -736,6 +815,8 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `app.anonymousRole` | none | The role of a request without a session. Without it, such requests are refused. |
 | `app.maxRows` | `10000` | The most rows one result for a client may have. |
 | `app.staticDir` | none | Files to serve beside the API (the app itself), with `index.html` for paths without a file. |
+| `app.files.maxSize` | `25MB` | The largest file a client may upload. |
+| `app.files.linkTtl` | `1h` | How long a link to a file in a query's result works (at least `1m`, at most `7d`). |
 | `app.tls.domains` | none | Serve https with a certificate for these names from the CA (`--domain`), renewed automatically. See [HTTPS](#https-with-certificates-from-lets-encrypt). |
 | `app.tls.email` | none | The contact on the CA account, for its notices (`--email`). |
 | `app.tls.cert` / `key` | none | Your own certificate chain and key (PEM files), instead of `domains`. |
@@ -749,6 +830,10 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `auth.sessionTtl` | `30d` | How long a session from sign-in lasts. At least `60s`. |
 | `auth.passwordMin` | `8` | The shortest password `signUp` and `setPassword` accept, in characters. |
 | `auth.oauth.<name>` | none | An OAuth provider: `clientId`, `clientSecret`; for providers other than `google` and `github`, `kind = "oidc"`, `authUrl`, `tokenUrl`, `jwksUrl` and `issuer`. Optional `scopes`. See [sign-in](#sign-in). |
+| `embed.url` / `model` | none | An OpenAI-compatible embeddings endpoint (https, or http on this machine) and its model, for generated `VECTOR` columns and `embed()`. |
+| `embed.apiKey` | none | Sent as `Authorization: Bearer`. |
+| `embed.dimensions` | the model's | Asked of models that can shorten their vectors. |
+| `embed.batch` | `64` | Texts embedded in one request. |
 | `log.syncDelay` | off | With `durable: false`, hold the background fsync up to this long so one fsync covers more writes. For hosts with thousands of small databases (one per tenant or agent) on one disk. A machine crash can then lose up to this much; a process crash still loses nothing, and anything that waits for durability syncs at once. At most `60s`. |
 
 Durations are written as `'5ms'`, `'1s'`, `'2m'`, `'1h'`, `'7d'` or a number of milliseconds. Sizes are
@@ -784,6 +869,10 @@ token = "${DB_TOKEN}"
   `FOREIGN KEY … REFERENCES … ON DELETE RESTRICT | CASCADE | SET NULL`. The key and the `UNIQUE`
   column can also be declared at the end: `PRIMARY KEY (id)`, `UNIQUE (email)`.
 - `CREATE INDEX` on one column of type `INT`, `TIMESTAMP`, `UUID`, `TEXT` or `BYTES`.
+- `FILE` columns hold uploaded files (see [files](#files)). A `FILE` column can't be a key, `UNIQUE` or have
+  a `DEFAULT`, and its type doesn't change.
+- `VECTOR(n)` columns hold n numbers, and `VECTOR(n) GENERATED ALWAYS AS (embed(<expression>)) STORED` the
+  embedding of a text (see [vectors](#vectors-and-search-by-meaning)). The same rules as for `FILE` apply.
 - `ALTER TABLE … ADD | DROP | RENAME COLUMN`, `ALTER COLUMN … TYPE`, `SET | DROP NOT NULL`, all online.
 
 **Queries**
@@ -798,7 +887,8 @@ token = "${DB_TOKEN}"
   `right`, `reverse`, `repeat`, `hex`), numbers (`abs`, `round`, `ceil`, `floor`, `sqrt`, `power`, `sign`,
   `mod`, `greatest`, `least`), NULL (`coalesce`, `ifnull`, `nullif`, `iif`), time (`now()`,
   `current_date`, `date`, `time`, `datetime`, `strftime`, `unixepoch`, `EXTRACT`), JSON (`json_extract`,
-  `json`, `json_valid`, `json_array_length`, `json_object`, `json_array`, `json_type`), and `uuid()`,
+  `json`, `json_valid`, `json_array_length`, `json_object`, `json_array`, `json_type`), vectors
+  (`cosine_distance`, `l2_distance`, `inner_product`, `vector_dims`, `embed`), and `uuid()`,
   `gen_random_uuid()` and `typeof`. Unlike SQLite, a division by zero, an integer overflow (in `SUM` too)
   and a value of the wrong type are errors, not NULL or a guess.
 - `SELECT` without `FROM`: `SELECT 1 + 1`, `SELECT now()`.
@@ -834,7 +924,7 @@ token = "${DB_TOKEN}"
 
 **Not supported yet:** `UPDATE … FROM`, `DELETE … RETURNING`, `RIGHT` and `FULL` joins, `WITH`, `UNION`, window functions, subqueries in `FROM`, correlated subqueries on text
 columns, `DISTINCT ON`, `NULLS FIRST` and `NULLS LAST`, variable-length text (every text column has a
-maximum, at most 65,535 bytes), `CHECK` constraints, generated columns, a second `UNIQUE` column,
+maximum, at most 65,535 bytes), `CHECK` constraints, generated columns other than embeddings, a second `UNIQUE` column,
 composite primary keys, multi-column indexes, `DELETE … LIMIT`, savepoints, `DROP TABLE`, views and
 triggers. A value an expression builds is at most 1 MB (`group_concat`: 16 MB). A correlated `IN (subquery)` can't be keyed on a UUID column; use `EXISTS` or a join. A table
 holds at most 16.7 million rows.
@@ -885,9 +975,10 @@ shared-memory ring for reads of about 0.6 µs, or connect over TCP with a token.
 Three apps, each benchmarked against the same app on PocketBase 0.40.5:
 
 - [`demos/notes`](demos/notes): notes with no server code at all. The page signs in and runs SQL through
-  the app API, the list is a live query, and who sees what is a row policy. It made 4.7 to 6.7 times
+  the app API, the list is a live query, attachments are a `FILE` column, search by meaning is a
+  generated `VECTOR` column, and who sees what is a row policy. It made 8 to 10 times
   PocketBase's writes, answered a read in a quarter of the time, and held 1,000 connected devices in
-  42 MB, where PocketBase used 158 to 251 MB.
+  48 MB, where PocketBase used 160 to 247 MB.
 - [`demos/boards`](demos/boards) (Go): a multi-tenant task board. The tenant rule is a row policy, each
   request runs as the signed-in member, and live updates are one subscription per organization. Against
   PocketBase 0.40.5 it handled 11 to 12 times the card inserts, and live updates took 1 ms instead of 33 ms (p50,
@@ -938,7 +1029,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.6.1`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.7.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

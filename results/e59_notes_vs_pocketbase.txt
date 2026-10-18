@@ -1,50 +1,58 @@
-E59: the notes app, 200 users x 50 notes, 1000 devices; sqweezdb 0.5.1 vs PocketBase 0.40.5 on 12 cores
+E59: the notes app, 200 users x 50 notes, 1000 devices; sqweezdb 0.6.1 vs PocketBase 0.40.5 on 12 cores
 
 server memory, started and set up
-  sqweezdb                       11 MB
-  PocketBase                     34 MB
-  PocketBase, request log off    36 MB
+  sqweezdb                       12 MB
+  PocketBase                     35 MB
+  PocketBase, request log off    35 MB
 200 sign-ups, 16 at a time (until each has a session)
-  sqweezdb                       0.7 s (278/s); server memory then 14 MB
-  PocketBase                     2.3 s (88/s); server memory then 45 MB
-  PocketBase, request log off    2.3 s (88/s); server memory then 44 MB
+  sqweezdb                       0.6 s (327/s); server memory then 16 MB
+  PocketBase                     2.1 s (94/s); server memory then 43 MB
+  PocketBase, request log off    2.1 s (93/s); server memory then 44 MB
 10000 notes created, 32 users writing at once
-  sqweezdb                       38941/s, server CPU 16 µs per note; memory then 25 MB
-  PocketBase                     5774/s, server CPU 367 µs per note; memory then 64 MB
-  PocketBase, request log off    8364/s, server CPU 317 µs per note; memory then 55 MB
+  sqweezdb                       47548/s, server CPU 12 µs per note; memory then 28 MB
+  PocketBase                     4972/s, server CPU 352 µs per note; memory then 65 MB
+  PocketBase, request log off    5761/s, server CPU 305 µs per note; memory then 53 MB
 read one note by id (HTTP, one request at a time)
-  sqweezdb                       p50 0.029 ms, p99 0.137 ms
-  PocketBase                     p50 0.128 ms, p99 0.399 ms
-  PocketBase, request log off    p50 0.118 ms, p99 0.348 ms
+  sqweezdb                       p50 0.026 ms, p99 0.105 ms
+  PocketBase                     p50 0.112 ms, p99 0.367 ms
+  PocketBase, request log off    p50 0.105 ms, p99 0.337 ms
 list the newest 20 notes (HTTP, one request at a time)
-  sqweezdb                       p50 0.048 ms, p99 0.116 ms
-  PocketBase                     p50 0.321 ms, p99 0.763 ms
-  PocketBase, request log off    p50 0.286 ms, p99 0.675 ms
+  sqweezdb                       p50 0.039 ms, p99 0.111 ms
+  PocketBase                     p50 0.278 ms, p99 0.649 ms
+  PocketBase, request log off    p50 0.266 ms, p99 0.635 ms
+a note with a 100 KB picture created (the upload included)
+  sqweezdb                       p50 0.180 ms, p99 0.424 ms
+  PocketBase                     p50 0.617 ms, p99 1.055 ms
+  PocketBase, request log off    p50 0.602 ms, p99 1.044 ms
+download that picture
+  sqweezdb                       p50 0.074 ms, p99 0.845 ms
+  PocketBase                     p50 0.177 ms, p99 0.687 ms
+  PocketBase, request log off    p50 0.182 ms, p99 0.568 ms
 list the newest 20, 32 users at once for 3 s
-  sqweezdb                       46453/s, server CPU 101% of a core; memory then 25 MB
-  PocketBase                     13155/s, server CPU 796% of a core; memory then 234 MB
-  PocketBase, request log off    13951/s, server CPU 776% of a core; memory then 147 MB
+  sqweezdb                       49868/s, server CPU 101% of a core; memory then 28 MB
+  PocketBase                     14435/s, server CPU 852% of a core; memory then 246 MB
+  PocketBase, request log off    15089/s, server CPU 833% of a core; memory then 136 MB
 write on one device -> seen on another (the write included)
-  sqweezdb                       p50 0.367 ms, p99 0.801 ms
-  PocketBase                     p50 0.790 ms, p99 1.457 ms
-  PocketBase, request log off    p50 0.751 ms, p99 1.448 ms
+  sqweezdb                       p50 0.273 ms, p99 0.547 ms
+  PocketBase                     p50 0.695 ms, p99 29.003 ms
+  PocketBase, request log off    p50 0.666 ms, p99 1.238 ms
 server memory with 1000 devices connected
-  sqweezdb                       42 MB (17 KB per device)
-  PocketBase                     251 MB (84 KB per device)
-  PocketBase, request log off    158 MB (26 KB per device)
+  sqweezdb                       48 MB (20 KB per device)
+  PocketBase                     247 MB (72 KB per device)
+  PocketBase, request log off    160 MB (33 KB per device)
 640 writes with the 1000 devices connected
-  sqweezdb                       24593/s; a device saw another user's note: 0 times
-  PocketBase                     187/s; a device saw another user's note: 0 times
-  PocketBase, request log off    180/s; a device saw another user's note: 0 times
+  sqweezdb                       22431/s; a device saw another user's note: 0 times
+  PocketBase                     205/s; a device saw another user's note: 0 times
+  PocketBase, request log off    211/s; a device saw another user's note: 0 times
 server CPU, whole run
-  sqweezdb                       6.4 s
-  PocketBase                     84.0 s
-  PocketBase, request log off    82.8 s
+  sqweezdb                       5.9 s
+  PocketBase                     83.6 s
+  PocketBase, request log off    81.3 s
 peak memory (VmHWM)
-  sqweezdb                       90 MB
-  PocketBase                     317 MB
-  PocketBase, request log off    242 MB
+  sqweezdb                       91 MB
+  PocketBase                     315 MB
+  PocketBase, request log off    235 MB
 data on disk
-  sqweezdb                       11.1 MB
-  PocketBase                     40.1 MB
-  PocketBase, request log off    12.0 MB
+  sqweezdb                       31.1 MB
+  PocketBase                     68.7 MB
+  PocketBase, request log off    33.5 MB

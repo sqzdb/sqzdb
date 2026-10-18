@@ -22,6 +22,8 @@ pub enum F {
     Now, CurrentDate, Date, Time, Datetime, Strftime, Unixepoch, Extract, TsText,
     JsonExtract, Json, JsonValid, JsonArrayLength, JsonObject, JsonArray, JsonType,
     Uuid, Uuid4,
+    /// vectors (`vector.rs`): `embed(text)` is replaced by the text's embedding when the statement is bound
+    Embed, CosineDistance, L2Distance, InnerProduct, VectorDims,
 }
 
 /// A planned scalar expression. `Col` reads the scanned row, `Out` an output column after aggregation (HAVING, an
@@ -56,6 +58,7 @@ pub fn function(name: &str) -> Option<(F, usize, usize)> {
         "json_extract" => (F::JsonExtract, 2, 2), "json" => (F::Json, 1, 1), "json_valid" => (F::JsonValid, 1, 1), "json_array_length" => (F::JsonArrayLength, 1, 2),
         "json_object" => (F::JsonObject, 0, 64), "json_array" => (F::JsonArray, 0, 64), "json_type" => (F::JsonType, 1, 2),
         "uuid" | "uuid7" => (F::Uuid, 0, 0), "gen_random_uuid" | "uuid4" => (F::Uuid4, 0, 0),
+        "embed" => (F::Embed, 1, 1), "cosine_distance" => (F::CosineDistance, 2, 2), "l2_distance" => (F::L2Distance, 2, 2), "inner_product" => (F::InnerProduct, 2, 2), "vector_dims" => (F::VectorDims, 1, 1),
         _ => return None,
     })
 }
@@ -94,6 +97,35 @@ impl SExpr {
             other => other.clone(),
         })
     }
+    /// After `bind`: `embed('text')` becomes the text's embedding (through `embed`), and a JSON array given to a
+    /// vector function becomes its bytes, once per statement instead of once per row. Unchanged without either.
+    pub fn fold_vectors(&self, embed: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>) -> Result<SExpr, String> {
+        let mut any = false; self.walk(&mut |n| if let SExpr::Call(F::Embed | F::CosineDistance | F::L2Distance | F::InnerProduct | F::VectorDims, _) = n { any = true; });
+        if !any { return Ok(self.clone()); }
+        let r = |x: &SExpr, embed: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>| x.fold_vectors(embed);
+        Ok(match self {
+            SExpr::Neg(a) => SExpr::Neg(r(a, embed)?.bx()), SExpr::Not(a) => SExpr::Not(r(a, embed)?.bx()),
+            SExpr::IsNull(a, n) => SExpr::IsNull(r(a, embed)?.bx(), *n), SExpr::Cast(a, c) => SExpr::Cast(r(a, embed)?.bx(), *c),
+            SExpr::Bin(o, x, y) => SExpr::Bin(*o, r(x, embed)?.bx(), r(y, embed)?.bx()),
+            SExpr::In(a, l, n) => SExpr::In(r(a, embed)?.bx(), l.iter().map(|x| r(x, embed)).collect::<Result<_, _>>()?, *n),
+            SExpr::Between(a, lo, hi, n) => SExpr::Between(r(a, embed)?.bx(), r(lo, embed)?.bx(), r(hi, embed)?.bx(), *n),
+            SExpr::Like { e, pat, ci, negated, esc } => SExpr::Like { e: r(e, embed)?.bx(), pat: r(pat, embed)?.bx(), ci: *ci, negated: *negated, esc: *esc },
+            SExpr::Case { op, whens, els } => SExpr::Case { op: op.as_ref().map(|o| r(o, embed).map(|x| x.bx())).transpose()?, whens: whens.iter().map(|(w, t)| Ok((r(w, embed)?, r(t, embed)?))).collect::<Result<_, String>>()?, els: els.as_ref().map(|e| r(e, embed).map(|x| x.bx())).transpose()? },
+            SExpr::Call(f, args) => {
+                let args: Vec<SExpr> = args.iter().map(|x| r(x, embed)).collect::<Result<_, _>>()?;
+                match (f, args.as_slice()) {
+                    (F::Embed, [SExpr::Lit(Value::Text(t))]) => SExpr::Lit(Value::Bytes(embed(t)?)),
+                    (F::Embed, [SExpr::Lit(Value::Null)]) => SExpr::Lit(Value::Null),
+                    (F::CosineDistance | F::L2Distance | F::InnerProduct | F::VectorDims, _) => SExpr::Call(*f, args.into_iter().map(|a| match a {
+                        SExpr::Lit(Value::Text(s)) => vector_arg(&Value::Text(s)).map(|v| SExpr::Lit(Value::Bytes(v.iter().flat_map(|x| x.to_le_bytes()).collect()))),
+                        a => Ok(a),
+                    }).collect::<Result<_, _>>()?),
+                    _ => SExpr::Call(*f, args),
+                }
+            }
+            other => other.clone(),
+        })
+    }
     /// The static type, when it is known: what the console shows, and how a TIMESTAMP compares with a text literal.
     pub fn ty(&self, col: &dyn Fn(usize) -> Option<ColType>) -> Option<ColType> {
         match self {
@@ -112,10 +144,11 @@ impl SExpr {
                 F::Upper | F::Lower | F::Substr | F::Replace | F::Trim | F::Ltrim | F::Rtrim | F::Concat | F::ConcatWs | F::Left | F::Right | F::Reverse | F::Repeat | F::Hex | F::Typeof
                 | F::CurrentDate | F::Date | F::Time | F::Datetime | F::Strftime | F::TsText | F::Json | F::JsonObject | F::JsonArray | F::JsonType => Some(ColType::Text(0)),
                 F::Length | F::Instr | F::Sign | F::Unixepoch | F::Extract | F::JsonArrayLength => Some(ColType::Int),
-                F::Sqrt | F::Power => Some(ColType::Float), F::JsonValid => Some(ColType::Bool), F::Now => Some(ColType::Timestamp), F::Uuid | F::Uuid4 => Some(ColType::Uuid),
+                F::Sqrt | F::Power => Some(ColType::Float), F::JsonValid => Some(ColType::Bool), F::Now => Some(ColType::Timestamp), F::Uuid | F::Uuid4 => Some(ColType::Uuid), F::CosineDistance | F::L2Distance | F::InnerProduct => Some(ColType::Float), F::VectorDims => Some(ColType::Int),
                 F::Abs | F::Round | F::Ceil | F::Floor | F::Mod => args.first().and_then(|a| a.ty(col)),
                 F::Coalesce | F::Greatest | F::Least | F::MinOf | F::MaxOf | F::Nullif => args.iter().find_map(|a| a.ty(col)),
                 F::Iif => args.get(1).and_then(|a| a.ty(col)).or_else(|| args.get(2).and_then(|a| a.ty(col))),
+                F::Embed => None,
                 F::JsonExtract => None,
             },
             SExpr::Param(_) | SExpr::Sub(_) => None,
@@ -330,7 +363,52 @@ fn call(f: F, args: &[SExpr], col: &dyn Fn(usize) -> Value) -> Result<Value, Str
         F::JsonObject => { if a.len() % 2 != 0 { return Err("json_object() needs key, value pairs".into()); } let mut m = serde_json::Map::new(); for kv in a.chunks(2) { let k = text_arg(&kv[0], "json_object")?.ok_or("json_object() keys cannot be NULL")?; m.insert(k, value_to_json(&kv[1])); } Text(serde_json::Value::Object(m).to_string()) }
         F::JsonArray => Text(serde_json::Value::Array(a.iter().map(value_to_json).collect()).to_string()),
         F::Uuid => Text(format_uuid(&uuid_v7())), F::Uuid4 => Text(format_uuid(&uuid_v4())),
+        F::Embed => return Err("embed() takes the text to embed as a parameter or a literal, not a column (a generated VECTOR column embeds its rows)".into()),
+        F::CosineDistance | F::L2Distance | F::InnerProduct => if a[0] == Null || a[1] == Null { Null } else { distance(f, &a[0], &a[1])? },
+        F::VectorDims => if a[0] == Null { Null } else { Int(vector_arg(&a[0])?.len() as i64) },
     })
+}
+/// A vector argument: a VECTOR column's bytes, or a JSON array of numbers.
+fn vector_arg(v: &Value) -> Result<Vec<f32>, String> {
+    match v {
+        Value::Bytes(b) if b.len() % 4 == 0 => Ok(crate::table::vector_floats(b).collect()),
+        Value::Text(s) => serde_json::from_str::<Vec<f64>>(s).map(|v| v.into_iter().map(|x| x as f32).collect()).map_err(|_| "expected a vector: a VECTOR column, or a JSON array of numbers".to_string()),
+        v => Err(format!("expected a vector, got {v:?}")),
+    }
+}
+/// Cosine distance (1 - cosine similarity; NULL for a zero vector), Euclidean distance, or the inner product.
+fn distance(f: F, x: &Value, y: &Value) -> Result<Value, String> {
+    match (x, y) {
+        (Value::Bytes(a), Value::Bytes(b)) => distance_bytes(f, a, b),
+        _ => { let (a, b) = (vector_arg(x)?, vector_arg(y)?); if a.len() != b.len() { return Err(format!("vectors of {} and {} numbers", a.len(), b.len())); }
+               distance_bytes(f, &a.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(), &b.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()) }
+    }
+}
+/// `distance` over two stored vectors (little-endian f32s), in eight lanes so the loop vectorizes.
+pub fn distance_bytes(f: F, a: &[u8], b: &[u8]) -> Result<Value, String> {
+    if a.len() != b.len() || a.len() % 4 != 0 { return Err(format!("vectors of {} and {} numbers", a.len() / 4, b.len() / 4)); }
+    let n = a.len() / 4;
+    // safe: every read is within the slices, which hold n f32s each (read unaligned: rows don't align them)
+    let at = |s: &[u8], i: usize| f32::from_bits(u32::from_le(unsafe { (s.as_ptr() as *const u32).add(i).read_unaligned() }));
+    let (mut dot, mut xx, mut yy, mut l2) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+    let mut i = 0;
+    while i + 8 <= n { for l in 0..8 { let (x, y) = (at(a, i + l), at(b, i + l)); dot[l] += x * y; xx[l] += x * x; yy[l] += y * y; let d = x - y; l2[l] += d * d; } i += 8; }
+    while i < n { let (x, y) = (at(a, i), at(b, i)); dot[0] += x * y; xx[0] += x * x; yy[0] += y * y; let d = x - y; l2[0] += d * d; i += 1; }
+    let sum = |v: [f32; 8]| v.iter().map(|&x| x as f64).sum::<f64>();
+    let (dot, xx, yy, l2) = (sum(dot), sum(xx), sum(yy), sum(l2));
+    Ok(match f { F::InnerProduct => Value::Float(dot), F::L2Distance => Value::Float(l2.sqrt()), _ => if xx == 0.0 || yy == 0.0 { Value::Null } else { Value::Float(1.0 - dot / (xx.sqrt() * yy.sqrt())) } })
+}
+impl SExpr {
+    /// A distance between column `c` and a bound vector (either way round): the function, the column, the vector.
+    pub fn as_column_distance(&self) -> Option<(F, usize, &[u8])> {
+        match self {
+            SExpr::Call(f @ (F::CosineDistance | F::L2Distance | F::InnerProduct), a) => match a.as_slice() {
+                [SExpr::Col(c), SExpr::Lit(Value::Bytes(q))] | [SExpr::Lit(Value::Bytes(q)), SExpr::Col(c)] => Some((*f, *c, q)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 // ---- dates: TIMESTAMP values are microseconds since 1970 (UTC); text in the forms `parse_timestamp` reads, or 'now'

@@ -12,6 +12,9 @@ export class SqweezError extends Error {
 }
 const err = (e) => new SqweezError(e.code || 'ERROR', e.error || String(e));
 const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+// a File or Blob as a parameter is uploaded first; a file a query returned is sent as its id
+const isBlob = (p) => typeof Blob !== 'undefined' && p instanceof Blob;
+const isFile = (p) => p !== null && typeof p === 'object' && typeof p.id === 'string' && 'url' in p;
 // the verifier of a provider sign-in this tab started (sessionStorage: it survives the trip to the provider)
 const verifiers = { mem: new Map(),
   put(k, v) { try { globalThis.sessionStorage.setItem(k, v); } catch { this.mem.set(k, v); } },
@@ -54,6 +57,20 @@ class Auth {
   }
 }
 
+class Files {
+  constructor(client) { this._c = client; }
+  /** Upload a File or Blob (`name` and `type` from it unless given); resolves to the file as a query returns it,
+   *  `{ id, name, type, size, url }`. Put its id (or the object) in a FILE column within the hour. */
+  async upload(data, { name, type } = {}) {
+    await this._c.ready;
+    const headers = { 'content-type': type || data.type || 'application/octet-stream' }; if (this._c.token) headers.authorization = `Bearer ${this._c.token}`;
+    const res = await this._c._fetch(`/api/files?name=${encodeURIComponent(name || data.name || 'file')}`, { method: 'POST', headers, body: data });
+    const v = await res.json().catch(() => ({ error: `HTTP ${res.status}`, code: 'ERROR' }));
+    if (v.error) { if (v.code === 'AUTH' && this._c.token) this._c.auth._set(null, null); throw err(v); }
+    return v;
+  }
+}
+
 class Live {
   constructor(client, sql, params, fn, onError) { Object.assign(this, { _c: client, sql, params, fn, onError, rows: null, closed: false }); this.id = 0; }
   close() { if (this.closed) return; this.closed = true; this._c._lives.delete(this.id); this._c._send({ op: 'unlive', id: this.id }, true); }
@@ -66,7 +83,7 @@ class Client {
     this._key = `sqweezdb:${this.url}`; this._fetchImpl = opts.fetch || globalThis.fetch.bind(globalThis);   // a browser's fetch must be called on the window
     this._WS = opts.WebSocket || globalThis.WebSocket;
     this._ws = null; this._open = false; this._wait = []; this._pending = new Map(); this._lives = new Map(); this._next = 1; this._backoff = 500;
-    this.auth = new Auth(this, opts.users || 'users');
+    this.auth = new Auth(this, opts.users || 'users'); this.files = new Files(this);
     try { const s = this._store && JSON.parse(this._store.getItem(this._key) || 'null'); if (s) { this.token = s.token; this.auth.user = s.user; } } catch {}
     // back from a provider: trade the one-time code for a session, then take it out of the address bar
     this.ready = this._finishRedirect();
@@ -91,24 +108,25 @@ class Client {
   }
   /** Run one statement as the signed-in user; resolves to rows as objects (an INSERT also has `lastInsertId`). */
   async sql(text, params = []) {
-    await this.ready;
+    await this.ready; params = await this._bind(params);
     const r = this._WS ? await this._call({ op: 'sql', sql: text, params }) : await this._post('/api/sql', { sql: text, params });
     const rows = toObjects(r); if (r.lastInsertId !== undefined) rows.lastInsertId = r.lastInsertId; return rows;
   }
   /** Several statements as one transaction: [[sql, params], …]; resolves to each one's rows. */
   async batch(statements) {
     await this.ready;
-    const body = { statements: statements.map((s) => (Array.isArray(s) ? { sql: s[0], params: s[1] || [] } : s)) };
+    const body = { statements: await Promise.all(statements.map(async (s) => { const st = Array.isArray(s) ? { sql: s[0], params: s[1] || [] } : s; return { ...st, params: await this._bind(st.params) }; })) };
     const r = this._WS ? await this._call({ op: 'batch', ...body }) : await this._post('/api/batch', body);
     return r.results.map(toObjects);
   }
   /** A query that keeps its result current: `fn(rows)` now and on every change. `onError(e)` if it can't run. */
   live(text, params, fn, onError) {
     if (typeof params === 'function') { onError = fn; fn = params; params = []; }
-    const l = new Live(this, text, params || [], fn, onError); l.id = this._next++;
+    const l = new Live(this, text, (params || []).map((p) => (isFile(p) ? p.id : p)), fn, onError); l.id = this._next++;
     this._lives.set(l.id, l); this.ready.then(() => this._subscribe(l), (e) => onError?.(e));
     return l;
   }
+  async _bind(params) { return Promise.all((params || []).map(async (p) => (isBlob(p) ? (await this.files.upload(p)).id : isFile(p) ? p.id : p))); }
   _subscribe(l) { if (!l.closed) this._send({ op: 'live', id: l.id, sql: l.sql, params: l.params }, true); }
   // ---------- the socket ----------
   _socket() {

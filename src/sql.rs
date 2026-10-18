@@ -20,6 +20,7 @@ impl std::fmt::Debug for Expr { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -
 /// One output column: a column, an aggregate, a scalar subquery, a row expression (`exprs[i]`), or a value the post
 /// step computes after aggregation (an expression over aggregates).
 #[derive(Clone, Debug)] pub enum Proj { Col(usize), Agg(Agg), Sub(usize), Expr(usize), Later }
+#[derive(Clone, Copy, Debug, PartialEq)] pub enum ColKind { Plain, File, Vector }
 #[derive(Clone)] pub enum Access { Pk(Expr), Unique(Expr), Range { lo: Expr, lo_excl: bool, hi: Expr, hi_excl: bool }, Index(Arc<SecIndex>, Expr), Scan }
 /// Equi-join chain. The probe table is scanned (or reached by key/index); each step joins one more table whose join
 /// column is its primary key, copying that table's needed columns next to the row, so the pipeline sees one virtual row.
@@ -466,6 +467,22 @@ fn check_function(f: &ast::Function) -> Result<(), String> {
     }
     Ok(())
 }
+fn is_file(dt: &ast::DataType) -> bool { format!("{dt}").eq_ignore_ascii_case("FILE") }
+/// A `VECTOR(n)` column's dimensions.
+fn vector_dims(dt: &ast::DataType) -> Option<usize> { let s = format!("{dt}").to_uppercase(); if !s.starts_with("VECTOR") { return None; } s.split(|c| c == '(' || c == ')').nth(1).and_then(|x| x.trim().parse().ok()) }
+/// What a FILE or VECTOR column may not be: a key, UNIQUE, or one with a DEFAULT.
+fn file_column_ok(name: &str, key: bool, default: &Value, generated: &Option<Gen>) -> Result<(), String> {
+    if key { return Err(format!("column {name}: a FILE or VECTOR column can't be a key or UNIQUE")); }
+    if *default != Value::Null || generated.is_some() { return Err(format!("column {name}: a FILE or VECTOR column has no DEFAULT")); }
+    Ok(())
+}
+/// `embed(<expr>)` in `VECTOR(n) GENERATED ALWAYS AS (…) STORED`: the expression whose text is embedded.
+fn embed_arg<'e>(e: &'e ast::Expr, col: &str) -> Result<&'e ast::Expr, String> {
+    let bad = || format!("column {col}: a generated VECTOR column is GENERATED ALWAYS AS (embed(<text expression>)) STORED");
+    let ast::Expr::Function(f) = e else { return Err(bad()) };
+    if !obj_name(&f.name).eq_ignore_ascii_case("embed") { return Err(bad()); }
+    match &f.args { FunctionArguments::List(l) if l.args.len() == 1 => match &l.args[0] { FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Ok(x), _ => Err(bad()) }, _ => Err(bad()) }
+}
 fn coltype_of(dt: &ast::DataType) -> Result<ColType, String> {
     let s = format!("{dt}").to_uppercase();
     let num = |s: &str| s.split(|c| c == '(' || c == ')').nth(1).and_then(|x| x.trim().parse::<usize>().ok());
@@ -473,13 +490,14 @@ fn coltype_of(dt: &ast::DataType) -> Result<ColType, String> {
     let width = |n: usize| if n > 65_535 { Err(unsup(format!("{s}: text and binary columns wider than 65,535 bytes"))) } else { Ok(n) };
     Ok(match s.as_str() {
         "INT" | "INTEGER" | "BIGINT" | "INT64" | "SMALLINT" => ColType::Int,
-        "UUID" => ColType::Uuid,
+        "UUID" | "FILE" => ColType::Uuid,   // a FILE column holds the file's id (`is_file`)
         "TIMESTAMP" | "DATETIME" | "TIMESTAMPTZ" => ColType::Timestamp,
         "DOUBLE" | "DOUBLE PRECISION" | "REAL" | "FLOAT" | "FLOAT64" => ColType::Float,
         "BOOL" | "BOOLEAN" => ColType::Bool,
         "TEXT" => ColType::Text(255), "BLOB" | "BYTEA" => ColType::Bytes(255),
         _ if s.starts_with("VARCHAR") || s.starts_with("CHAR") || s.starts_with("TEXT") || s.starts_with("STRING") => ColType::Text(width(num(&s).ok_or(format!("need a length: {s}"))?)?),
         _ if s.starts_with("BLOB") || s.starts_with("VARBINARY") || s.starts_with("BYTES") || s.starts_with("BINARY") => ColType::Bytes(width(num(&s).ok_or(format!("need a length: {s}"))?)?),
+        _ if s.starts_with("VECTOR") => { let n = num(&s).ok_or("need a length: VECTOR(n), the number of dimensions")?; if !(1..=16_000).contains(&n) { return Err(format!("{s}: between 1 and 16,000 dimensions")); } ColType::Bytes(4 * n) }
         _ => return Err(format!("unsupported type {s}")),
     })
 }
@@ -655,6 +673,23 @@ impl<'a> Planner<'a> {
         })
     }
     /// A row expression over the FROM tables: columns become `SExpr::Col` of the (virtual) row.
+    /// What a generated VECTOR column embeds: `e` over the table's columns `names`, planned to check it, and the
+    /// columns it reads.
+    fn embed_spec(&mut self, e: &ast::Expr, names: &[String]) -> Result<crate::table::EmbedSpec, String> {
+        let (_, used) = self.over_columns(e, names)?;
+        if used.is_empty() { return Err("embed(): the expression reads no column".into()); }
+        Ok(crate::table::EmbedSpec { expr: e.to_string(), cols: used.iter().map(|&k| names[k].clone()).collect() })
+    }
+    /// `e` planned over one table's columns by name (no aliases, no subqueries): the expression and the columns it reads.
+    fn over_columns(&mut self, e: &ast::Expr, names: &[String]) -> Result<(SExpr, Vec<usize>), String> {
+        let mut used: Vec<usize> = vec![];
+        let mut leaf = |x: &ast::Expr| -> Result<Option<SExpr>, String> {
+            if let ast::Expr::Identifier(i) = x { let k = names.iter().position(|n| n.eq_ignore_ascii_case(&i.value)).ok_or_else(|| format!("embed(): no column {}", i.value))?; if !used.contains(&k) { used.push(k); } return Ok(Some(SExpr::Col(k))); }
+            Ok(None)
+        };
+        let x = self.sexpr(e, &mut leaf, &|_| None)?;
+        Ok((x, used))
+    }
     fn row_sexpr(&mut self, e: &ast::Expr, srcs: &[Src], vidx: &mut dyn FnMut(usize, usize) -> usize, types: &std::cell::RefCell<HashMap<usize, ColType>>) -> Result<SExpr, String> {
         let ty_of = |i: usize| types.borrow().get(&i).cloned();
         let mut leaf = |x: &ast::Expr| -> Result<Option<SExpr>, String> {
@@ -722,7 +757,7 @@ impl<'a> Planner<'a> {
     fn plan(&mut self, st: &Statement) -> Result<Plan, String> {
         match st {
             Statement::CreateTable(ct) => {
-                let mut cols = vec![]; let mut pk = None; let mut unique = None; let mut fks: Vec<FkDef> = vec![];
+                let mut cols = vec![]; let mut pk = None; let mut unique = None; let mut fks: Vec<FkDef> = vec![]; let mut embeds: Vec<(usize, &ast::Expr)> = vec![];
                 let action = |a: &Option<ast::ReferentialAction>| -> Result<FkAction, String> { match a { None | Some(ast::ReferentialAction::NoAction) | Some(ast::ReferentialAction::Restrict) => Ok(FkAction::Restrict), Some(ast::ReferentialAction::Cascade) => Ok(FkAction::Cascade), Some(ast::ReferentialAction::SetNull) => Ok(FkAction::SetNull), Some(other) => Err(format!("unsupported referential action {other}")) } };
                 let mut auto: Option<usize> = None;
                 for (i, c) in ct.columns.iter().enumerate() {
@@ -730,6 +765,7 @@ impl<'a> Planner<'a> {
                     let mut nullable = true;
                     let mut default = Value::Null; let mut generated = None;
                     let ty = if is_serial(&c.data_type) { auto = Some(i); ColType::Int } else { coltype_of(&c.data_type)? };
+                    let vector = vector_dims(&c.data_type); let mut embed_src = None;
                     for o in &c.options {
                         match &o.option {
                             ast::ColumnOption::ForeignKey(fk) => fks.push(FkDef { col: i, parent: obj_name(&fk.foreign_table), on_delete: action(&fk.on_delete)? }),
@@ -739,13 +775,18 @@ impl<'a> Planner<'a> {
                             ast::ColumnOption::Null | ast::ColumnOption::Comment(_) => {}
                             ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; }
                             ast::ColumnOption::Generated { generation_expr: None, .. } => auto = Some(i),
+                            ast::ColumnOption::Generated { generation_expr: Some(e), .. } if vector.is_some() => embed_src = Some(embed_arg(e, &c.name.value)?),
                             ast::ColumnOption::Generated { .. } => return Err(unsup(format!("generated column {}", c.name.value))),
                             ast::ColumnOption::Check(_) => return Err(unsup(format!("CHECK constraint on {}", c.name.value))),
                             ast::ColumnOption::DialectSpecific(_) if { let s = format!("{}", o.option).to_uppercase(); s.contains("AUTOINCREMENT") || s.contains("AUTO_INCREMENT") } => auto = Some(i),
                             other => return Err(unsup(format!("column option {other} on {}", c.name.value))),
                         }
                     }
-                    cols.push(Column { name: c.name.value.clone(), ty, nullable, default, generated });
+                    let file = is_file(&c.data_type);
+                    if file || vector.is_some() { file_column_ok(&c.name.value, pk == Some(i) || unique == Some(i), &default, &generated)?; }
+                    if embed_src.is_some() && !nullable { return Err(format!("column {}: a generated VECTOR column is NULL until its embedding is made", c.name.value)); }
+                    if let Some(e) = embed_src { embeds.push((i, e)); }
+                    cols.push(Column { name: c.name.value.clone(), ty, nullable, default, generated, file, vector, embed: None });
                 }
                 if ct.or_replace || ct.temporary || ct.query.is_some() || ct.like.is_some() || ct.clone.is_some() || ct.inherits.is_some() || ct.partition_of.is_some() { return Err(unsup("CREATE TABLE with OR REPLACE, TEMPORARY, AS SELECT, LIKE, CLONE, INHERITS or PARTITION OF")); }
                 let one_col = |cols_: &[ast::IndexColumn], what: &str, cols: &[Column]| -> Result<usize, String> {
@@ -762,6 +803,8 @@ impl<'a> Planner<'a> {
                 for tc in &ct.constraints { if let ast::TableConstraint::ForeignKey(fk) = tc { if fk.columns.len() != 1 { return Err("one column per foreign key (for now)".into()); } let col = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&fk.columns[0].value)).ok_or(format!("unknown column {}", fk.columns[0].value))?; fks.push(FkDef { col, parent: obj_name(&fk.foreign_table), on_delete: action(&fk.on_delete)? }); } }
                 let pk = pk.ok_or("a PRIMARY KEY column is required")?;
                 if let Some(a) = auto { if a != pk { return Err(format!("{} is assigned automatically but is not the primary key; automatic values are for the INT PRIMARY KEY", cols[a].name)); } if cols[pk].ty != ColType::Int { return Err(format!("{}: automatic ids are integers; for a UUID key use DEFAULT uuid()", cols[pk].name)); } }
+                if let Some(c) = [Some(pk), unique].into_iter().flatten().find(|&c| cols.get(c).is_some_and(|c| c.file || c.vector.is_some())) { return Err(format!("column {}: a FILE or VECTOR column can't be a key or UNIQUE", cols[c].name)); }
+                for (i, e) in embeds { let names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect(); cols[i].embed = Some(Arc::new(self.embed_spec(e, &names)?)); }
                 let mut schema = Schema::new(&obj_name(&ct.name), cols, pk, unique)?; schema.fks = fks; schema.auto = auto.is_some();
                 Ok(Plan::CreateTable(schema, ct.if_not_exists))
             }
@@ -880,10 +923,13 @@ impl<'a> Planner<'a> {
                 let mut ops = vec![];
                 for op in &at.operations {
                     ops.push(match op {
-                        ast::AlterTableOperation::AddColumn { column_def: c, .. } => { literal_name(&c.name)?; let mut nullable = true; let mut default = Value::Null; let mut generated = None; let ty = coltype_of(&c.data_type)?; for o in &c.options { match &o.option { ast::ColumnOption::NotNull => nullable = false, ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; } ast::ColumnOption::Null => nullable = true, other => return Err(format!("unsupported column option {other}")) } } if !nullable && default == Value::Null && generated.is_none() { return Err(format!("column {} is NOT NULL and needs a DEFAULT for existing rows", c.name.value)); } AlterOp::Add { col: Column { name: c.name.value.clone(), ty, nullable, default: default.clone(), generated }, default } }
+                        ast::AlterTableOperation::AddColumn { column_def: c, .. } => { literal_name(&c.name)?; let mut nullable = true; let mut default = Value::Null; let mut generated = None; let ty = coltype_of(&c.data_type)?; let vector = vector_dims(&c.data_type); let mut embed = None;
+                            for o in &c.options { match &o.option { ast::ColumnOption::NotNull => nullable = false, ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; } ast::ColumnOption::Null => nullable = true,
+                                ast::ColumnOption::Generated { generation_expr: Some(e), .. } if vector.is_some() => { let t = self.db.table(&obj_name(&at.name)).ok_or_else(|| format!("no such table {}", obj_name(&at.name)))?; let names: Vec<String> = t.schema.columns.iter().map(|c| c.name.clone()).collect(); embed = Some(Arc::new(self.embed_spec(embed_arg(e, &c.name.value)?, &names)?)); }
+                                other => return Err(format!("unsupported column option {other}")) } } if !nullable && default == Value::Null && generated.is_none() { return Err(format!("column {} is NOT NULL and needs a DEFAULT for existing rows", c.name.value)); } let file = is_file(&c.data_type); if file || vector.is_some() { file_column_ok(&c.name.value, false, &default, &generated)?; } AlterOp::Add { col: Column { name: c.name.value.clone(), ty, nullable, default: default.clone(), generated, file, vector, embed }, default } }
                         ast::AlterTableOperation::DropColumn { column_names, .. } => { if column_names.len() != 1 { return Err("drop one column at a time".into()); } AlterOp::Drop(column_names[0].value.clone()) }
                         ast::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => AlterOp::Rename(old_column_name.value.clone(), new_column_name.value.clone()),
-                        ast::AlterTableOperation::AlterColumn { column_name, op } => match op { ast::AlterColumnOperation::SetNotNull => AlterOp::SetNotNull(column_name.value.clone()), ast::AlterColumnOperation::DropNotNull => AlterOp::DropNotNull(column_name.value.clone()), ast::AlterColumnOperation::SetDataType { data_type, .. } => AlterOp::SetType(column_name.value.clone(), coltype_of(data_type)?), other => return Err(format!("unsupported ALTER COLUMN {other}")) },
+                        ast::AlterTableOperation::AlterColumn { column_name, op } => match op { ast::AlterColumnOperation::SetNotNull => AlterOp::SetNotNull(column_name.value.clone()), ast::AlterColumnOperation::DropNotNull => AlterOp::DropNotNull(column_name.value.clone()), ast::AlterColumnOperation::SetDataType { data_type, .. } => { if is_file(data_type) || vector_dims(data_type).is_some() { return Err(unsup("ALTER COLUMN … TYPE FILE or VECTOR: add such a column instead")); } AlterOp::SetType(column_name.value.clone(), coltype_of(data_type)?) } other => return Err(format!("unsupported ALTER COLUMN {other}")) },
                         other => return Err(format!("unsupported ALTER TABLE operation {other}")),
                     });
                 }
@@ -1209,7 +1255,7 @@ impl<'a> Planner<'a> {
             let mut off = vn + ps.row_size; let mut vbase = ncols_probe;
             for (k, &(bs, bcol, _, _)) in step_specs.iter().enumerate() {
                 let bsch = &srcs[bs].table.schema; let base = off;
-                for &c in &step_cols[k] { schema.columns.push(Column { name: format!("{}.{}", srcs[bs].alias, bsch.columns[c].name), ty: bsch.columns[c].ty.clone(), nullable: bsch.columns[c].nullable, default: Value::Null, generated: None }); schema.offsets.push(off); off += bsch.columns[c].ty.width(); }
+                for &c in &step_cols[k] { schema.columns.push(Column { name: format!("{}.{}", srcs[bs].alias, bsch.columns[c].name), ty: bsch.columns[c].ty.clone(), nullable: bsch.columns[c].nullable, default: Value::Null, generated: None, file: bsch.columns[c].file, vector: bsch.columns[c].vector, embed: bsch.columns[c].embed.clone() }); schema.offsets.push(off); off += bsch.columns[c].ty.width(); }
                 let mut build_preds = std::mem::take(&mut side_preds[bs]);
                 let build_access = access_path(&srcs[bs].table, &mut build_preds);
                 let outer = outer_of[bs]; let multi = bcol != srcs[bs].table.schema.pk;
@@ -1379,13 +1425,16 @@ struct Sink<'a> { schema: &'a Schema, proj: &'a [Proj], subs: Vec<SubVal<'a>>, a
     /// GROUP BY a column that is not INT/TIMESTAMP: groups keyed by the value's bytes, `bvals[i]` is group i's value
     wide_group: bool, bgroups: HashMap<Box<[u8]>, u32>, bvals: Vec<Value>, kbuf: Vec<u8>,
     /// row expressions (`Proj::Expr`) and residual WHERE conditions, bound to this execution; the first error stops the scan
-    exprs: Vec<SExpr>, filters: Vec<SExpr>, pub err: Option<String> }
+    exprs: Vec<SExpr>, filters: Vec<SExpr>, pub err: Option<String>,
+    /// row expressions that are a distance from a VECTOR column to a bound vector: computed from the row's bytes
+    near: Vec<Option<(crate::expr::F, usize, Vec<u8>)>> }
 impl<'a> Sink<'a> {
     fn new(schema: &'a Schema, proj: &'a [Proj], group_by: Option<usize>, order: Option<(usize, bool)>, limit: Option<usize>, subs: Vec<SubVal<'a>>, exprs: Vec<SExpr>, filters: Vec<SExpr>) -> Sink<'a> {
         let aggs: Vec<&Agg> = proj.iter().filter_map(|p| if let Proj::Agg(a) = p { Some(a) } else { None }).collect();
         let sort_col = match order.map(|(oi, _)| &proj[oi]) { Some(Proj::Col(c)) => *c, _ => 0 };
         Sink { schema, proj, subs, has_agg: !aggs.is_empty(), single: vec![AggState::default(); aggs.len()], aggs, group_by, group_off: group_by.filter(|&g| matches!(schema.columns[g].ty, ColType::Int | ColType::Timestamp)).map(|g| schema.offsets[g]), order, limit: limit.unwrap_or(usize::MAX), groups: FastMap::default(), gstates: vec![], dense: vec![], dense_seen: vec![], null_group: None, topk: vec![], out: vec![],
             wide_group: group_by.is_some_and(|g| !matches!(schema.columns[g].ty, ColType::Int | ColType::Timestamp)), bgroups: HashMap::new(), bvals: vec![], kbuf: vec![],
+            near: exprs.iter().map(|x| x.as_column_distance().filter(|(_, c, _)| schema.columns.get(*c).is_some_and(|c| c.vector.is_some())).map(|(f, c, q)| (f, c, q.to_vec()))).collect(),
             sort_col, sort_off: schema.offsets.get(sort_col).copied().unwrap_or(0), sort_kind: match schema.columns.get(sort_col).map(|c| &c.ty) { Some(ColType::Float) => 1, Some(ColType::Bool) => 2, Some(ColType::Text(_) | ColType::Bytes(_) | ColType::Uuid) => 3, _ => 0 }, topk_b: vec![], exprs, filters, err: None }
     }
     /// The output values of one row.
@@ -1393,7 +1442,10 @@ impl<'a> Sink<'a> {
         let schema = self.schema; let mut err = None;
         let vals = self.proj.iter().map(|p| match p {
             Proj::Col(c) => decode_col(schema, row, *c), Proj::Agg(_) | Proj::Later => Value::Null, Proj::Sub(i) => self.subs[*i].get(row),
-            Proj::Expr(i) => match self.exprs[*i].eval(&|c| decode_col(schema, row, c)) { Ok(v) => v, Err(e) => { err.get_or_insert(e); Value::Null } },
+            Proj::Expr(i) => match &self.near[*i] {
+                Some((f, c, q)) => if crate::table::is_null(row, *c) { Value::Null } else { crate::expr::distance_bytes(*f, crate::table::read_bytes(row, schema.offsets[*c]), q).unwrap_or_else(|e| { err.get_or_insert(e); Value::Null }) },
+                None => match self.exprs[*i].eval(&|c| decode_col(schema, row, c)) { Ok(v) => v, Err(e) => { err.get_or_insert(e); Value::Null } },
+            },
         }).collect();
         if let Some(e) = err { self.err.get_or_insert(e); }
         vals
@@ -1534,6 +1586,10 @@ pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Pre
     pub(crate) auth: crate::auth::AuthState,
     /// Provider sign-ins in progress and cached signing keys: see `oauth.rs`.
     pub(crate) oauth: crate::oauth::OAuthState,
+    /// FILE columns: whether the sweep of unreferenced files runs (see `files.rs`).
+    pub(crate) files: crate::files::FilesState,
+    /// VECTOR columns: the embedder and its caches (see `vector.rs`).
+    pub(crate) vectors: crate::vector::VectorState,
     /// `<dir>/.lock`, held while open. Declared last: fields drop in order, so the lock is released only after `db`
     /// (and with it the log threads) has gone.
     dir_lock: Mutex<Option<std::fs::File>> }
@@ -1599,7 +1655,7 @@ pub struct Follower { pub applied: Arc<std::sync::atomic::AtomicU64>, stop: Arc<
 impl Follower { pub fn applied(&self) -> u64 { self.applied.load(std::sync::atomic::Ordering::Acquire) } }
 impl Drop for Follower { fn drop(&mut self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); if let Some(h) = self.thread.take() { h.join().ok(); } } }
 impl Sql {
-    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), dir_lock: Mutex::new(None) } }
+    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), files: Default::default(), vectors: Default::default(), dir_lock: Mutex::new(None) } }
     /// Build the new schema and the old-row -> new-row converter for a list of ALTER operations.
     fn alter_schema(old: &Schema, ops: &[AlterOp]) -> Result<(Schema, Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>), String> {
         // working list: (column, source: Some(old index) | None, default, retyped from old type)
@@ -1611,7 +1667,7 @@ impl Sql {
                 AlterOp::Add { col, default } => { if find(&cols, &col.name).is_ok() { return Err(format!("column {} already exists", col.name)); } cols.push((col.clone(), None, default.clone())); }
                 AlterOp::Drop(n) => { let i = find(&cols, n)?; if cols[i].0.name.eq_ignore_ascii_case(&pk_name) { return Err("cannot drop the primary key".into()); } cols.remove(i); }
                 AlterOp::Rename(a, b) => { let i = find(&cols, a)?; if find(&cols, b).is_ok() { return Err(format!("column {b} already exists")); } cols[i].0.name = b.clone(); }
-                AlterOp::SetType(n, ty) => { let i = find(&cols, n)?; if cols[i].0.name.eq_ignore_ascii_case(&pk_name) { return Err("cannot change the primary key type".into()); } cols[i].0.ty = ty.clone(); }
+                AlterOp::SetType(n, ty) => { let i = find(&cols, n)?; if cols[i].0.name.eq_ignore_ascii_case(&pk_name) { return Err("cannot change the primary key type".into()); } if cols[i].0.file || cols[i].0.vector.is_some() { return Err(format!("column {n}: a FILE or VECTOR column's type doesn't change")); } cols[i].0.ty = ty.clone(); }
                 AlterOp::SetNotNull(n) => { let i = find(&cols, n)?; cols[i].0.nullable = false; }
                 AlterOp::DropNotNull(n) => { let i = find(&cols, n)?; cols[i].0.nullable = true; }
             }
@@ -1719,6 +1775,9 @@ impl Sql {
         if cfg.snapshot.log_bytes.is_some() || cfg.snapshot.idle_after.is_some() { sv.snapshotter = Some(spawn_snapshotter(&sql.db, cfg.snapshot.clone(), sv.snapshots.clone())); }
         if let Some(a) = &cfg.listen.http { sv.listeners.push(start_http(&sql, a, cfg.listen.token.as_deref().unwrap_or(""))?); }
         if let Some(a) = &cfg.listen.app { sv.listeners.push(crate::app::start(sql.clone(), a)?); }
+        if sql.db.table(crate::files::FILES).is_some() { sql.files_gc_start(); }
+        if sql.cfg.embed.is_some() { sql.vectors_start(); }
+        else if let Some(t) = sql.db.table_names().iter().find(|n| sql.db.table(n).is_some_and(|t| t.schema.columns.iter().any(|c| c.embed.is_some()))) { eprintln!("embed: {t} has generated VECTOR columns; set [embed] to have them filled"); }
         *sql.services.lock().unwrap() = Some(sv);
         Ok(sql)
     }
@@ -1759,6 +1818,17 @@ impl Sql {
     /// Block until commit `seq` (e.g. `Session::last_seq`) has been fsynced; works in both durability modes.
     pub fn wait_durable(&self, seq: u64) { self.db.log.wait_durable(seq) }
     /// Output columns of a prepared statement: (name, type when known). Empty for statements that return no rows.
+    /// What each result column of a statement is, for a client: a FILE or VECTOR column read as it is (not in an
+    /// expression or a GROUP BY), or anything else.
+    pub fn column_kinds(&self, p: &Prepared) -> Vec<ColKind> {
+        let kind = |c: &Column| if c.file { ColKind::File } else if c.vector.is_some() { ColKind::Vector } else { ColKind::Plain };
+        match &p.plan {
+            Plan::Select(s) if s.post.as_ref().is_some_and(|p| p.grouping.is_some()) => vec![ColKind::Plain; s.names.len().max(s.proj.len())],
+            Plan::Select(s) => { let mut v: Vec<ColKind> = s.proj.iter().map(|pr| match pr { Proj::Col(c) => s.schema.columns.get(*c).map(kind).unwrap_or(ColKind::Plain), _ => ColKind::Plain }).collect(); if let Some(post) = &s.post { v.truncate(post.visible); } v }
+            Plan::Update { table, returning: Some(cols), .. } | Plan::Insert { table, returning: Some(cols), .. } => cols.iter().map(|&c| kind(&table.schema.columns[c])).collect(),
+            _ => vec![ColKind::Plain; self.columns(p).len()],
+        }
+    }
     pub fn columns(&self, p: &Prepared) -> Vec<(String, Option<ColType>)> {
         match &p.plan {
             Plan::Select(s) if s.post.is_some() => s.post.as_ref().unwrap().types.iter().enumerate().map(|(i, t)| (s.names.get(i).cloned().unwrap_or_else(|| format!("col{i}")), t.clone())).collect(),
@@ -1832,6 +1902,13 @@ impl Sql {
     pub(crate) fn apply_admin(&self, sql: &str) -> Result<(), String> { self.admin(&Session::default(), sql) }
     pub(crate) fn log_admin(&self, sql: &str) { self.log_meta(sql) }
     /// Create one of the engine's own tables (see `auth.rs`) and log the CREATE, so a restart replays it first.
+    /// A generated VECTOR column's source, planned over the table as it is now (columns move with ALTER TABLE).
+    pub(crate) fn plan_embed(&self, schema: &crate::table::Schema, spec: &crate::table::EmbedSpec) -> Result<SExpr, String> {
+        let e = Parser::new(&GenericDialect {}).try_with_sql(&spec.expr).map_err(|e| e.to_string())?.parse_expr().map_err(|e| e.to_string())?;
+        let mut pl = Planner { db: &self.db, nparams: 0, outer: vec![], cur: vec![], corr: None, exists_mode: false, params_at: vec![] };
+        let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        Ok(pl.over_columns(&e, &names)?.0)
+    }
     pub(crate) fn create_system_table(&self, ddl: &str) -> Result<(), String> {
         let stmts = Parser::parse_sql(&GenericDialect {}, ddl).map_err(|e| e.to_string())?;
         let mut pl = Planner { db: &self.db, nparams: 0, outer: vec![], cur: vec![], corr: None, exists_mode: false, params_at: vec![] };
@@ -2049,7 +2126,7 @@ impl Sql {
         if p.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire) { let p2 = self.prepare(&p.text)?; return self.execute_s(sess, &p2, params); }  // a schema change swapped the table under this plan
         match &p.plan {
             Plan::Alter { table, ops } => { if sess.user.is_some() { return Err("permission denied: only the application session can alter tables".into()); } self.alter(&p.text, table, ops, true)?; Ok(vec![]) }
-            Plan::CreateTable(s, if_not_exists) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } if crate::auth::is_system(&s.name) { return Err(format!("{}: names starting with _auth_ are reserved for the engine", s.name)); } if *if_not_exists && self.db.table(&s.name).is_some() { return Ok(vec![]); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
+            Plan::CreateTable(s, if_not_exists) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } if crate::auth::is_system(&s.name) { return Err(format!("{}: names starting with _auth_ or _sqz_ are reserved for the engine", s.name)); } if *if_not_exists && self.db.table(&s.name).is_some() { return Ok(vec![]); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
             Plan::Const { exprs, .. } => { let xs = self.bind(sess, exprs, params)?; Ok(vec![xs.iter().map(|x| x.eval(&|_| Value::Null)).collect::<Result<Vec<_>, _>>()?]) }
             Plan::Begin => { if sess.txn.is_some() { return Err("already in a transaction".into()); } sess.txn = Some(Txn::new()); Ok(vec![]) }
             Plan::Rollback => { sess.txn = None; Ok(vec![]) }
@@ -2059,6 +2136,8 @@ impl Sql {
                 let schema = &table.schema; let mut encoded = Vec::with_capacity(rows.len()); let mut last_id = 0; let mut last_key: Option<Value> = None;
                 // the values of every row to insert: from VALUES, or from the SELECT's rows plus the other columns' fill
                 let plain = from.is_none() && matches!(conflict, Conflict::None);
+                let files = if schema.columns.iter().any(|c| c.file) { Some(self.file_writer(sess)) } else { None };
+                let embeds = schema.columns.iter().any(|c| c.embed.is_some());
                 if plain {   // INSERT … VALUES: the hot path, one loop
                     for exprs in rows {
                         let mut vals = Vec::with_capacity(exprs.len());
@@ -2066,6 +2145,8 @@ impl Sql {
                         if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
                         let row = encode_row(schema, &vals)?;
                         for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
+                        if let Some(w) = &files { self.check_files(w, schema, None, &row)?; }
+                        if embeds { crate::vector::embed_insert_ok(schema, &row)?; }
                         last_key = Some(decode_col(schema, &row, schema.pk));
                         encoded.push(row);
                     }
@@ -2091,6 +2172,8 @@ impl Sql {
                     if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
                     let row = encode_row(schema, vals)?;
                     for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
+                    if let (Some(w), Conflict::None) = (&files, conflict) { self.check_files(w, schema, None, &row)?; }
+                    if embeds && matches!(conflict, Conflict::None) { crate::vector::embed_insert_ok(schema, &row)?; }   // an upsert checks each row as what it becomes
                     last_key = Some(decode_col(schema, &row, schema.pk));
                     encoded.push(row);
                 }
@@ -2126,8 +2209,12 @@ impl Sql {
                 let vals = sets.iter().filter_map(|(c, v)| if let SetVal::Value(e) = v { Some(self.resolve(sess, e, params).map(|v| (*c, v))) } else { None }).collect::<Result<Vec<_>, _>>()?;
                 let rowx: Vec<(usize, SExpr)> = if !sets.iter().any(|(_, v)| matches!(v, SetVal::Row(_))) { vec![] } else { let xs: Vec<(usize, SExpr)> = sets.iter().filter_map(|(c, v)| if let SetVal::Row(x) = v { Some((*c, x.clone())) } else { None }).collect(); let bound = self.bind(sess, &xs.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?; xs.into_iter().map(|(c, _)| c).zip(bound).collect() };
                 // the new row: every SET expression reads the row as it was before this UPDATE
+                let files = if schema.columns.iter().any(|c| c.file) { Some(self.file_writer(sess)) } else { None };
+                let embeds = schema.columns.iter().any(|c| c.embed.is_some());
                 let make = |row: &[u8]| -> Result<Vec<u8>, Abort> { let mut new = row.to_vec(); for (c, v) in &vals { encode_col(schema, &mut new, *c, v).map_err(Abort::Type)?; }
-                    for (c, x) in &rowx { let v = x.eval(&|k| decode_col(schema, row, k)).map_err(Abort::Type)?; encode_col(schema, &mut new, *c, &v).map_err(Abort::Type)?; } for p in &policy { if !p.eval(&new) { return Err(Abort::Type("permission denied: new row violates a policy".into())); } } Ok(new) };
+                    for (c, x) in &rowx { let v = x.eval(&|k| decode_col(schema, row, k)).map_err(Abort::Type)?; encode_col(schema, &mut new, *c, &v).map_err(Abort::Type)?; }
+                    if embeds { crate::vector::embed_on_update(schema, row, &mut new).map_err(Abort::Type)?; } for p in &policy { if !p.eval(&new) { return Err(Abort::Type("permission denied: new row violates a policy".into())); } }
+                    if let Some(w) = &files { self.check_files(w, schema, Some(row), &new).map_err(Abort::Type)?; } Ok(new) };
                 let mut changed: Vec<Vec<u8>> = vec![];
                 match at {
                     UpdWhere::Pk(e) => {
@@ -2197,6 +2284,8 @@ impl Sql {
             Conflict::Update { sets, cond, .. } => (self.bind(sess, &sets.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?, match cond { Some(c) => Some(self.bind(sess, std::slice::from_ref(c), params)?.remove(0)), None => None }),
             _ => (vec![], None),
         };
+        let files = if schema.columns.iter().any(|c| c.file) { Some(self.file_writer(sess)) } else { None };
+        let embeds = schema.columns.iter().any(|c| c.embed.is_some());
         let own = sess.txn.is_none(); let mut t = sess.txn.take().unwrap_or_default();
         let mut work = || -> Result<Vec<Vec<u8>>, String> {
             let mut out = vec![];
@@ -2209,25 +2298,31 @@ impl Sql {
                     Conflict::Nothing(target) => {
                         let hit = match target { Some(c) if *c == schema.pk => by_pk.is_some(), Some(_) => by_unique().is_some(), None => by_pk.is_some() || by_unique().is_some() };
                         if hit { continue; }
+                        if let Some(w) = &files { self.check_files(w, schema, None, row)?; }
+                        if embeds { crate::vector::embed_insert_ok(schema, row)?; }
                         table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone());
                     }
                     Conflict::Update { target, .. } => {
                         let old = if *target == schema.pk { by_pk } else { by_unique() };
-                        let Some(old) = old else { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone()); continue };
+                        let Some(old) = old else { if let Some(w) = &files { self.check_files(w, schema, None, row)?; } if embeds { crate::vector::embed_insert_ok(schema, row)?; } table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone()); continue };
                         if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); }
                         let get = |i: usize| if i < n { decode_col(schema, &old, i) } else { vals[i - n].clone() };
                         if let Some(c) = &cond { if crate::expr::truth(&c.eval(&get)?)? != Some(true) { continue; } }
                         let mut new = old.clone();
                         for ((c, _), x) in match conflict { Conflict::Update { sets: s, .. } => s.iter().zip(&sets), _ => unreachable!() } { let v = x.eval(&get)?; encode_col(schema, &mut new, *c, &v)?; }
+                        if embeds { crate::vector::embed_on_update(schema, &old, &mut new)?; }
                         if !visible(&new) { return Err(format!("permission denied: new row violates a policy on {}", schema.name)); }
+                        if let Some(w) = &files { self.check_files(w, schema, Some(&old), &new)?; }
                         let new2 = new.clone();
                         table.txn_update(&mut t, schema.key_of(&old), move |_| Ok(new2)).map_err(|a| a.to_string())?; out.push(new);
                     }
                     Conflict::Replace => {
                         // the rows it collides with, by primary key or UNIQUE value, go first
                         let mut gone = vec![];
-                        if let Some(old) = by_pk { if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(schema.key_of(&old)); }
+                        if let Some(old) = &by_pk { if !visible(old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(schema.key_of(old)); }
                         if let Some(old) = by_unique() { let k = schema.key_of(&old); if !gone.contains(&k) { if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(k); } }
+                        if embeds { crate::vector::embed_insert_ok(schema, row)?; }
+                        if let Some(w) = &files { self.check_files(w, schema, by_pk.as_deref(), row)?; }   // keeping the replaced row's file is allowed
                         for k in gone { table.txn_delete(&mut t, k).map_err(|a| a.to_string())?; }
                         table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; self.forget_secret(&mut t, table, row)?; out.push(row.clone());
                     }
@@ -2242,7 +2337,7 @@ impl Sql {
     /// A statement's expressions with its parameters and scalar subqueries replaced by values for this execution.
     fn bind(&self, sess: &Session, xs: &[SExpr], params: &[Value]) -> Result<Vec<SExpr>, String> {
         let mut sub = |q: &Arc<SelectPlan>| -> Result<Value, String> { Ok(self.run_select(sess, q, params)?.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null)) };
-        xs.iter().map(|x| x.bind(params, &mut sub)).collect()
+        xs.iter().map(|x| x.bind(params, &mut sub).and_then(|x| x.fold_vectors(&mut |t| self.embed_query(t)))).collect()
     }
     /// Feed the rows of a single-table SELECT's access path to `visit` (stops when it returns false).
     #[inline(always)] fn drive<V: FnMut(&[u8]) -> bool>(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, visit: &mut V) -> Result<(), String> {
@@ -2291,7 +2386,20 @@ impl Sql {
             rows = kept;
         }
         if p.distinct { let mut seen = std::collections::HashSet::new(); let mut kb = vec![]; rows.retain(|r| { kb.clear(); for v in &r[..p.visible] { canon(v, &mut kb); } seen.insert(kb.clone()) }); }
-        if !p.order.is_empty() { rows.sort_by(|a, b| { for &(i, desc) in &p.order { let o = value_order(&a[i], &b[i]); let o = if desc { o.reverse() } else { o }; if o.is_ne() { return o; } } Equal }); }
+        if !p.order.is_empty() {
+            let cmp = |a: &Vec<Value>, b: &Vec<Value>| { for &(i, desc) in &p.order { let o = value_order(&a[i], &b[i]); let o = if desc { o.reverse() } else { o }; if o.is_ne() { return o; } } Equal };
+            match p.limit.map(|l| p.offset.saturating_add(l)) {
+                // a few of many (the nearest 10 vectors, the newest 20 rows): find those, then sort just them; ties
+                // keep their input order, so the rows are the ones a full sort would give
+                Some(k) if k > 0 && k < rows.len() / 4 => {
+                    let mut at: Vec<(usize, Vec<Value>)> = rows.into_iter().enumerate().collect();
+                    let by = |a: &(usize, Vec<Value>), b: &(usize, Vec<Value>)| cmp(&a.1, &b.1).then(a.0.cmp(&b.0));
+                    at.select_nth_unstable_by(k - 1, by); at.truncate(k); at.sort_by(by);
+                    rows = at.into_iter().map(|(_, r)| r).collect();
+                }
+                _ => rows.sort_by(cmp),
+            }
+        }
         Ok(rows.into_iter().skip(p.offset).take(p.limit.unwrap_or(usize::MAX)).map(|mut r| { r.truncate(p.visible); r }).collect())
     }
     #[inline(always)] fn select_rows(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, mut policies: Vec<Vec<CPred>>) -> Result<Vec<Vec<Value>>, String> {

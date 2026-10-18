@@ -42,10 +42,12 @@ fn enc(s: &str) -> String { s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"
 fn fail(m: impl std::fmt::Display) -> String { format!("sign-in failed: {m}") }
 
 /// Run an HTTP exchange on its own thread and runtime (callers may themselves be inside one).
-fn http<T: Send, F, Fut>(f: F) -> Result<T, String> where F: FnOnce(reqwest::Client) -> Fut + Send, Fut: std::future::Future<Output = Result<T, String>> {
+fn http<T: Send, F, Fut>(f: F) -> Result<T, String> where F: FnOnce(reqwest::Client) -> Fut + Send, Fut: std::future::Future<Output = Result<T, String>> { http_with(Duration::from_secs(10), f) }
+/// `http`, with another timeout for the whole exchange.
+pub(crate) fn http_with<T: Send, F, Fut>(timeout: Duration, f: F) -> Result<T, String> where F: FnOnce(reqwest::Client) -> Fut + Send, Fut: std::future::Future<Output = Result<T, String>> {
     std::thread::scope(|s| s.spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).user_agent(concat!("sqweezdb/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
+        let client = reqwest::Client::builder().timeout(timeout).user_agent(concat!("sqweezdb/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
         rt.block_on(f(client))
     }).join().map_err(|_| "the HTTP thread panicked".to_string())?)
 }

@@ -24,7 +24,27 @@ impl ColType {
     pub fn name(&self) -> String { match self { ColType::Int => "INT".into(), ColType::Timestamp => "TIMESTAMP".into(), ColType::Uuid => "UUID".into(), ColType::Float => "DOUBLE".into(), ColType::Bool => "BOOL".into(), ColType::Text(n) => format!("TEXT({n})"), ColType::Bytes(n) => format!("BYTES({n})") } }
 }
 #[derive(Clone, Debug)] pub struct Column { pub name: String, pub ty: ColType, pub nullable: bool, pub default: Value, /// computed per row when the INSERT leaves the column out (`uuid()`, `now()`)
-    pub generated: Option<Gen> }
+    pub generated: Option<Gen>, /// a `FILE` column: stored and compared as the file's id (a UUID), checked on writes (`files.rs`)
+    pub file: bool, /// a `VECTOR(n)` column: n f32s, stored as BYTES(4n) (`vector.rs`)
+    pub vector: Option<usize>, /// what a VECTOR column is the embedding of, when it is generated (`vector.rs`)
+    pub embed: Option<std::sync::Arc<EmbedSpec>> }
+impl Column { pub fn type_name(&self) -> String { if self.file { "FILE".into() } else if let Some(n) = self.vector { format!("VECTOR({n})") } else { self.ty.name() } } }
+/// A `VECTOR(n) GENERATED ALWAYS AS (embed(<expr>)) STORED` column's source: the expression as SQL, and the columns
+/// it reads (a write that changes one of them clears the vector, for the embedder to fill again).
+#[derive(Clone, Debug, PartialEq)] pub struct EmbedSpec { pub expr: String, pub cols: Vec<String> }
+/// A VECTOR(n) value as stored, n little-endian f32s: from a JSON array of numbers (text, as a client sends it), or
+/// from those bytes.
+pub fn vector_bytes(v: &Value, n: usize) -> Result<Vec<u8>, String> {
+    let fs: Vec<f32> = match v {
+        Value::Bytes(b) if b.len() == 4 * n => vector_floats(b).collect(),
+        Value::Text(s) => serde_json::from_str::<Vec<f64>>(s).map_err(|_| format!("expected a vector of {n} numbers, as a JSON array such as [0.1, 0.2]"))?.into_iter().map(|x| x as f32).collect(),
+        v => return Err(format!("expected a vector of {n} numbers, got {v:?}")),
+    };
+    if fs.len() != n { return Err(format!("expected a vector of {n} numbers, got {}", fs.len())); }
+    if fs.iter().any(|x| !x.is_finite()) { return Err("a vector's numbers must be finite".into()); }
+    Ok(fs.iter().flat_map(|x| x.to_le_bytes()).collect())
+}
+pub fn vector_floats(b: &[u8]) -> impl Iterator<Item = f32> + '_ { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])) }
 #[derive(Clone, Debug, PartialEq)] pub enum FkAction { Restrict, Cascade, SetNull }
 /// A foreign key: `col` references the primary key of table `parent`. Enforced always (no pragma); `on_delete` says what a parent delete does.
 #[derive(Clone, Debug)] pub struct FkDef { pub col: usize, pub parent: String, pub on_delete: FkAction }
@@ -169,6 +189,7 @@ pub fn format_timestamp(us: i64) -> String {
 pub fn encode_col(schema: &Schema, row: &mut [u8], i: usize, v: &Value) -> Result<(), String> {
     let c = &schema.columns[i]; let off = schema.offsets[i]; let w = c.ty.width();
     if let Value::Null = v { if !c.nullable { return Err(format!("column {} is NOT NULL", c.name)); } row[i >> 3] |= 1 << (i & 7); for b in &mut row[off..off + w] { *b = 0; } return Ok(()); }
+    let as_vector; let v = match c.vector { Some(n) => { as_vector = Value::Bytes(vector_bytes(v, n).map_err(|e| format!("column {}: {e}", c.name))?); &as_vector } None => v };
     encode_value(&c.ty, v, &mut row[off..off + w]).map_err(|e| format!("column {}: {e}", c.name))?;
     row[i >> 3] &= !(1 << (i & 7));
     Ok(())

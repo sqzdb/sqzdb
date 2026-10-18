@@ -9,7 +9,7 @@
 //
 // Each server is started, measured and stopped in turn: sqweezdb, PocketBase as it comes, and PocketBase with its
 // request log off (it writes every request to a second SQLite database by default).
-import http from 'node:http'; import fs from 'node:fs'; import net from 'node:net'; import assert from 'node:assert/strict';
+import http from 'node:http'; import fs from 'node:fs'; import net from 'node:net'; import assert from 'node:assert/strict'; import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { connect } from '../../../clients/js/index.js';
 
@@ -34,12 +34,13 @@ async function pool(n, items, fn) { let next = 0; await Promise.all(Array.from({
  *  sign-ups per address; real users come from many). Resolves to { status, body }. */
 function httpClient(base, i) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1, localAddress: `127.0.${1 + Math.floor(i / 10)}.1` });
+  // body: JSON, or { raw: Buffer, type } sent as it is
   return (method, path, body, auth) => new Promise((resolve, reject) => {
-    const data = body === undefined ? null : JSON.stringify(body);
-    const headers = { ...(data ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) } : {}), ...(auth ? { authorization: auth } : {}) };
+    const data = body === undefined ? null : body.raw ? body.raw : JSON.stringify(body);
+    const headers = { ...(data ? { 'content-type': body.raw ? body.type : 'application/json', 'content-length': Buffer.byteLength(data) } : {}), ...(auth ? { authorization: auth } : {}) };
     http.request(base + path, { method, agent, headers }, (res) => {
       const parts = []; res.on('data', (c) => parts.push(c));
-      res.on('end', () => { const s = Buffer.concat(parts).toString(); let v = null; try { v = s ? JSON.parse(s) : null; } catch {} resolve({ status: res.statusCode, body: v }); });
+      res.on('end', () => { const b = Buffer.concat(parts); let v = null; try { v = b.length && b[0] === 0x7b ? JSON.parse(b) : null; } catch {} resolve({ status: res.statusCode, body: v, size: b.length }); });
     }).on('error', reject).end(data);
   });
 }
@@ -61,6 +62,13 @@ const sqweezdb = {
   async insert(c, u, body) { return (await this.sql(c, u, 'INSERT INTO notes (owner, body) VALUES (?, ?)', [u.id, body])).lastInsertId; },
   async read(c, u, id) { const r = await this.sql(c, u, 'SELECT id, owner, body, pinned, created FROM notes WHERE id = ?', [id]); assert.equal(r.rows.length, 1); },
   async list(c, u) { const r = await this.sql(c, u, 'SELECT id, owner, body, pinned, created FROM notes WHERE owner = ? ORDER BY created DESC LIMIT 20', [u.id]); assert.equal(r.rows.length, 20); },
+  /** A note with a picture: the upload, then the INSERT that names it (what the JS client does with a File). */
+  async insertWithFile(c, u, body, pic) {
+    const f = ok(await c('POST', '/api/files?name=pic.jpg', { raw: pic, type: 'image/jpeg' }, u.auth), 'upload');
+    return (await this.sql(c, u, 'INSERT INTO notes (owner, body, attachment) VALUES (?, ?, ?)', [u.id, body, f.id])).lastInsertId;
+  },
+  /** How to download a note's picture: the signed link a query hands out. */
+  async picture(c, u, note) { const url = (await this.sql(c, u, 'SELECT attachment FROM notes WHERE id = ?', [note])).rows[0][0].url; return () => c('GET', url); },
   /** A device of `u` with live queries; `onNote(id)` for the newest note of theirs, each time it changes. */
   device(t, u, { onNote, onLeak, full }) {
     const db = connect(t.base, { storage: { getItem: () => JSON.stringify({ token: u.token, user: u.user }), setItem() {}, removeItem() {} } });
@@ -89,7 +97,7 @@ const pocketbase = (requestLog) => ({
     const rule = 'owner = @request.auth.id';
     ok(await c('POST', '/api/collections', { name: 'notes', type: 'base',
       fields: [{ name: 'owner', type: 'relation', collectionId: users.id, maxSelect: 1, required: true, cascadeDelete: true }, { name: 'body', type: 'text', max: 1000, required: true },
-        { name: 'pinned', type: 'bool' }, { name: 'created', type: 'autodate', onCreate: true }],
+        { name: 'pinned', type: 'bool' }, { name: 'created', type: 'autodate', onCreate: true }, { name: 'attachment', type: 'file', maxSelect: 1, maxSize: 26214400, protected: true }],
       listRule: rule, viewRule: rule, createRule: `@request.auth.id != "" && ${rule}`, updateRule: rule, deleteRule: rule,
       indexes: ['CREATE INDEX idx_notes_owner ON notes (owner)'] }, admin), 'notes collection');
     return { base, proc, dir };
@@ -103,6 +111,14 @@ const pocketbase = (requestLog) => ({
   async insert(c, u, body) { return ok(await c('POST', '/api/collections/notes/records', { owner: u.id, body }, u.auth), 'insert').id; },
   async read(c, u, id) { ok(await c('GET', `/api/collections/notes/records/${id}`, undefined, u.auth), 'read'); },
   async list(c, u) { const r = ok(await c('GET', '/api/collections/notes/records?sort=-created&perPage=20&skipTotal=1', undefined, u.auth), 'list'); assert.equal(r.items.length, 20); },
+  /** A note with a picture: one multipart request with the fields and the file. */
+  async insertWithFile(c, u, body, pic) {
+    const b = `----e59${crypto.randomBytes(8).toString('hex')}`, part = (name, v) => `--${b}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${v}\r\n`;
+    const raw = Buffer.concat([Buffer.from(part('owner', u.id) + part('body', body) + `--${b}\r\nContent-Disposition: form-data; name="attachment"; filename="pic.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), pic, Buffer.from(`\r\n--${b}--\r\n`)]);
+    const r = ok(await c('POST', '/api/collections/notes/records', { raw, type: `multipart/form-data; boundary=${b}` }, u.auth), 'insert with a file'); return { id: r.id, file: r.attachment };
+  },
+  /** How to download a note's picture: a file token (protected files), then the file's URL. */
+  async picture(c, u, note) { const t = ok(await c('POST', '/api/files/token', {}, u.auth), 'file token').token; return () => c('GET', `/api/files/notes/${note.id}/${note.file}?token=${t}`); },
   /** A device of `u` subscribed to notes over server-sent events; `onNote(id)` for each note of theirs created. */
   device(t, u, { onNote, onLeak }) {
     let req; const ready = new Promise((resolve, reject) => {
@@ -151,6 +167,13 @@ async function measure(target) {
     xs = [];
     for (let k = 0; k < 2000; k++) { const i = k % USERS; const a = process.hrtime.bigint(); await target.list(cs[i], users[i]); xs.push(ms(a)); }
     out['list the newest 20 notes (HTTP, one request at a time)'] = lat(xs);
+    // a note with a 100 KB picture; then that picture, downloaded
+    const pic = crypto.randomBytes(100 << 10); xs = []; let note;
+    for (let k = 0; k < 200; k++) { const i = k % USERS; const a = process.hrtime.bigint(); note = await target.insertWithFile(cs[i], users[i], `picture ${k}`, pic); xs.push(ms(a)); }
+    out['a note with a 100 KB picture created (the upload included)'] = lat(xs);
+    const fetchPic = await target.picture(cs[199 % USERS], users[199 % USERS], note); xs = [];
+    for (let k = 0; k < 500; k++) { const a = process.hrtime.bigint(); const r = await fetchPic(); assert.equal(r.status, 200); assert.equal(r.size, pic.length); xs.push(ms(a)); }
+    out['download that picture'] = lat(xs);
     // 32 users reading at once for 3 s
     let done = 0; c0 = cpu(pid); t0 = process.hrtime.bigint(); const until = Date.now() + 3000;
     await Promise.all(Array.from({ length: 32 }, async (_, w) => { for (let k = 0; Date.now() < until; k++) { const i = (w * 7 + k) % USERS; await target.list(cs[i], users[i]); done++; } }));

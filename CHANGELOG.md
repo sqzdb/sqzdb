@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0 — 2026-10-18
+
+### Added
+- **Files as a column** (`FILE`). A `FILE` column holds an uploaded file; the bytes are kept in the database
+  directory's `files/`. Through the app API a browser uploads with `POST /api/files`, and the JS client does
+  it for a `File` or `Blob` passed as a SQL parameter (or `db.files.upload`). A query's result gives each
+  file as `{ id, name, type, size, url }`, where `url` is a signed link (`app.files.linkTtl`, an hour) with
+  ETags and byte ranges. Whoever may read the row may download the file.
+- A signed-in user may put a file in a row only if they uploaded it within the hour, or keep the one the row
+  has. Files no row refers to are deleted after a day. New settings: `app.files.maxSize`, `app.files.linkTtl`.
+- **Vectors** (`VECTOR(n)`), searched with `cosine_distance`, `l2_distance` and `inner_product` (exact, under
+  the row policies), plus `vector_dims`. A vector is written as a JSON array, and the app API returns one.
+- **Embedding on write.** `VECTOR(n) GENERATED ALWAYS AS (embed(<text expression>)) STORED` is filled in the
+  background by an OpenAI-compatible endpoint (`[embed]`: OpenAI, Ollama, llama.cpp …), and filled again when
+  the text changes. `embed(?)` in a query embeds the search text, cached.
+- `demos/notes` has attachments, pasted or chosen, shown in place when they are images, and search by meaning
+  when an embedding column is added.
+
+### Changed
+- `ORDER BY … LIMIT k` over many rows finds the first k without sorting them all; the rows are the same.
+
 ## 0.6.1 — 2026-10-18
 
 **Upgrade from 0.6.0 if you use provider sign-in through the app API.** Use the client the server serves

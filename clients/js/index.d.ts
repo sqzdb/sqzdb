@@ -1,5 +1,9 @@
 export type Value = string | number | boolean | null;
-export type Row = Record<string, Value>;
+/** A FILE column's value: `url` is a signed link (an hour by default) that an <img> or a download can use. */
+export interface FileValue { id: string; name: string; type: string; size: number; url: string | null; }
+export type Row = Record<string, Value | FileValue>;
+/** A parameter: a value, a File or Blob (uploaded first, then its id), or a file a query returned (its id). */
+export type Param = Value | FileValue | Blob;
 
 export class SqweezError extends Error {
   /** AUTH, DENIED, TYPE, SYNTAX, SCHEMA, DUPLICATE, FOREIGN_KEY, CONFLICT, NOT_FOUND, TRANSACTION, ARGUMENTS, RATE_LIMITED, CLOSED, ERROR */
@@ -23,6 +27,11 @@ export interface Auth {
   onChange(fn: (user: Row | null) => void): () => void;
 }
 
+export interface Files {
+  /** Upload a File or Blob; resolves to the file, to put in a FILE column within the hour. */
+  upload(data: Blob | ArrayBuffer | Uint8Array, opts?: { name?: string; type?: string }): Promise<FileValue>;
+}
+
 export interface Live {
   readonly id: number;
   /** The newest rows (null until the first result). */
@@ -33,11 +42,12 @@ export interface Live {
 export interface Client {
   readonly url: string;
   readonly auth: Auth;
+  readonly files: Files;
   /** Resolves once a sign-in coming back from a provider is finished. */
   readonly ready: Promise<void>;
-  sql(sql: string, params?: Value[]): Promise<Row[] & { lastInsertId?: Value }>;
-  batch(statements: Array<[string, Value[]?] | { sql: string; params?: Value[] }>): Promise<Row[][]>;
-  live(sql: string, params: Value[], fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqweezError) => void): Live;
+  sql(sql: string, params?: Param[]): Promise<Row[] & { lastInsertId?: Value }>;
+  batch(statements: Array<[string, Param[]?] | { sql: string; params?: Param[] }>): Promise<Row[][]>;
+  live(sql: string, params: Array<Value | FileValue>, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqweezError) => void): Live;
   live(sql: string, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqweezError) => void): Live;
   close(): void;
 }

@@ -1,0 +1,5 @@
+files: ok
+upload 100 KB (one at a time)                                    p50 0.45 ms, p99 0.93 ms
+download 100 KB                                                  p50 0.20 ms, p99 1.00 ms
+10 MB: upload, download                                          8 ms (1252 MB/s), 6 ms (1744 MB/s)
+a query returning a file (and signing its link), over the socket 21 µs each

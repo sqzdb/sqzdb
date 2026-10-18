@@ -43,7 +43,13 @@ main { max-width:760px; margin:0 auto; padding:24px 20px 60px; display:flex; fle
 .compose { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; display:flex; flex-direction:column; gap:10px }
 .compose textarea { width:100%; min-height:72px; resize:vertical; padding:10px 11px; border-radius:8px; border:1px solid var(--line-2); background:var(--bg) }
 .compose .row { display:flex; align-items:center; gap:10px } .compose .row .hint { color:var(--text-3); font-size:12px; margin-right:auto }
+.chip { display:inline-flex; align-items:center; gap:6px; max-width:60%; padding:3px 6px 3px 10px; border-radius:999px; background:var(--raised); border:1px solid var(--line-2); font-size:12px; color:var(--text-2) }
+.chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap } .chip button { border:0; background:transparent; color:var(--text-3); cursor:pointer; padding:0 4px }
+.note .file { margin-top:8px } .note .file img { display:block; max-width:100%; max-height:260px; border-radius:8px; border:1px solid var(--line) }
+.note .file a { color:var(--text-2); font-size:13px } .note .file a:hover { color:var(--text) }
 .bar { display:flex; align-items:center; gap:12px } .bar .input { flex:1 } .count { color:var(--text-3); font-size:13px; white-space:nowrap }
+.toggle { height:36px; padding:0 12px; border-radius:7px; border:1px solid var(--line-2); background:var(--bg); color:var(--text-3); cursor:pointer; font-weight:600; white-space:nowrap }
+.toggle[aria-pressed=true] { color:var(--text); border-color:#5b616b; background:var(--raised) }
 .list { display:flex; flex-direction:column; gap:8px }
 .note { position:relative; padding:12px 14px; border-radius:10px; background:var(--panel); border:1px solid var(--line); transition:border-color .15s }
 .note:hover { border-color:var(--line-2) } .note.pinned { border-color:#4a4536; background:#1f1e1b }
@@ -89,11 +95,15 @@ details.how summary { cursor:pointer; color:var(--text-2) } details.how pre { wh
   <main>
     <form id="compose" class="compose">
       <label for="body" class="hidden">New note</label>
-      <textarea id="body" placeholder="Write a note… (Ctrl+Enter to save)" maxlength="1000" required></textarea>
-      <div class="row"><span class="hint">Open this page in a second window: notes appear in both.</span><button class="btn btn-primary" type="submit">Add note</button></div>
+      <textarea id="body" placeholder="Write a note… (Ctrl+Enter to save)" maxlength="1000"></textarea>
+      <div class="row"><span id="hint" class="hint">Open this page in a second window: notes appear in both. Paste an image to attach it.</span>
+        <span id="chip" class="chip hidden"><span id="chip-name"></span><button type="button" id="chip-x" aria-label="Remove the attachment">✕</button></span>
+        <input id="file" type="file" class="hidden"><button class="btn btn-ghost" type="button" id="attach" title="Attach a file" aria-label="Attach a file">📎</button>
+        <button class="btn btn-primary" type="submit">Add note</button></div>
       <div id="compose-err" class="err" role="alert"></div>
     </form>
-    <div class="bar"><input id="search" class="input" type="search" placeholder="Search notes" aria-label="Search notes"><span id="count" class="count"></span></div>
+    <div class="bar"><input id="search" class="input" type="search" placeholder="Search notes" aria-label="Search notes">
+      <button id="meaning" class="toggle hidden" type="button" aria-pressed="false" title="Search by meaning: the notes nearest to what you type, from their embeddings">≈ meaning</button><span id="count" class="count"></span></div>
     <div id="list" class="list" aria-live="polite"></div>
     <details class="how">
       <summary>How this page works</summary>

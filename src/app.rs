@@ -35,9 +35,9 @@
 //! files, commits that wait for their fsync or the bucket) runs on the runtime's blocking pool.
 use crate::config::Durability;
 use crate::live::{Event, Subscription};
-use crate::sql::{Plan, Prepared, Session, Sql};
+use crate::sql::{ColKind, Plan, Prepared, Session, Sql};
 use crate::table::{ColType, Value};
-use crate::util::{err_json, j_to_value, names, row_json, url_decode, value_json, Cols};
+use crate::util::{err_json, j_to_value, names, url_decode, value_json, Cols};
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
 use std::io;
@@ -69,7 +69,49 @@ const OUT_QUEUE: usize = 64;
 
 /// Shared by every connection of one listener. `hashing`: sign-ups and sign-ins running at once (a password hash
 /// takes 19 MB and a core); the rest wait here as tasks rather than as blocked threads.
-struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore }
+struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore, links: Arc<Links> }
+/// Links to files: signed with this database's key (`files/link.key`), under `base` (`app.publicUrl`, or none: a link
+/// relative to the API), and working for a `ttl`. A link's expiry is rounded to half the ttl, so the same file gets
+/// the same link for a while and browsers can cache it.
+struct Links { key: ring::hmac::Key, base: String, ttl: i64 }
+impl Links {
+    fn load(sql: &Sql) -> Result<Links, String> {
+        let dir = sql.files_dir(); let p = dir.join("link.key");
+        let key = match std::fs::read(&p) { Ok(k) if k.len() == 32 => k, _ => {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("files: {}: {e}", dir.display()))?;
+            let mut k = [0u8; 32]; getrandom::fill(&mut k).expect("random");
+            let mut o = std::fs::OpenOptions::new(); o.write(true).create(true).truncate(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; o.mode(0o600); }
+            o.open(&p).and_then(|mut f| { use std::io::Write; f.write_all(&k)?; f.sync_all() }).map_err(|e| format!("files: {}: {e}", p.display()))?;
+            k.to_vec()
+        } };
+        Ok(Links { key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key), base: sql.cfg.app.public_url.clone().unwrap_or_default(), ttl: sql.cfg.app.file_link_ttl.as_secs() as i64 })
+    }
+    fn sig(&self, id: &str, exp: i64) -> String { ring::hmac::sign(&self.key, format!("{id}.{exp}").as_bytes()).as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect() }
+    fn url(&self, id: &str) -> String { let half = (self.ttl / 2).max(1); let exp = (now_secs() / half + 2) * half; format!("{}/api/files/{id}?e={exp}&s={}", self.base, self.sig(id, exp)) }
+    /// Whether `e` and `s` are a link to `id` that still works.
+    fn check(&self, id: &str, e: &str, s: &str) -> bool { e.parse::<i64>().is_ok_and(|exp| exp >= now_secs() && crate::net::same_secret(self.sig(id, exp).as_bytes(), s.as_bytes())) }
+}
+fn now_secs() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
+/// A FILE value as a client sees it: `{id, name, type, size, url}` (a file that is gone is `{id, url: null}`).
+fn file_json(sql: &Sql, links: &Links, id: &str) -> J {
+    match sql.file_meta(id) { Some(m) => json!({"id": m.id, "name": m.name, "type": m.ctype, "size": m.size, "url": links.url(id)}), None => json!({"id": id, "url": null}) }
+}
+/// A result's columns as a client sees them: names, types, and which are FILE or VECTOR columns.
+struct Shape { cols: Cols, kinds: Vec<ColKind> }
+impl Shape {
+    fn of(sql: &Sql, p: &Prepared) -> Shape { let cols = sql.columns(p); let mut kinds = sql.column_kinds(p); kinds.resize(cols.len(), ColKind::Plain); Shape { cols, kinds } }
+    fn rows(&self, sql: &Sql, links: &Links, rows: &[Vec<Value>]) -> Vec<J> {
+        rows.iter().map(|r| J::Array(r.iter().enumerate().map(|(i, v)| match (v, self.kinds.get(i)) {
+            (Value::Text(id), Some(ColKind::File)) => file_json(sql, links, id),
+            // f32s as their shortest decimal (0.1, not 0.10000000149011612)
+            (Value::Bytes(b), Some(ColKind::Vector)) => J::Array(crate::table::vector_floats(b).map(|f| format!("{f}").parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(J::Number).unwrap_or(J::Null)).collect()),
+            _ => value_json(v, self.cols.get(i).and_then(|c| c.1.as_ref())),
+        }).collect())).collect()
+    }
+}
+/// Whether a statement may call the embeddings endpoint (`embed()`), so it runs off the runtime's threads.
+fn calls_embed(body: &[u8]) -> bool { body.windows(6).any(|w| w.eq_ignore_ascii_case(b"embed(")) }
 impl AppState {
     /// A token bucket per client address for sign-up, sign-in and code exchange: 10 at once, then one every 3 s.
     fn allow(&self, ip: IpAddr) -> bool {
@@ -97,8 +139,9 @@ pub fn start(sql: Arc<Sql>, addr: &str) -> Result<crate::net::Listener, String> 
         let l = { let _in = rt.enter(); tokio::net::TcpListener::from_std(l).map_err(|e| format!("app.tls.redirect {to}: {e}"))? };
         rt.spawn(crate::tls::redirect(l, hosts, Some(local.port()).filter(|p| *p != 443)));
     }
+    let links = Arc::new(Links::load(&sql)?);
     let weak = Arc::downgrade(&sql); drop(sql);
-    let st = Arc::new(AppState { limits: Default::default(), codes: Default::default(), hashing: tokio::sync::Semaphore::new(workers) });
+    let st = Arc::new(AppState { limits: Default::default(), codes: Default::default(), hashing: tokio::sync::Semaphore::new(workers), links });
     Ok(crate::net::spawn_listener(local, move |stop| {
         rt.block_on(async move {
             loop {
@@ -141,14 +184,24 @@ async fn read_req<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> io::Result<Opti
         if n >= MAX_HEADERS { return Err(io::Error::other("too many header lines")); }   // lines, not names: a repeated name must count too
         if let Some((k, v)) = h.split_once(':') { headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string()); }
     }
-    let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if len > MAX_BODY { return Err(io::Error::other("body too large")); }
-    let mut body = vec![0u8; len]; if len > 0 { r.read_exact(&mut body).await?; }
     let (path, q) = match target.split_once('?') { Some((p, q)) => (p.to_string(), q.to_string()), None => (target.clone(), String::new()) };
+    let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut body = vec![];
+    if !(method == "POST" && path == "/api/files") {   // an upload's body is the handler's to stream
+        if len > MAX_BODY { return Err(io::Error::other("body too large")); }
+        body = vec![0u8; len]; if len > 0 { r.read_exact(&mut body).await?; }
+    }
     let query = q.split('&').filter(|s| !s.is_empty()).map(|kv| { let (k, v) = kv.split_once('=').unwrap_or((kv, "")); (url_decode(k), url_decode(v)) }).collect();
     Ok(Some(Req { method, path, query, headers, body }))
 }
-fn reason(status: u16) -> &'static str { match status { 101 => "Switching Protocols", 200 => "OK", 204 => "No Content", 302 => "Found", 400 => "Bad Request", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed", 413 => "Payload Too Large", 429 => "Too Many Requests", _ => "Error" } }
+fn reason(status: u16) -> &'static str { match status { 101 => "Switching Protocols", 200 => "OK", 204 => "No Content", 206 => "Partial Content", 302 => "Found", 304 => "Not Modified", 400 => "Bad Request", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed", 411 => "Length Required", 413 => "Payload Too Large", 416 => "Range Not Satisfiable", 429 => "Too Many Requests", _ => "Error" } }
+/// A response's status line and headers, for a body sent after (`len` bytes).
+fn head(status: u16, ctype: &str, len: u64, extra: &[(String, String)]) -> Vec<u8> {
+    if extra.iter().any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n'])) { return respond(500, "text/plain", b"a response header with a line break", &[]); }
+    let mut out = format!("HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n", reason(status));
+    for (k, v) in extra { out.push_str(k); out.push_str(": "); out.push_str(v); out.push_str("\r\n"); }
+    out.push_str("\r\n"); out.into_bytes()
+}
 /// A whole response, written in one piece: a response in fragments waits on the peer's delayed ACK for each one.
 fn respond(status: u16, ctype: &str, body: &[u8], extra: &[(String, String)]) -> Vec<u8> {
     if extra.iter().any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n'])) { return respond(500, "text/plain", b"a response header with a line break", &[]); }
@@ -208,25 +261,25 @@ fn params_of(v: &J) -> Result<Vec<Value>, J> {
     Ok(a.iter().map(j_to_value).collect())
 }
 /// Run one client statement as `sess`: `{columns, rows}` (plus `lastInsertId` for an INSERT).
-fn run(sql: &Sql, sess: &mut Session, v: &J) -> Result<J, J> {
+fn run(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
     let p = client_statement(sql, v.get("sql").and_then(|s| s.as_str()).unwrap_or(""))?;
     let params = params_of(v)?;
     let rows = sql.execute_s(sess, &p, &params).map_err(err_json)?;
     let max = sql.cfg.app.max_rows;
     if rows.len() > max { return Err(json!({"error": format!("the result has more than {max} rows (app.maxRows); add a LIMIT"), "code": "ARGUMENTS"})); }
-    let cols = sql.columns(&p);
-    let mut out = json!({"columns": names(&cols), "rows": rows.iter().map(|r| row_json(&cols, r)).collect::<Vec<_>>()});
+    let shape = Shape::of(sql, &p);
+    let mut out = json!({"columns": names(&shape.cols), "rows": shape.rows(sql, links, &rows)});
     if matches!(p.plan, Plan::Insert { .. }) { out["lastInsertId"] = sess.last_insert_key.as_ref().map(|k| value_json(k, None)).unwrap_or(J::Null); }
     Ok(out)
 }
 /// Several statements in one transaction: all or none.
-fn run_batch(sql: &Sql, sess: &mut Session, v: &J) -> Result<J, J> {
+fn run_batch(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
     let list = v.get("statements").and_then(|s| s.as_array()).ok_or_else(|| json!({"error": "statements is an array of {sql, params}", "code": "ARGUMENTS"}))?;
     if list.len() > MAX_BATCH { return Err(json!({"error": format!("at most {MAX_BATCH} statements in a batch"), "code": "ARGUMENTS"})); }
     sql.exec_s(sess, "BEGIN", &[]).map_err(err_json)?;
     let mut results = vec![];
     for (i, st) in list.iter().enumerate() {
-        match run(sql, sess, st) { Ok(r) => results.push(r), Err(mut e) => { let _ = sql.exec_s(sess, "ROLLBACK", &[]); e["statement"] = json!(i); return Err(e); } }
+        match run(sql, links, sess, st) { Ok(r) => results.push(r), Err(mut e) => { let _ = sql.exec_s(sess, "ROLLBACK", &[]); e["statement"] = json!(i); return Err(e); } }
     }
     sql.exec_s(sess, "COMMIT", &[]).map_err(err_json)?;
     Ok(json!({"results": results}))
@@ -272,7 +325,7 @@ fn redirect(to: &str, cookies: &[String]) -> Vec<u8> {
 /// Requests whose handling can block a thread for a while: sign-in (password hashing; a provider's token exchange
 /// runs a runtime of its own), static files, and SQL when commits wait for their fsync or the bucket.
 fn blocks(sql: &Sql, req: &Req) -> bool {
-    !req.path.starts_with("/api/") || req.path.starts_with("/api/auth/") || (sql.cfg.durable != Durability::Visible && req.method == "POST")
+    !req.path.starts_with("/api/") || req.path.starts_with("/api/auth/") || (req.method == "POST" && (sql.cfg.durable != Durability::Visible || calls_embed(&req.body)))
 }
 
 /// One connection, plain or TLS: HTTP requests until it closes, or a WebSocket.
@@ -282,7 +335,9 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Weak<Sq
         let Ok(Ok(Some(req))) = timeout(IO_TIMEOUT, read_req(&mut r)).await else { return };
         let Some(sql) = weak.upgrade() else { return };
         let close = req.headers.get("connection").map(|c| c.eq_ignore_ascii_case("close")).unwrap_or(false);
-        if req.method == "GET" && req.path.trim_matches('/') == "api/socket" { drop(sql); return websocket(weak, r, w, req).await; }
+        if req.method == "GET" && req.path.trim_matches('/') == "api/socket" { drop(sql); return websocket(weak, r, w, req, st.links.clone()).await; }
+        if req.method == "POST" && req.path == "/api/files" { drop(sql); if !upload(&weak, &st, &mut r, &mut w, &req).await || close { return; } continue; }
+        if (req.method == "GET" || req.method == "HEAD") && req.path.starts_with("/api/files/") { drop(sql); if !download(&weak, &st, &mut w, &req).await || close { return; } continue; }
         let out = if blocks(&sql, &req) {
             let hashes = req.method == "POST" && req.path.starts_with("/api/auth/") && (req.path.ends_with("/sign-up") || req.path.ends_with("/sign-in"));
             let _turn = if hashes { st.hashing.acquire().await.ok() } else { None };
@@ -303,7 +358,7 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
     let path: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     match (req.method.as_str(), path.as_slice()) {
         ("OPTIONS", ["api", ..]) => { let mut h = h.clone(); h.extend([("Access-Control-Allow-Methods".into(), "GET, POST, OPTIONS".into()), ("Access-Control-Allow-Headers".into(), "Authorization, Content-Type".into()), ("Access-Control-Max-Age".into(), "600".into())]); respond(204, "text/plain", b"", &h) }
-        ("POST", ["api", op @ ("sql" | "batch")]) => reply(body_json(req).and_then(|v| { let mut s = session_for(sql, bearer(req).as_deref())?; if *op == "sql" { run(sql, &mut s, &v) } else { run_batch(sql, &mut s, &v) } })),
+        ("POST", ["api", op @ ("sql" | "batch")]) => reply(body_json(req).and_then(|v| { let mut s = session_for(sql, bearer(req).as_deref())?; if *op == "sql" { run(sql, &st.links, &mut s, &v) } else { run_batch(sql, &st.links, &mut s, &v) } })),
         ("GET", ["api", "me"]) => reply(session_for(sql, bearer(req).as_deref()).map(|s| json!({"user": J::Object(s.attrs.iter().map(|(k, v)| (k.clone(), value_json(v, None))).collect()), "roles": s.roles}))),
         ("GET", ["api", "auth", table, "methods"]) => reply(sql.auth_table_of(table).map_err(err_json).map(|_| {
             let providers: Vec<&String> = if sql.cfg.app.public_url.is_some() { sql.cfg.auth.oauth.keys().collect() } else { vec![] };
@@ -364,6 +419,97 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
     }
 }
 
+// ---------- files: uploads, and downloads through signed links ----------
+/// Write a whole response; false: the connection is done.
+async fn send<W: AsyncWrite + Unpin>(w: &mut W, out: Vec<u8>) -> bool { matches!(timeout(IO_TIMEOUT, w.write_all(&out)).await, Ok(Ok(()))) }
+/// After refusing an upload: read and drop the body the client is still sending (up to 64 MB, for up to 10 s), so
+/// it gets to read the answer instead of a reset connection; then the connection closes.
+async fn refuse_upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(r: &mut BufReader<R>, w: &mut W, out: Vec<u8>, len: Option<u64>) -> bool {
+    if send(w, out).await { if let Some(len) = len.filter(|&l| l <= 64 << 20) { let _ = timeout(Duration::from_secs(10), tokio::io::copy(&mut (&mut *r).take(len), &mut tokio::io::sink())).await; } }
+    false
+}
+/// `POST /api/files?name=<file name>`, the bytes as the body (`Content-Type` its type): a new file owned by the
+/// signed-in user, answered with the file as a query returns it. Streams to disk; false: the connection is done.
+async fn upload<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(weak: &Weak<Sql>, st: &AppState, r: &mut BufReader<R>, w: &mut W, req: &Req) -> bool {
+    let Some(sql) = weak.upgrade() else { return false };
+    let declared = req.headers.get("content-length").and_then(|v| v.parse::<u64>().ok());
+    let origin = match allowed_origin(&sql, req) { Ok(o) => o, Err(()) => return refuse_upload(r, w, json_resp(403, &json!({"error": "permission denied: this origin may not call the API (app.origins)", "code": "DENIED"}), &[]), declared).await };
+    let h = cors(&origin);
+    let Some(len) = declared else { return refuse_upload(r, w, json_resp(411, &json!({"error": "an upload needs a Content-Length", "code": "ARGUMENTS"}), &h), None).await };
+    let max = sql.cfg.app.file_max;
+    if len > max { return refuse_upload(r, w, json_resp(413, &json!({"error": format!("the file is larger than {max} bytes (app.files.maxSize)"), "code": "ARGUMENTS"}), &h), declared).await; }
+    let mut sess = Session::default();
+    let signed = match bearer(req) { Some(t) => sql.session_from_token(&mut sess, &t).map_err(err_json), None => Err(json!({"error": "session: sign in to upload files", "code": "AUTH"})) };
+    if let Err(e) = signed { return refuse_upload(r, w, json_resp(401, &e, &h), declared).await; }
+    let staged = match sql.file_staging() { Ok(p) => p, Err(e) => { send(w, json_resp(500, &err_json(e), &h)).await; return false } };
+    let copied = async {
+        use sha2::Digest;
+        let mut f = tokio::fs::File::create(&staged).await?; let mut hash = sha2::Sha256::new();
+        let (mut left, mut buf) = (len, vec![0u8; 64 << 10]);
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            let n = timeout(IO_TIMEOUT, r.read(&mut buf[..want])).await.map_err(|_| io::Error::other("the upload stalled"))??;
+            if n == 0 { return Err(io::Error::other("the upload ended early")); }
+            hash.update(&buf[..n]); f.write_all(&buf[..n]).await?; left -= n as u64;
+        }
+        if sql.db.durable { f.sync_all().await?; }
+        Ok::<[u8; 32], io::Error>(hash.finalize().into())
+    }.await;
+    let sha = match copied { Ok(sha) => sha, Err(_) => { let _ = std::fs::remove_file(&staged); return false } };   // the body is gone with the connection
+    let name = req.query.get("name").cloned().unwrap_or_else(|| "file".into());
+    let ctype = req.headers.get("content-type").cloned().unwrap_or_else(|| "application/octet-stream".into());
+    let added = { let (sql, links) = (sql.clone(), st.links.clone());
+        tokio::task::spawn_blocking(move || sql.file_add(&sess, &staged, &name, &ctype, len, sha).map(|m| file_json(&sql, &links, &m.id))).await };
+    let out = match added { Ok(Ok(v)) => json_resp(200, &v, &h), Ok(Err(e)) => json_resp(status_of(&err_json(e.clone())), &err_json(e), &h), Err(_) => json_resp(500, &json!({"error": "the upload failed", "code": "ERROR"}), &h) };
+    send(w, out).await
+}
+/// Types a browser may show in place (with nosniff and a sandbox): anything else downloads as an attachment, so a
+/// file can never be a page (HTML, SVG …) running on the API's origin.
+fn inline_type(t: &str) -> bool {
+    matches!(t, "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/bmp" | "application/pdf" | "text/plain") || t.starts_with("video/") || t.starts_with("audio/")
+}
+/// `GET /api/files/<id>?e=…&s=…`: the file, if the link is one a query handed out and still works. ETags, and
+/// single byte ranges (seeking in a video). False: the connection is done.
+async fn download<W: AsyncWrite + Unpin>(weak: &Weak<Sql>, st: &AppState, w: &mut W, req: &Req) -> bool {
+    let Some(sql) = weak.upgrade() else { return false };
+    let origin = allowed_origin(&sql, req).unwrap_or(None);   // a link is a capability: any page may show it, CORS only for allowed origins
+    let mut h = cors(&origin);
+    let id = req.path["/api/files/".len()..].to_string();
+    let q = |k: &str| req.query.get(k).map(String::as_str).unwrap_or("");
+    if !st.links.check(&id, q("e"), q("s")) { return send(w, json_resp(403, &json!({"error": "permission denied: this link is not one this server made, or it has expired; read the row again for a new one", "code": "DENIED"}), &h)).await; }
+    let Some(m) = sql.file_meta(&id) else { return send(w, json_resp(404, &json!({"error": "no such file", "code": "NOT_FOUND"}), &h)).await };
+    let etag = format!("\"{}\"", m.sha256[..16].iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let age = q("e").parse::<i64>().unwrap_or(0) - now_secs();
+    let disposition = if inline_type(&m.ctype) { "inline" } else { "attachment" };
+    h.extend([("ETag".into(), etag.clone()), ("Cache-Control".into(), format!("private, max-age={age}, immutable")), ("Accept-Ranges".into(), "bytes".into()),
+              ("Content-Disposition".into(), format!("{disposition}; filename*=UTF-8''{}", enc(&m.name))), ("Content-Security-Policy".into(), "default-src 'none'; sandbox".into()),
+              ("Cross-Origin-Resource-Policy".into(), "cross-origin".into())]);
+    if req.headers.get("if-none-match").is_some_and(|v| v.split(',').any(|t| t.trim() == etag)) { return send(w, head(304, &m.ctype, 0, &h)).await; }
+    let size = m.size as u64;
+    let range = req.headers.get("range").and_then(|r| r.strip_prefix("bytes=")).filter(|r| !r.contains(',')).map(|r| {
+        let (a, b) = r.split_once('-').unwrap_or((r, ""));
+        match (a.trim().parse::<u64>().ok(), b.trim().parse::<u64>().ok()) { (Some(a), Some(b)) => (a, b.min(size.saturating_sub(1))), (Some(a), None) => (a, size.saturating_sub(1)), (None, Some(n)) => (size.saturating_sub(n), size.saturating_sub(1)), _ => (1, 0) }
+    });
+    let (status, start, end) = match range {
+        None => (200, 0, size.saturating_sub(1)),
+        Some((a, b)) if a <= b && b < size => { h.push(("Content-Range".into(), format!("bytes {a}-{b}/{size}"))); (206, a, b) }
+        Some(_) => { h.push(("Content-Range".into(), format!("bytes */{size}"))); return send(w, head(416, "text/plain", 0, &h)).await; }
+    };
+    let len = if size == 0 { 0 } else { end - start + 1 };
+    if !send(w, head(status, &m.ctype, len, &h)).await || req.method == "HEAD" || len == 0 { return req.method == "HEAD" || len == 0; }
+    let streamed = async {
+        use tokio::io::AsyncSeekExt;
+        let mut f = tokio::fs::File::open(sql.file_path(&id)).await?; f.seek(std::io::SeekFrom::Start(start)).await?;
+        let (mut left, mut buf) = (len, vec![0u8; 64 << 10]);
+        while left > 0 {
+            let want = buf.len().min(left as usize); let n = f.read(&mut buf[..want]).await?; if n == 0 { return Err(io::Error::other("the file is shorter than its record")); }
+            timeout(IO_TIMEOUT, w.write_all(&buf[..n])).await.map_err(|_| io::Error::other("the client stalled"))??; left -= n as u64;
+        }
+        Ok::<(), io::Error>(())
+    }.await;
+    streamed.is_ok()
+}
+
 /// A file under `dir` (no `..`, no hidden files); a path without a file gets `index.html` (an app's own routes).
 fn static_file(dir: &std::path::Path, path: &str) -> Vec<u8> {
     let not_found = || respond(404, "text/plain", b"not found", &[]);
@@ -399,10 +545,10 @@ async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<(bool, u8, V
     Ok((fin, op, p))
 }
 /// A socket's state, shared by its reader (messages in) and its writer (replies, live results and pings out).
-struct Conn { sess: Mutex<Session>, signed_in: AtomicBool, lives: Mutex<HashMap<u64, (Subscription, Cols)>>, changed: Arc<Notify>, done: Notify }
+struct Conn { sess: Mutex<Session>, signed_in: AtomicBool, lives: Mutex<HashMap<u64, (Subscription, Shape)>>, changed: Arc<Notify>, done: Notify, sql: Weak<Sql>, links: Arc<Links> }
 enum Out { Text(J), Pong(Vec<u8>), Close(Vec<u8>) }
 
-async fn websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Weak<Sql>, mut r: BufReader<ReadHalf<S>>, mut w: WriteHalf<S>, req: Req) {
+async fn websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Weak<Sql>, mut r: BufReader<ReadHalf<S>>, mut w: WriteHalf<S>, req: Req, links: Arc<Links>) {
     let Some(sql) = weak.upgrade() else { return };
     let upgrade = req.headers.get("upgrade").map(|u| u.eq_ignore_ascii_case("websocket")).unwrap_or(false);
     let Some(key) = req.headers.get("sec-websocket-key").filter(|_| upgrade) else { let _ = w.write_all(&json_resp(400, &json!({"error": "expected a WebSocket upgrade", "code": "ARGUMENTS"}), &[])).await; return };
@@ -411,7 +557,7 @@ async fn websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Wea
     let s0 = anonymous_session(&sql); drop(sql);
     let hello = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", ws_accept(key));
     if !matches!(timeout(IO_TIMEOUT, w.write_all(hello.as_bytes())).await, Ok(Ok(()))) { return; }
-    let conn = Arc::new(Conn { signed_in: AtomicBool::new(s0.user.is_some()), sess: Mutex::new(s0), lives: Mutex::new(HashMap::new()), changed: Arc::new(Notify::new()), done: Notify::new() });
+    let conn = Arc::new(Conn { signed_in: AtomicBool::new(s0.user.is_some()), sess: Mutex::new(s0), lives: Mutex::new(HashMap::new()), changed: Arc::new(Notify::new()), done: Notify::new(), sql: weak.clone(), links });
     let (tx, rx) = mpsc::channel(OUT_QUEUE);
     let writer = tokio::spawn(write_loop(conn.clone(), w, rx));
     tokio::select! { _ = read_loop(&weak, &conn, &mut r, &tx) => {}, _ = conn.done.notified() => {} }
@@ -438,7 +584,7 @@ async fn read_loop<R: AsyncRead + Unpin>(weak: &Weak<Sql>, conn: &Arc<Conn>, r: 
         let Some(sql) = weak.upgrade() else { return Ok(()) };
         let (out, live) = match serde_json::from_slice::<J>(&msg) {
             Err(e) => (vec![json!({"error": format!("bad JSON: {e}"), "code": "ARGUMENTS"})], None),
-            Ok(v) if sql.cfg.durable != Durability::Visible => {   // a write may wait for its fsync: off the runtime's threads
+            Ok(v) if sql.cfg.durable != Durability::Visible || calls_embed(&msg) => {   // waits for an fsync or the embeddings endpoint: off the runtime's threads
                 let c = conn.clone();
                 let Ok(x) = tokio::task::spawn_blocking(move || message(&sql, &c, &v)).await else { return Err(io::Error::other("a message failed")) };
                 x
@@ -447,14 +593,14 @@ async fn read_loop<R: AsyncRead + Unpin>(weak: &Weak<Sql>, conn: &Arc<Conn>, r: 
         };
         for m in out { if tx.send(Out::Text(m)).await.is_err() { return Ok(()); } }
         // a new live query delivers changes only once its first result is queued, so no change can overtake it
-        if let Some((lid, sub, cols)) = live {
+        if let Some((lid, sub, shape)) = live {
             let n = conn.changed.clone(); let mut lives = conn.lives.lock().unwrap();
-            lives.insert(lid, (sub, cols)); lives[&lid].0.set_waker(Arc::new(move || n.notify_one()));
+            lives.insert(lid, (sub, shape)); lives[&lid].0.set_waker(Arc::new(move || n.notify_one()));
         }
     }
 }
 /// One message from a socket, run as its session: the replies, and a live query to deliver from once they are queued.
-fn message(sql: &Arc<Sql>, conn: &Conn, v: &J) -> (Vec<J>, Option<(u64, Subscription, Cols)>) {
+fn message(sql: &Arc<Sql>, conn: &Conn, v: &J) -> (Vec<J>, Option<(u64, Subscription, Shape)>) {
     let id = v.get("id").cloned().unwrap_or(J::Null);
     let reply = |mut out: J| -> J { out["id"] = id.clone(); out };
     let sign_in_first = || json!({"error": "session: sign in first", "code": "AUTH"});
@@ -479,23 +625,23 @@ fn message(sql: &Arc<Sql>, conn: &Conn, v: &J) -> (Vec<J>, Option<(u64, Subscrip
             }
         }
         op @ ("sql" | "batch") => {
-            let out = if !signed_in { Err(sign_in_first()) } else { let mut s = conn.sess.lock().unwrap(); if op == "sql" { run(sql, &mut s, v) } else { run_batch(sql, &mut s, v) } };
+            let out = if !signed_in { Err(sign_in_first()) } else { let mut s = conn.sess.lock().unwrap(); if op == "sql" { run(sql, &conn.links, &mut s, v) } else { run_batch(sql, &conn.links, &mut s, v) } };
             (vec![reply(out.unwrap_or_else(|e| e))], None)
         }
         "live" => {
-            let out = (|| -> Result<(J, u64, Subscription, Cols), J> {
+            let out = (|| -> Result<(J, u64, Subscription, Shape), J> {
                 if !signed_in { return Err(sign_in_first()); }
                 let lid = id.as_u64().ok_or_else(|| json!({"error": "a live query needs a numeric id", "code": "ARGUMENTS"}))?;
                 if conn.lives.lock().unwrap().len() >= MAX_LIVES { return Err(json!({"error": format!("at most {MAX_LIVES} live queries per connection"), "code": "ARGUMENTS"})); }
                 let p = client_statement(sql, v.get("sql").and_then(|s| s.as_str()).unwrap_or(""))?;
                 if !matches!(p.plan, Plan::Select(_)) { return Err(json!({"error": "a live query is a SELECT", "code": "ARGUMENTS"})); }
-                let params = params_of(v)?; let cols = sql.columns(&p);
+                let params = params_of(v)?; let shape = Shape::of(sql, &p);
                 let (sub, rows) = sql.reactor().watch(&conn.sess.lock().unwrap(), &p.text, &params).map_err(err_json)?;
                 if rows.len() > sql.cfg.app.max_rows { return Err(json!({"error": format!("the result has more than {} rows (app.maxRows); add a LIMIT", sql.cfg.app.max_rows), "code": "ARGUMENTS"})); }
-                let first = json!({"live": true, "initial": true, "columns": names(&cols), "rows": rows.iter().map(|r| row_json(&cols, r)).collect::<Vec<_>>()});
-                Ok((first, lid, sub, cols))
+                let first = json!({"live": true, "initial": true, "columns": names(&shape.cols), "rows": shape.rows(sql, &conn.links, &rows)});
+                Ok((first, lid, sub, shape))
             })();
-            match out { Ok((first, lid, sub, cols)) => (vec![reply(first)], Some((lid, sub, cols))), Err(e) => (vec![reply(e)], None) }
+            match out { Ok((first, lid, sub, shape)) => (vec![reply(first)], Some((lid, sub, shape))), Err(e) => (vec![reply(e)], None) }
         }
         "unlive" => { if let Some(lid) = id.as_u64() { conn.lives.lock().unwrap().remove(&lid); } (vec![reply(json!({"ok": true}))], None) }
         other => (vec![reply(json!({"error": format!("unknown op {other:?}: auth, sql, batch, live or unlive"), "code": "ARGUMENTS"}))], None),
@@ -524,11 +670,12 @@ async fn write_loop<W: AsyncWrite + Unpin + Send + 'static>(conn: Arc<Conn>, mut
 /// ended) ends, and the client makes it again.
 fn live_updates(conn: &Conn) -> Vec<J> {
     let mut out = vec![]; let mut ended = vec![];
+    let Some(sql) = conn.sql.upgrade() else { return out };
     let mut lives = conn.lives.lock().unwrap();
-    for (id, (sub, cols)) in lives.iter() {
+    for (id, (sub, shape)) in lives.iter() {
         let mut newest = None;
         while let Some(ev) = sub.try_recv() { match ev { Event::Live { seq, rows, .. } => newest = Some((seq, rows)), Event::Overflow { .. } => { ended.push(*id); break; } Event::Change(_) => {} } }
-        if let Some((seq, rows)) = newest { out.push(json!({"id": id, "live": true, "seq": seq, "columns": names(cols), "rows": rows.iter().map(|r| row_json(cols, r)).collect::<Vec<_>>()})); }
+        if let Some((seq, rows)) = newest { out.push(json!({"id": id, "live": true, "seq": seq, "columns": names(&shape.cols), "rows": shape.rows(&sql, &conn.links, &rows)})); }
     }
     for id in ended { lives.remove(&id); out.push(json!({"id": id, "ended": true, "reason": "the live query ended (signed out, the user changed, or it fell behind); make it again"})); }
     out
