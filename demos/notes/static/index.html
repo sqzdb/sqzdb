@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes · sqweezdb demo</title>
+<style>
+:root { --bg:#141518; --panel:#1b1d21; --raised:#212429; --hover:#272a30; --line:#2b2e34; --line-2:#383c43; --text:#e8eaed; --text-2:#b0b5bd; --text-3:#858b94;
+  --ok:#5cc98f; --warn:#e8b55c; --bad:#ff7070; --sans:system-ui,-apple-system,"Segoe UI","Helvetica Neue",sans-serif; --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace; color-scheme:dark }
+* { box-sizing:border-box } html, body { height:100% }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 var(--sans); -webkit-font-smoothing:antialiased }
+button, input, textarea { font:inherit; color:inherit }
+:focus-visible { outline:2px solid #9aa4b2; outline-offset:2px }
+.hidden { display:none !important }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; height:34px; padding:0 14px; border-radius:7px; border:1px solid var(--line-2); background:var(--raised); cursor:pointer }
+.btn:hover { background:var(--hover) } .btn:disabled { opacity:.5; cursor:default }
+.btn-primary { background:var(--text); color:var(--bg); border-color:var(--text); font-weight:600 } .btn-primary:hover { background:#fff }
+.btn-ghost { background:transparent; border-color:transparent; color:var(--text-2) } .btn-ghost:hover { color:var(--text); background:var(--hover) }
+.input { height:36px; padding:0 11px; border-radius:7px; border:1px solid var(--line-2); background:var(--bg); color:var(--text); min-width:0; width:100% }
+.input:focus, textarea:focus { outline:none; border-color:#5b616b; box-shadow:0 0 0 3px rgba(154,164,178,.18) }
+.err { color:var(--bad); font-size:13px; min-height:20px }
+code, .sql { font-family:var(--mono); font-size:12px }
+/* sign-in */
+.gate { min-height:100%; display:grid; place-items:center; padding:24px; background:radial-gradient(1000px 500px at 50% -10%, #23262c 0%, var(--bg) 60%) }
+.gate .box { width:min(380px,100%); background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:24px }
+.gate h1 { margin:0 0 2px; font-size:20px; letter-spacing:-.01em } .gate p { margin:0 0 18px; color:var(--text-3) }
+.gate form { display:flex; flex-direction:column; gap:10px }
+.tabs { display:flex; gap:4px; padding:3px; background:var(--bg); border:1px solid var(--line); border-radius:9px; margin-bottom:14px }
+.tabs button { flex:1; height:30px; border:0; border-radius:7px; background:transparent; color:var(--text-3); cursor:pointer; font-weight:600 }
+.tabs button[aria-selected=true] { background:var(--raised); color:var(--text) }
+.or { display:flex; align-items:center; gap:10px; margin:14px 0 10px; color:var(--text-3); font-size:12px } .or::before, .or::after { content:""; flex:1; height:1px; background:var(--line) }
+.providers { display:flex; flex-direction:column; gap:8px }
+/* app */
+.top { display:flex; align-items:center; gap:14px; height:56px; padding:0 20px; border-bottom:1px solid var(--line); background:var(--panel) }
+.brand { font-weight:800; letter-spacing:-.02em } .brand span { color:var(--text-3); font-weight:600 }
+.live { display:inline-flex; align-items:center; gap:7px; font-size:12px; font-weight:600; color:var(--text-3) }
+.live .dot { width:7px; height:7px; border-radius:50%; background:var(--text-3) }
+.live.on { color:var(--ok) } .live.on .dot { background:var(--ok); animation:pulse 1.6s infinite }
+.live.off { color:var(--bad) } .live.off .dot { background:var(--bad) }
+@keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(92,201,143,.55) } 70% { box-shadow:0 0 0 6px rgba(92,201,143,0) } 100% { box-shadow:0 0 0 0 rgba(92,201,143,0) } }
+.me { margin-left:auto; display:flex; align-items:center; gap:10px; color:var(--text-2); min-width:0 } .me span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+main { max-width:760px; margin:0 auto; padding:24px 20px 60px; display:flex; flex-direction:column; gap:16px }
+.compose { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; display:flex; flex-direction:column; gap:10px }
+.compose textarea { width:100%; min-height:72px; resize:vertical; padding:10px 11px; border-radius:8px; border:1px solid var(--line-2); background:var(--bg) }
+.compose .row { display:flex; align-items:center; gap:10px } .compose .row .hint { color:var(--text-3); font-size:12px; margin-right:auto }
+.bar { display:flex; align-items:center; gap:12px } .bar .input { flex:1 } .count { color:var(--text-3); font-size:13px; white-space:nowrap }
+.list { display:flex; flex-direction:column; gap:8px }
+.note { position:relative; padding:12px 14px; border-radius:10px; background:var(--panel); border:1px solid var(--line); transition:border-color .15s }
+.note:hover { border-color:var(--line-2) } .note.pinned { border-color:#4a4536; background:#1f1e1b }
+.note .t { padding-right:76px; white-space:pre-wrap; word-break:break-word }
+.note .m { margin-top:6px; color:var(--text-3); font-size:12px }
+.note .acts { position:absolute; top:8px; right:8px; display:flex; gap:2px; opacity:0 }
+.note:hover .acts, .note:focus-within .acts { opacity:1 }
+.note .acts button { width:28px; height:28px; border:0; border-radius:6px; background:transparent; color:var(--text-3); cursor:pointer }
+.note .acts button:hover { background:var(--hover); color:var(--text) } .note.pinned .acts .pin { color:var(--warn) }
+.note.flash { animation:flash 1.6s ease-out } @keyframes flash { 0% { background:rgba(92,201,143,.16); border-color:rgba(92,201,143,.6) } 100% {} }
+.empty { padding:40px 0; text-align:center; color:var(--text-3) }
+details.how { color:var(--text-3); font-size:13px; border-top:1px solid var(--line); padding-top:14px }
+details.how summary { cursor:pointer; color:var(--text-2) } details.how pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; color:var(--text-2) }
+@media (max-width:520px) { .top { padding:0 12px; gap:10px } .me span { display:none } main { padding:16px 12px 48px } }
+</style>
+</head>
+<body>
+<section id="gate" class="gate hidden" aria-label="Sign in">
+  <div class="box">
+    <h1>Notes</h1>
+    <p>Everything here runs in the browser: sign-in, SQL, live updates. The server is only sqweezdb.</p>
+    <div class="tabs" role="tablist">
+      <button id="tab-in" role="tab" aria-selected="true">Sign in</button>
+      <button id="tab-up" role="tab" aria-selected="false">Create account</button>
+    </div>
+    <form id="auth-form">
+      <input id="f-name" class="input hidden" placeholder="Name" autocomplete="name">
+      <input id="f-email" class="input" type="email" placeholder="Email" autocomplete="email" required>
+      <input id="f-password" class="input" type="password" placeholder="Password" autocomplete="current-password" required minlength="8">
+      <div id="auth-err" class="err" role="alert"></div>
+      <button id="auth-go" class="btn btn-primary" type="submit">Sign in</button>
+    </form>
+    <div id="providers-wrap" class="hidden"><div class="or">or</div><div id="providers" class="providers"></div></div>
+  </div>
+</section>
+
+<section id="app" class="hidden">
+  <header class="top">
+    <div class="brand">Notes <span>· sqweezdb</span></div>
+    <div id="live" class="live" title="The list is a live query: it changes when the data does, in every open window"><span class="dot"></span><span id="live-text">connecting</span></div>
+    <div class="me"><span id="me"></span><button id="sign-out" class="btn btn-ghost">Sign out</button></div>
+  </header>
+  <main>
+    <form id="compose" class="compose">
+      <label for="body" class="hidden">New note</label>
+      <textarea id="body" placeholder="Write a note… (Ctrl+Enter to save)" maxlength="1000" required></textarea>
+      <div class="row"><span class="hint">Open this page in a second window: notes appear in both.</span><button class="btn btn-primary" type="submit">Add note</button></div>
+      <div id="compose-err" class="err" role="alert"></div>
+    </form>
+    <div class="bar"><input id="search" class="input" type="search" placeholder="Search notes" aria-label="Search notes"><span id="count" class="count"></span></div>
+    <div id="list" class="list" aria-live="polite"></div>
+    <details class="how">
+      <summary>How this page works</summary>
+      <p>The page imports the client from its own server and runs SQL as the signed-in user. The database
+      allows each user their own notes only (<code>CREATE POLICY own ON notes … USING (owner = SESSION.id)</code>),
+      so the same SQL from another user's browser sees other rows. The list and the count are live queries:</p>
+      <pre id="sql-list"></pre><pre id="sql-count"></pre>
+    </details>
+  </main>
+</section>
+<script type="module" src="app.js"></script>
+</body>
+</html>

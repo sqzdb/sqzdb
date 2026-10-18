@@ -1,0 +1,6 @@
+API checks: ok
+SQL point read over the socket                                   p50 0.013 ms, p99 0.068 ms
+SQL point read over HTTP (fetch, keep-alive)                     p50 0.099 ms, p99 0.456 ms
+write on one device -> live query on another (writes 10 ms apart) p50 0.13 ms, p99 0.22 ms
+write on one device -> live query on another (writes back to back) p50 5.05 ms, p99 5.10 ms
+server memory: 1000 users signed up and connected, 2000 live queries 36 MB (17 MB before; 19 KB per user, their rows and session included)

@@ -4,7 +4,7 @@
 
 **An embedded SQL database for applications that outgrow SQLite.**<br>
 Concurrent writers, strict types, row-level security, live queries and continuous backup,<br>
-in a library inside your process and a directory on disk.
+in a library inside your process, or as the whole backend of a web or mobile app.
 
 [![CI](https://github.com/iluxav/sqweezdb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iluxav/sqweezdb/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/iluxav/sqweezdb?sort=semver)](https://github.com/iluxav/sqweezdb/releases/latest)
@@ -24,6 +24,10 @@ library in your process. It is written in Rust and adds what SQLite leaves to th
 writers at once, enforced column types, access control inside the engine, subscriptions to changes,
 schema changes without downtime, and backup to any S3-compatible bucket.
 
+It can also be the whole backend of a browser or mobile app. Users sign in and send SQL straight from
+the client, the row policies decide what each one sees and changes, any query can be live, and HTTPS
+with certificates from Let's Encrypt is built in. See [the app API](#the-app-api-sql-from-the-browser).
+
 > [!WARNING]
 > **Project status: experimental.** Every feature below exists and is covered by tests and benchmarks,
 > but the file format is not frozen, the APIs may change between releases, and the SQL dialect is
@@ -39,6 +43,7 @@ schema changes without downtime, and backup to any S3-compatible bucket.
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
 | **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
+| **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 17 KB. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
 | **Online schema changes** | `ALTER TABLE` adds, drops, renames or retypes a column while reads and writes continue. |
 | **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`. |
@@ -85,6 +90,17 @@ Compared with the tools usually paired with SQLite:
 | 1M rows in a backup bucket | 43 MB (Litestream) | **6 MB** |
 | Insert then delete 3M rows, one at a time | 614 s | **4.1 s** |
 
+As the backend of a browser app, against PocketBase 0.40.5 running the same notes app with the same
+rules ([`demos/notes`](demos/notes); PocketBase's range is with and without its request log):
+
+| Workload | PocketBase | sqweezdb |
+|---|---:|---:|
+| Notes created per second, 32 users writing at once | 5,774–8,364 | **38,941** |
+| Read one note over HTTP, p50 | 0.118–0.128 ms | **0.029 ms** |
+| A write on one device seen on another, p50 | 0.75–0.79 ms | **0.37 ms** |
+| Server memory with 1,000 devices connected | 158–251 MB | **42 MB** |
+| Writes per second while they are connected | 180–187 | **24,593** |
+
 Where the others are ahead or even: Turso matches sqweezdb on durable commits up to about 64 writers;
 SQLite reopens slightly faster, uses far less memory after a load, bulk-loads faster one row
 per call through a language binding, and finishes `ALTER TABLE` changes that only touch metadata
@@ -110,7 +126,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.5.1` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.6.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -508,6 +524,118 @@ app.get('/auth/google/callback', async (req, res) => {
   `auth.oauth_finish(provider, code, state, cookie)` returns `(token, user, created)`. In Go, use
   `Auth.OAuthStart` and `Auth.OAuthFinish`, configured with `Options.Auth`.
 
+### The app API: SQL from the browser
+
+A browser or mobile app can talk to the database directly: users sign in, and the app sends SQL. Every
+statement runs as the signed-in user under the row policies, so the rules live in the database and the
+app needs no server code of its own. Any `SELECT` can be live, joins and aggregates included: the client
+gets its rows at once and again whenever they change.
+
+```sh
+sqweezdb serve ./data --app 0.0.0.0:8080 --config app.toml
+```
+
+```toml
+# app.toml
+[app]
+origins   = ["https://app.example"]   # web pages that may call the API (its own origin always may)
+publicUrl = "https://api.example"     # where browsers reach it; needed for provider sign-in
+staticDir = "./dist"                  # optional: serve the app's files too
+
+[app.signUp]
+users = ["name"]                      # tables clients may make accounts in, and the columns they may set
+```
+
+```js
+import { connect } from 'https://api.example/api/client.js'   // the server hands out its client: no build step
+const db = connect('https://api.example')
+
+await db.auth.signUp({ email, name }, password)               // or signIn(email, password), or signInWith('google')
+await db.sql('INSERT INTO notes (owner, body) VALUES (?, ?)', [db.auth.user.id, text])
+db.live('SELECT id, body FROM notes ORDER BY created DESC LIMIT 20', (rows) => render(rows))   // her notes, kept current
+```
+
+The client (`clients/js`) runs in browsers, React Native and Node 22+. It keeps the session in
+`localStorage`, carries SQL and every live query over one WebSocket, and reconnects. Its calls are
+`auth.signUp`, `signIn`, `signInWith`, `signOut`, `onChange` and `methods` (whether sign-up is open, and
+which providers are configured), then `sql(text, params)`, `batch([[text, params], …])` for one
+transaction, `live(text, params, fn)` and `close()`. [`demos/notes`](demos/notes) is a whole app built this way.
+
+- **Statements:** `SELECT`, `INSERT`, `UPDATE` and `DELETE`, up to 64 KB and 1,000 parameters each. No
+  DDL, no grants, no `BEGIN`: a transaction is a `batch` of up to 100 statements, all or none. A result
+  has at most `app.maxRows` rows.
+- **Who is asking:** a request acts as the user its session token belongs to. Without a token it acts as
+  `app.anonymousRole`, or is refused with `AUTH`.
+- **Sign-up** works only in the tables `app.signUp` lists, and sets only the login column and the columns
+  listed there; the role column is never a client's to set. Other tables are sign-in only, by password or
+  by provider. Sign-up, sign-in and the code exchange are rate limited per client address: 10 at once,
+  then one every 3 seconds.
+- **Providers:** `signInWith('google')` sends the browser to the API, which sends it to Google. Google
+  sends it back to the API, which returns it to the app's page with a one-time code in the URL fragment. The
+  client trades the code for a session (once, within 60 seconds) and removes it from the address bar, so
+  a session token never sits in a URL. The page must be on `app.origins` or `app.publicUrl`.
+- **Origins:** browsers may call from the API's own origin and from `app.origins`. Requests and
+  WebSockets from other pages are refused.
+- **Live queries:** up to 64 per connection. They end when their session does, or when a change to the
+  user's row changes their role or attributes; the client then signs out or makes them again.
+
+| Endpoint | Returns |
+|---|---|
+| `POST /api/auth/<table>/sign-up` `{fields, password}` and `…/sign-in` `{login, password}` | `{token, user, created}` |
+| `GET /api/auth/<table>/oauth/<provider>?return=<url>` | the provider's sign-in page |
+| `POST /api/auth/exchange` `{code}` | `{token, user, created}`, for the code a provider sign-in returned |
+| `POST /api/auth/sign-out`, `GET /api/me`, `GET /api/auth/<table>/methods` | |
+| `POST /api/sql` `{sql, params}` and `POST /api/batch` `{statements}` | `{columns, rows}`, and `lastInsertId` for an `INSERT` |
+| `GET /api/socket` | a WebSocket of JSON messages: `auth`, `sql`, `batch`, `live` and `unlive` |
+| `GET /api/client.js` | the JavaScript client |
+
+Requests carry the session as `Authorization: Bearer <token>`. Errors are `{error, code}` with the
+[codes below](#error-codes), with HTTP status 401 for `AUTH`, 403 for `DENIED`, 429 for `RATE_LIMITED`
+and 400 otherwise.
+
+Connections are tasks on a small runtime, not threads. A connected user with two live queries costs the
+server about 17 KB, and a write reaches another device's live query in about 0.1 ms, or within
+`live.debounce` when writes come back to back (E58, E59).
+
+#### HTTPS, with certificates from Let's Encrypt
+
+Give the app API its domain and it serves https and wss with a certificate from Let's Encrypt, renewed
+automatically, the way Caddy does. No proxy is needed in front.
+
+```sh
+sudo setcap cap_net_bind_service=+ep "$(command -v sqweezdb)"   # once: bind port 443 without root
+sqweezdb serve ./data --app 0.0.0.0:443 --domain api.example.com --email ops@example.com
+```
+
+```toml
+[app.tls]
+domains  = ["api.example.com"]      # their DNS points at this server
+email    = "ops@example.com"        # optional: the CA's notices
+redirect = "0.0.0.0:80"             # optional: send http:// visitors to https://
+# cert = "/etc/ssl/api.pem"         # or your own certificate and key (PEM) instead of domains
+# key  = "/etc/ssl/api.key"
+# acme = "https://acme-staging-v02.api.letsencrypt.org/directory"   # another CA: staging, ZeroSSL, your own
+```
+
+- The CA checks the domains over TLS-ALPN-01 on port 443 itself, so port 80 can stay closed. The domains
+  must resolve to this server, and port 443 must reach it.
+- The first certificate arrives a second or so after start (1 s against Let's Encrypt's test CA here);
+  until then https connections fail. A restart serves the stored certificate at once.
+- Renewal starts with a third of the certificate's lifetime left (30 days of Let's Encrypt's 90). A failed
+  attempt is retried after a minute, then less often, up to every hour, while the current certificate keeps
+  serving. Progress goes to stderr as `tls: …`.
+- The account key and the certificate are kept in the database directory's `tls/` (or `app.tls.dir`),
+  readable only by the owner. Losing them only means getting a new certificate.
+- Setting `domains` agrees to the CA's terms (for Let's Encrypt, its Subscriber Agreement).
+- `app.publicUrl` defaults to `https://` and the first domain.
+- TLS costs about 10 KB more per connected device (27 KB with two live queries), and requests take as long
+  as without it (E60).
+- Wildcard and IP-address certificates aren't supported: they need DNS challenges, or a CA profile this
+  doesn't ask for.
+
+**Not built yet:** a trusted-proxy setting (behind a proxy, the sign-in rate limit sees every user as the
+proxy's address), HTTP/2, files and vectors as columns, email verification and password reset.
+
 ### Backup, restore and replication
 
 Everything is built on the change log, so backups never pause the database.
@@ -530,12 +658,14 @@ Everything is built on the change log, so backups never pause the database.
 
 ```sh
 sqweezdb serve ./data/shop --ui 127.0.0.1:7780 --tcp 0.0.0.0:7781   # own a database, serve it
+sqweezdb serve ./data/shop --app 0.0.0.0:8080 --config app.toml     # … to browsers and mobile apps
+sqweezdb serve ./data/shop --app 0.0.0.0:443 --domain api.shop.com   # … over https, certificate from Let's Encrypt
 sqweezdb shell ./data/shop                                          # SQL in the terminal
 sqweezdb shell db.internal:7781 --token …                           # the same against a running server
 ```
 
 `serve` owns a directory and starts what you ask for: a Unix socket, TCP, backup, the snapshot policy,
-and with `--ui` a web console. Every console request needs the token; without `--token`, one is
+with `--ui` a web console, and with `--app` [the app API](#the-app-api-sql-from-the-browser). Every console request needs the token; without `--token`, one is
 generated and printed once. `Ctrl-C` stops cleanly, writing a final snapshot so the next start is
 instant.
 
@@ -596,7 +726,21 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `snapshot.idleAfter` | `30s` | Snapshot after this long without writes. |
 | `listen.socket` / `tcp` / `http` | none | A Unix socket, a TCP listener, and the web console. |
 | `listen.token` | none | The shared secret for TCP and the console; required when either is on. The `sqweezdb` command generates one if you don't pass `--token`. |
-| `live.debounce` | `5ms` | How long a live query waits to batch changes before re-running. |
+| `listen.app` | none | The app API for browsers and mobile apps (`--app`). Users sign in; no shared token. See [the app API](#the-app-api-sql-from-the-browser). |
+| `app.origins` | `[]` | Web origins whose pages may call the app API, besides its own. `"*"` allows any. |
+| `app.publicUrl` | none | The URL the app API is reached at. Needed for provider sign-in. |
+| `app.signUp.<table>` | none | A table clients may make accounts in, and the columns they may set besides the login. Tables not listed are sign-in only. |
+| `app.anonymousRole` | none | The role of a request without a session. Without it, such requests are refused. |
+| `app.maxRows` | `10000` | The most rows one result for a client may have. |
+| `app.staticDir` | none | Files to serve beside the API (the app itself), with `index.html` for paths without a file. |
+| `app.tls.domains` | none | Serve https with a certificate for these names from the CA (`--domain`), renewed automatically. See [HTTPS](#https-with-certificates-from-lets-encrypt). |
+| `app.tls.email` | none | The contact on the CA account, for its notices (`--email`). |
+| `app.tls.cert` / `key` | none | Your own certificate chain and key (PEM files), instead of `domains`. |
+| `app.tls.acme` | Let's Encrypt | The directory URL of another ACME CA. |
+| `app.tls.acmeRoot` | none | A root certificate (PEM) to trust for the CA's own connection: a private or test CA. |
+| `app.tls.dir` | `<database>/tls` | Where the account key and the certificate are kept. |
+| `app.tls.redirect` | none | An address, such as `0.0.0.0:80`, where plain HTTP is sent on to https. |
+| `live.debounce` | `5ms` | The shortest time between two re-runs of a live query. A change re-runs it at once; more changes within this time are batched into one re-run. |
 | `live.queue` | `65536` | Events a subscriber may fall behind before it is dropped. |
 | `log.threadsIdleAfter` | off | Let log threads exit when idle; for many idle databases in one process. |
 | `auth.sessionTtl` | `30d` | How long a session from sign-in lasts. At least `60s`. |
@@ -711,9 +855,11 @@ Every binding reports errors with a stable code. In Node it is `err.code` on a `
 | `CONFLICT` | A concurrent transaction changed the same rows; retry. |
 | `NOT_FOUND` | An `UPDATE` by primary key found no row. |
 | `TRANSACTION` | `BEGIN` inside a transaction, or `COMMIT` outside one. |
-| `ARGUMENTS` | Too few parameters for the statement. |
+| `ARGUMENTS` | Too few parameters for the statement, or a request the app API can't take: bad JSON, too large, or a result over `app.maxRows`. |
 | `PATH` | The path is a file, or a directory that isn't a database. |
 | `CONFIG` | An invalid or unknown option. |
+| `RATE_LIMITED` | The app API: too many sign-ins or sign-ups from one address; wait a few seconds. |
+| `CLOSED` | The JavaScript client: the connection closed with the request unanswered. |
 | `ERROR` | Anything else. |
 
 ## How it works
@@ -733,13 +879,17 @@ shared-memory ring for reads of about 0.6 µs, or connect over TCP with a token.
 
 ## Demos
 
-Two Go apps on the Go binding, each benchmarked against the same app on PocketBase:
+Three apps, each benchmarked against the same app on PocketBase 0.40.5:
 
-- [`demos/boards`](demos/boards): a multi-tenant task board. The tenant rule is a row policy, each
+- [`demos/notes`](demos/notes): notes with no server code at all. The page signs in and runs SQL through
+  the app API, the list is a live query, and who sees what is a row policy. It made 4.7 to 6.7 times
+  PocketBase's writes, answered a read in a quarter of the time, and held 1,000 connected devices in
+  42 MB, where PocketBase used 158 to 251 MB.
+- [`demos/boards`](demos/boards) (Go): a multi-tenant task board. The tenant rule is a row policy, each
   request runs as the signed-in member, and live updates are one subscription per organization. Against
   PocketBase 0.40.5 it handled 11 to 12 times the card inserts, and live updates took 1 ms instead of 33 ms (p50,
   1,000 browsers).
-- [`demos/agents`](demos/agents): a database per AI agent, created in a quarter of a millisecond, closed
+- [`demos/agents`](demos/agents) (Go): a database per AI agent, created in a quarter of a millisecond, closed
   when idle and forgotten by deleting its directory; also compared with SQLite and Turso at 10,000
   agents. Its README lists where it is behind as well: fixed-width text makes long memories expensive,
   and there is no text or vector search yet.
@@ -766,6 +916,9 @@ console is the default `ui` feature; build with `--no-default-features` for the 
 - `src/table.rs`: storage, log, snapshots and recovery
 - `src/sql.rs`: parser, planner, executor, access control and the change feed
 - `src/live.rs`: subscriptions and live queries
+- `src/auth.rs`, `src/oauth.rs`: sign-in, sessions and OAuth providers
+- `src/app.rs`: the app API for browsers and mobile apps
+- `src/tls.rs`: HTTPS, and certificates from Let's Encrypt or another ACME CA
 - `src/cloud.rs`: S3 backup, compression and encryption
 - `src/net.rs`: the socket, shared-memory ring and TCP server
 - `src/config.rs`: options, configuration files and validation
@@ -774,13 +927,15 @@ console is the default `ui` feature; build with `--no-default-features` for the 
 - `src/capi.rs`: the C ABI
 - `src/tenants.rs`: many databases in one process
 - `bindings/`: Node, Python and Go
+- `clients/js`: the JavaScript client for the app API
+- `demos/`: example apps, each with a benchmark against PocketBase
 
 Design decisions are made with benchmarks. The programs in `src/bin/` race sqweezdb against SQLite and
 Turso on the same machine, one question each; their outputs are in `results/`. They need the `lab`
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.5.1`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.6.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

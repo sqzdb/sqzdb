@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0 — 2026-10-18
+
+### Added
+- **The app API: SQL from the browser** (`listen.app`, `sqweezdb serve --app <addr>`). Browsers and mobile
+  apps sign up and sign in (password, or a provider through browser redirects) and send SQL that runs as the
+  signed-in user, under the row policies. Any `SELECT` can be live over one WebSocket. Clients may send
+  `SELECT`, `INSERT`, `UPDATE` and `DELETE`, and transactions as batches. Results are capped by
+  `app.maxRows`. Accounts can be made only in the tables `app.signUp` lists, with the columns listed there.
+  New settings: `app.origins`, `app.publicUrl`, `app.signUp`, `app.anonymousRole`, `app.maxRows` and
+  `app.staticDir`. See the README's "The app API".
+- **A JavaScript client** (`clients/js`) for browsers, React Native and Node 22+: `connect(url)`, `auth.signUp`,
+  `signIn`, `signInWith`, `signOut`, `onChange`, `methods`, `sql`, `batch`, `live`. The server also serves it
+  at `/api/client.js`.
+- **`demos/notes`**: a notes app with no server code, and a benchmark of it against PocketBase 0.40.5.
+- **HTTPS for the app API, with certificates from Let's Encrypt** (`app.tls`, `sqweezdb serve --domain`). The
+  certificate for `app.tls.domains` is requested at start and renewed in the background with a third of its
+  lifetime left, as Caddy does. The CA checks the domains over TLS-ALPN-01 on port 443 itself, so port 80 isn't
+  needed; `app.tls.redirect` sends plain HTTP on to https. Your own certificate works too (`cert` and `key`),
+  and so does another ACME CA (`acme`, `acmeRoot`).
+- `sqweezdb serve` raises its open-files limit to the system's hard limit, for many connected users.
+
+### Changed
+- `live.debounce` is now the shortest time between two re-runs of a live query, not a wait before each one.
+  A change re-runs it at once (about 0.1 ms to another device, was 5 ms), and changes within the next
+  `live.debounce` are batched.
+
+### Fixed
+- A live query could miss a write that came in just as it re-ran: the write was in the log a moment before
+  its row was visible. It was rare with the old 5 ms wait.
+- With `durable` on, live queries kept a core partly busy (20% at 100 writes/s) while each commit synced.
+- After sign-ins, up to 19 MiB per thread that had hashed a password stayed allocated. Password hashing now
+  uses memory of its own and returns it. Stored hashes are unchanged.
+- `sqweezdb shell` reading a file: a `--` comment line swallowed the statement after it.
+
 ## 0.5.1 — 2026-10-18
 
 **Upgrade from 0.5.0 if you use provider sign-in.** This changes its API (see Changed).

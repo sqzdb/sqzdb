@@ -1,0 +1,22 @@
+# The notes app's server settings. From demos/notes:  sqweezdb serve ./data --config notes.toml
+[listen]
+app = "127.0.0.1:8075"          # the app API, and the page from staticDir
+
+[app]
+staticDir = "static"
+# publicUrl = "http://127.0.0.1:8075"   # the URL a provider sends the browser back to; needed for provider sign-in
+
+[app.signUp]
+users = ["name"]                # anyone may make an account: their email (the login column) and their name
+
+# Sign-in with Google: make an OAuth client (a web application) whose redirect URI is
+# http://127.0.0.1:8075/api/auth/users/oauth/google/callback, set publicUrl above, and fill in:
+# [auth.oauth.google]
+# clientId = "....apps.googleusercontent.com"
+# clientSecret = "..."
+
+# Over https on a server of your own: point a domain at it, then run with --app 0.0.0.0:443 and
+# [app.tls]
+# domains = ["notes.example.com"]   # a certificate from Let's Encrypt, renewed automatically
+# email = "you@example.com"
+# redirect = "0.0.0.0:80"           # http:// to https://

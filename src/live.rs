@@ -17,13 +17,25 @@ pub enum Event {
     /// The subscriber fell more than `cap` events behind and was dropped; resubscribe (a feed from `last_seq` recovers everything).
     Overflow { last_seq: u64 },
 }
-pub struct Queue { items: Mutex<VecDeque<Event>>, cv: Condvar, cap: usize, pub closed: AtomicBool, pub delivered: AtomicU64 }
+pub struct Queue { items: Mutex<VecDeque<Event>>, cv: Condvar, cap: usize, pub closed: AtomicBool, pub delivered: AtomicU64, waker: Mutex<Option<Wake>> }
 impl Queue {
-    fn push(&self, e: Event) -> bool { let mut q = self.items.lock().unwrap(); if q.len() >= self.cap { return false; } q.push_back(e); self.delivered.fetch_add(1, Ordering::Relaxed); self.cv.notify_one(); true }
+    fn push(&self, e: Event) -> bool {
+        { let mut q = self.items.lock().unwrap(); if q.len() >= self.cap { return false; } q.push_back(e); self.delivered.fetch_add(1, Ordering::Relaxed); self.cv.notify_one(); }
+        if let Some(w) = self.waker.lock().unwrap().as_ref() { w(); }
+        true
+    }
+    fn new(cap: usize) -> Queue { Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), cap, closed: AtomicBool::new(false), delivered: AtomicU64::new(0), waker: Mutex::new(None) } }
 }
+/// How long the reactor waits for writes it has read to finish publishing before re-running anyway (and again later).
+const SETTLE_WAIT: Duration = Duration::from_micros(200);
+const SETTLE_RETRY: Duration = Duration::from_millis(1);
+/// Called on every event of the subscriptions it is set on: one waiter for many of them (a connection's live queries).
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// A subscriber's handle: pop events; dropping it unsubscribes.
 pub struct Subscription { pub q: Arc<Queue> }
 impl Subscription {
+    /// Wake `w` on every event from now on (events already queued are found by the next `try_recv`).
+    pub fn set_waker(&self, w: Wake) { *self.q.waker.lock().unwrap() = Some(w.clone()); if !self.q.items.lock().unwrap().is_empty() { w(); } }
     pub fn try_recv(&self) -> Option<Event> { self.q.items.lock().unwrap().pop_front() }
     pub fn recv_timeout(&self, d: Duration) -> Option<Event> { let mut q = self.q.items.lock().unwrap(); if q.is_empty() { let (g, _) = self.q.cv.wait_timeout(q, d).unwrap(); q = g; } q.pop_front() }
     pub fn pending(&self) -> usize { self.q.items.lock().unwrap().len() }
@@ -34,7 +46,17 @@ impl Drop for Subscription { fn drop(&mut self) { self.q.closed.store(true, Orde
 struct Sub { table: u16, preds: Vec<CPred>, policies: Vec<CPred>, q: Arc<Queue>, key: Option<(usize, i64)>, since: u64,
     /// For a session from a sign-in token: its identity, checked again whenever sign-in state changes.
     ident: Option<Session> }
-struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<(usize, ColType)>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, q: Arc<Queue> }
+struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<(usize, ColType)>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, last_run: Option<Instant>,
+    /// its last re-run started while writes were still publishing, so it runs again (at least SETTLE_RETRY later)
+    retry: bool, q: Arc<Queue> }
+impl Live {
+    /// When a changed live query runs again: at once if it hasn't run within `debounce`, else `debounce` after its
+    /// last run. A lone write is seen without waiting; a burst costs one re-run per `debounce`.
+    fn due(&self, debounce: Duration) -> Option<Instant> {
+        let d = self.dirty_since?; let gap = if self.retry { debounce.max(SETTLE_RETRY) } else { debounce };
+        Some(self.last_run.map_or(d, |r| d.max(r + gap)))
+    }
+}
 /// Subscriptions whose filter is `col = constant` on an INT column are indexed by (table, column, value): a record
 /// reaches them through one hash lookup per indexed column instead of a scan over every subscriber.
 #[derive(Default)] struct State { subs: Vec<Sub>, lives: Vec<Live>, keyed: HashMap<(u16, usize, i64), Vec<usize>>, key_cols: HashMap<u16, Vec<usize>>, general: HashMap<u16, Vec<usize>> }
@@ -86,13 +108,13 @@ impl Reactor {
         if let Some(h) = h { if h.thread().id() != std::thread::current().id() { h.join().ok(); } }
     }
     fn run(&self, start: u64) {
-        let mut feed = { let Some(sql) = self.sql.upgrade() else { return }; sql.subscribe(start) };
+        let (mut feed, durable_only) = { let Some(sql) = self.sql.upgrade() else { return }; (sql.subscribe(start), sql.db.durable) };
         let mut auth_seen = { let Some(sql) = self.sql.upgrade() else { return }; sql.auth_epoch() };
         loop {
             if self.stop.load(Ordering::Relaxed) { return; }
             // sleep until something is appended, or until a dirty query is due
-            let due = { let st = self.state.lock().unwrap(); st.lives.iter().filter_map(|l| l.dirty_since).map(|d| (d + self.debounce).saturating_duration_since(Instant::now())).min() };
-            self.log.wait_feed(feed.last_seq(), due.unwrap_or(Duration::from_millis(20)).min(Duration::from_millis(20)));
+            let due = { let st = self.state.lock().unwrap(); st.lives.iter().filter_map(|l| l.due(self.debounce)).map(|d| d.saturating_duration_since(Instant::now())).min() };
+            self.log.wait_feed(feed.last_seq(), durable_only, due.unwrap_or(Duration::from_millis(20)).min(Duration::from_millis(20)));
             let Some(sql) = self.sql.upgrade() else { return };   // the database is gone
             let recs = feed.poll_raw(); let now = Instant::now();
             // sign-in state changed: a subscription or live query whose token no longer holds, or whose identity changed
@@ -138,17 +160,21 @@ impl Reactor {
                 }
                 let before = st.subs.len(); st.subs.retain(|s| !s.q.closed.load(Ordering::Relaxed)); if st.subs.len() != before { st.reindex(); } st.lives.retain(|l| !l.q.closed.load(Ordering::Relaxed));
             }
-            // re-run the live queries whose debounce has passed
+            // re-run the changed live queries that are due. A write is in the log before its rows are visible: a
+            // re-run counts only if none was in between (it saw every write that changed it); else it runs again
             let mut st = self.state.lock().unwrap();
+            let settled = st.lives.iter().any(|l| l.due(self.debounce).is_some_and(|d| now >= d)) && {
+                let t = Instant::now(); loop { if self.log.settled() { break true; } if t.elapsed() > SETTLE_WAIT { break false; } std::thread::yield_now(); }
+            };
             for live in st.lives.iter_mut() {
-                let Some(d) = live.dirty_since else { continue }; if now.saturating_duration_since(d) < self.debounce { continue; }
-                let t0 = Instant::now();
+                let Some(due) = live.due(self.debounce) else { continue }; if now < due { continue; }
+                let t0 = Instant::now(); live.last_run = Some(t0);
                 let rows = match sql.execute_s(&mut live.sess, &live.prepared, &live.params) { Ok(r) => r, Err(_) => {
                     // a session from a token that no longer holds ends the live query (the client sees it dropped)
                     if live.sess.token.is_some() { let _ = live.q.push(Event::Overflow { last_seq: self.last_seq.load(Ordering::Relaxed) }); live.q.closed.store(true, Ordering::Relaxed); }
                     live.dirty_since = None; continue; } };
                 self.reruns.fetch_add(1, Ordering::Relaxed); self.rerun_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-                live.dirty_since = None;
+                live.retry = !settled; if settled { live.dirty_since = None; }
                 if rows != live.result {
                     let (added, removed) = match live.key_col.clone() { Some(kc) => { let kc = Some(kc); let old: HashSet<crate::table::Key> = live.keys.clone(); let new: HashSet<crate::table::Key> = rows.iter().filter_map(|r| key_of(r, &kc)).collect(); (rows.iter().filter(|r| key_of(r, &kc).map(|k| !old.contains(&k)).unwrap_or(true)).cloned().collect(), live.result.iter().filter(|r| key_of(r, &kc).map(|k| !new.contains(&k)).unwrap_or(true)).cloned().collect()) } None => (rows.clone(), live.result.clone()) };
                     live.keys = rows.iter().filter_map(|r| key_of(r, &live.key_col)).collect();
@@ -170,7 +196,7 @@ impl Reactor {
         // an equality on an INT column with a constant makes the subscription indexable
         let key = { let mut all: Vec<Pred> = sp.preds.clone(); match &sp.access { Access::Pk(e) => all.push(Pred { col: sp.table.schema.pk, cmp: Cmp::Eq, rhs: e.clone() }), Access::Index(ix, e) => all.push(Pred { col: ix.col, cmp: Cmp::Eq, rhs: e.clone() }), _ => {} }
             all.iter().find_map(|p| if p.cmp == Cmp::Eq && sp.table.schema.columns[p.col].ty == crate::table::ColType::Int { match &p.rhs { Expr::Lit(Value::Int(v)) => Some((p.col, *v)), Expr::Param(i) => match params.get(*i) { Some(Value::Int(v)) => Some((p.col, *v)), _ => None }, _ => None } } else { None }) };
-        let q = Arc::new(Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), cap: sql.cfg.live.queue, closed: AtomicBool::new(false), delivered: AtomicU64::new(0) });
+        let q = Arc::new(Queue::new(sql.cfg.live.queue));
         { let mut st = self.state.lock().unwrap(); st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)) }); st.reindex(); }
         Ok(Subscription { q })
     }
@@ -183,11 +209,46 @@ impl Reactor {
         let single = if sp.join.is_none() && sp.subs.is_empty() { Some((sp.table.id, plan_preds(&sql, sess, sp, params)?, sql.guard(sess, &sp.table, P_SELECT)?)) } else { None };
         let key_col = if sp.join.is_none() && sp.post.is_none() { sp.proj.iter().position(|pr| matches!(pr, Proj::Col(c) if *c == sp.table.schema.pk)).map(|i| (i, sp.table.schema.columns[sp.table.schema.pk].ty.clone())) } else { None };
         let mut s = session_like(sess); let result = sql.execute_s(&mut s, &p, params)?;
-        let q = Arc::new(Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), cap: 4096, closed: AtomicBool::new(false), delivered: AtomicU64::new(0) });
+        let q = Arc::new(Queue::new(4096));
         let keys = result.iter().filter_map(|r| key_of(r, &key_col)).collect();
-        self.state.lock().unwrap().lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables, single, key_col, result: result.clone(), keys, dirty_since: None, q: q.clone() });
+        self.state.lock().unwrap().lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables, single, key_col, result: result.clone(), keys, dirty_since: None, last_run: None, retry: false, q: q.clone() });
         Ok((Subscription { q }, result))
     }
     pub fn counts(&self) -> (usize, usize) { let st = self.state.lock().unwrap(); (st.subs.len(), st.lives.len()) }
 }
 impl Drop for Reactor { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); self.log.feeds.fetch_sub(1, Ordering::Relaxed); } }
+
+#[cfg(test)]
+mod tests {
+    use super::Event;
+    use crate::config::Config;
+    use crate::sql::{Session, Sql};
+    use crate::table::{encode_row, Value, OP_INSERT};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// A write is in the log (where the reactor reads it) a moment before its row is visible. A re-run in that moment
+    /// sees the old result; the live query must not count as fresh then, or the write never reaches it.
+    #[test] fn a_live_query_sees_a_write_whose_row_appears_after_its_log_record() {
+        let d = std::env::temp_dir().join(format!("sqweezdb-live-{}-settle", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let mut cfg = Config::default(); cfg.live.debounce = Duration::ZERO;
+        let s = Sql::open_with(&d, cfg).unwrap(); let mut sess = Session::default();
+        s.exec_s(&mut sess, "CREATE TABLE t (id INT PRIMARY KEY, v INT)", &[]).unwrap();
+        let (sub, _) = s.reactor().watch(&sess, "SELECT count(*) FROM t", &[]).unwrap();
+        // a writer stopped between logging its row and publishing it
+        let t = s.db.table("t").unwrap(); let row = encode_row(&t.schema, &[Value::Int(1), Value::Int(7)]).unwrap();
+        let seq = s.db.log.append(OP_INSERT, t.id, &row);
+        let waited = Instant::now(); while s.reactor().reruns.load(Ordering::Relaxed) == 0 { assert!(waited.elapsed() < Duration::from_secs(2), "the reactor never ran the query"); std::thread::yield_now(); }
+        // the writer goes on: the row appears, with no other record to tell the reactor
+        t.replay_record(seq, &row); s.db.log.published();
+        let deadline = Instant::now() + Duration::from_secs(2); let mut n = 0;
+        while n < 1 {
+            match sub.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Some(Event::Live { rows, .. }) => if let Value::Int(c) = rows[0][0] { n = c },
+                Some(_) => {}
+                None => panic!("the live query still counts {n}"),
+            }
+        }
+        drop(sub); drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+}

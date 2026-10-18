@@ -32,9 +32,10 @@ pub struct Config {
     pub live: LivePolicy,
     pub log: LogPolicy,
     pub auth: AuthPolicy,
+    pub app: AppPolicy,
 }
 impl Default for Config {
-    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default() } }
+    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default() } }
 }
 impl Config {
     pub fn durable(mut self, d: Durability) -> Config { self.durable = d; self }
@@ -87,10 +88,28 @@ pub struct SnapshotPolicy { pub log_bytes: Option<u64>, pub idle_after: Option<D
 impl Default for SnapshotPolicy { fn default() -> Self { SnapshotPolicy { log_bytes: Some(64 << 20), idle_after: Some(Duration::from_secs(30)) } } }
 /// Doors for other processes: a Unix socket path, a TCP address, the web console's HTTP address; the last two need the shared token.
 #[derive(Clone, Debug, Default)]
-pub struct Listen { pub socket: Option<PathBuf>, pub tcp: Option<String>, pub http: Option<String>, pub token: Option<String> }
+pub struct Listen { pub socket: Option<PathBuf>, pub tcp: Option<String>, pub http: Option<String>, pub token: Option<String>, /// the app API for browsers and mobile apps (see `app.rs`)
+    pub app: Option<String> }
 #[derive(Clone, Debug)]
 pub struct LivePolicy { pub debounce: Duration, pub queue: usize }
 impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Duration::from_millis(5), queue: 65536 } } }
+/// The app API (`listen.app`, see `app.rs`): which web origins may call it, the URL it is reached at (for OAuth
+/// redirects), the role of a request without a session, the most rows one result may return, a directory of
+/// static files to serve beside it (the app itself), and the tables clients may make accounts in, each with the
+/// columns a client may set besides the login column (other tables are sign-in only).
+#[derive(Clone, Debug)] pub struct AppPolicy { pub origins: Vec<String>, pub public_url: Option<String>, pub anonymous_role: Option<String>, pub max_rows: usize, pub static_dir: Option<PathBuf>, pub sign_up: std::collections::BTreeMap<String, Vec<String>>, pub tls: Option<TlsPolicy> }
+impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None } } }
+/// TLS for the app API (`app.tls`, see `tls.rs`): your own certificate (`cert` and `key`, PEM files), or one for
+/// `domains` from the ACME CA whose directory is `acme` (Let's Encrypt), kept in `dir` (the database's `tls/` when
+/// unset) under an account with `email` as its contact. `acme_root` is a root to trust for the CA itself (a private
+/// CA, or a test one); `redirect` is an address where plain HTTP requests are sent on to https.
+#[derive(Clone, Debug)] pub struct TlsPolicy { pub domains: Vec<String>, pub email: Option<String>, pub cert: Option<PathBuf>, pub key: Option<PathBuf>, pub acme: String, pub acme_root: Option<PathBuf>, pub dir: Option<PathBuf>, pub redirect: Option<String> }
+pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
+/// A name a CA can check over TLS-ALPN-01: letters, digits and hyphens in dot-separated labels, no wildcard, not an IP.
+fn is_dns_name(d: &str) -> bool {
+    let label = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    d.len() <= 253 && d.split('.').all(label) && !d.rsplit('.').next().unwrap_or("").bytes().all(|b| b.is_ascii_digit())
+}
 /// Sign-in (see `auth.rs`): how long a session lasts, and the shortest password `signUp` and `setPassword` accept.
 #[derive(Clone, Debug)] pub struct AuthPolicy { pub session_ttl: Duration, pub password_min: usize, /// sign-in providers by name (see `oauth.rs`)
     pub oauth: std::collections::BTreeMap<String, OAuthProvider> }
@@ -121,8 +140,14 @@ pub struct ConfigFile {
     #[serde(alias = "config_file")] pub config_file: Option<String>,
     pub durable: Option<DurableIn>, pub create: Option<bool>,
     #[serde(alias = "recover_threads")] pub recover_threads: Option<usize>,
-    pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>, pub auth: Option<AuthFile>,
+    pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>, pub auth: Option<AuthFile>, pub app: Option<AppFile>,
 }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile> }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TlsFile { pub domains: Option<Vec<String>>, pub email: Option<String>, pub cert: Option<String>, pub key: Option<String>, pub acme: Option<String>, #[serde(alias = "acme_root")] pub acme_root: Option<String>, pub dir: Option<String>, pub redirect: Option<String> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BackupFile {
@@ -140,7 +165,7 @@ pub struct FollowFile { pub dir: Option<String>, pub bucket: Option<BackupFile>,
 pub struct SnapshotFile { #[serde(alias = "log_bytes")] pub log_bytes: Option<Size>, #[serde(alias = "idle_after")] pub idle_after: Option<Dur> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ListenFile { pub socket: Option<String>, pub tcp: Option<String>, pub http: Option<String>, pub token: Option<String> }
+pub struct ListenFile { pub socket: Option<String>, pub tcp: Option<String>, pub http: Option<String>, pub token: Option<String>, pub app: Option<String> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LiveFile { pub debounce: Option<Dur>, pub queue: Option<usize> }
@@ -194,7 +219,9 @@ impl ConfigFile {
             backup: nest(self.backup, o.backup, |a, b| a.overlay(b)),
             follow: nest(self.follow, o.follow, |a, b| FollowFile { dir: pick(a.dir, b.dir), bucket: nest(a.bucket, b.bucket, |x, y| x.overlay(y)), poll: pick(a.poll, b.poll) }),
             snapshot: nest(self.snapshot, o.snapshot, |a, b| SnapshotFile { log_bytes: pick(a.log_bytes, b.log_bytes), idle_after: pick(a.idle_after, b.idle_after) }),
-            listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token) }),
+            listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token), app: pick(a.app, b.app) }),
+            app: nest(self.app, o.app, |a, b| AppFile { origins: pick(a.origins, b.origins), public_url: pick(a.public_url, b.public_url), anonymous_role: pick(a.anonymous_role, b.anonymous_role), max_rows: pick(a.max_rows, b.max_rows), static_dir: pick(a.static_dir, b.static_dir), sign_up: pick(a.sign_up, b.sign_up),
+                tls: nest(a.tls, b.tls, |x, y| TlsFile { domains: pick(x.domains, y.domains), email: pick(x.email, y.email), cert: pick(x.cert, y.cert), key: pick(x.key, y.key), acme: pick(x.acme, y.acme), acme_root: pick(x.acme_root, y.acme_root), dir: pick(x.dir, y.dir), redirect: pick(x.redirect, y.redirect) }) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
             log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
             auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min), oauth: nest(a.oauth, b.oauth, |mut x, y| { for (k, v) in y { let merged = match x.remove(&k) { Some(old) => old.overlay(v), None => v }; x.insert(k, merged); } x }) }),
@@ -224,7 +251,7 @@ impl ConfigFile {
             if let Some(v) = s.idle_after { let d = dur_of(v, "snapshot.idleAfter")?; c.snapshot.idle_after = if d.is_zero() { None } else { Some(d) }; }
         }
         if let Some(l) = self.listen {
-            c.listen.socket = l.socket.map(PathBuf::from); c.listen.tcp = l.tcp; c.listen.http = l.http; c.listen.token = l.token.filter(|t| !t.is_empty());
+            c.listen.socket = l.socket.map(PathBuf::from); c.listen.tcp = l.tcp; c.listen.http = l.http; c.listen.token = l.token.filter(|t| !t.is_empty()); c.listen.app = l.app.filter(|a| !a.is_empty());
             if c.listen.tcp.is_some() && c.listen.token.is_none() { return Err("listen.tcp needs listen.token (a shared secret every connection presents first)".into()); }
             if c.listen.http.is_some() && c.listen.token.is_none() { return Err("listen.http needs listen.token (the web console asks for it)".into()); }
         }
@@ -232,6 +259,31 @@ impl ConfigFile {
         if let Some(l) = self.log {
             if let Some(d) = l.threads_idle_after { let d = dur_of(d, "log.threadsIdleAfter")?; c.log.threads_idle_after = if d.is_zero() { None } else { Some(d) }; }
             if let Some(d) = l.sync_delay { let d = dur_of(d, "log.syncDelay")?; if d > Duration::from_secs(60) { return Err("log.syncDelay: at most 60s".into()); } c.log.sync_delay = if d.is_zero() { None } else { Some(d) }; }
+        }
+        if let Some(a) = self.app {
+            if let Some(o) = a.origins { for x in &o { if x != "*" && !(x.starts_with("https://") || x.starts_with("http://")) { return Err(format!("app.origins: {x:?} is not an origin (https://app.example, or \"*\")")); } } c.app.origins = o.into_iter().map(|x| x.trim_end_matches('/').to_string()).collect(); }
+            if let Some(u) = a.public_url.filter(|u| !u.is_empty()) { if !(u.starts_with("https://") || u.starts_with("http://")) { return Err("app.publicUrl: an http(s) URL".into()); } c.app.public_url = Some(u.trim_end_matches('/').to_string()); }
+            c.app.anonymous_role = a.anonymous_role.filter(|r| !r.is_empty());
+            if let Some(n) = a.max_rows { if n == 0 { return Err("app.maxRows: at least 1".into()); } c.app.max_rows = n; }
+            c.app.static_dir = a.static_dir.filter(|d| !d.is_empty()).map(PathBuf::from);
+            if let Some(m) = a.sign_up { c.app.sign_up = m.into_iter().map(|(t, cols)| (t.to_ascii_lowercase(), cols.into_iter().map(|c| c.to_ascii_lowercase()).collect())).collect(); }
+            if let Some(t) = a.tls {
+                let some = |v: Option<String>| v.filter(|x| !x.is_empty());
+                let domains: Vec<String> = t.domains.unwrap_or_default().into_iter().map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase()).collect();
+                if let Some(d) = domains.iter().find(|d| !is_dns_name(d)) { return Err(format!("app.tls.domains: {d:?} is not a domain name a CA can check here (no wildcards, no IP addresses)")); }
+                let (cert, key) = (some(t.cert).map(PathBuf::from), some(t.key).map(PathBuf::from));
+                if cert.is_some() != key.is_some() { return Err("app.tls: cert and key go together".into()); }
+                if cert.is_none() && domains.is_empty() { return Err("app.tls: domains (a certificate from the CA, renewed automatically) or cert and key (your own)".into()); }
+                let acme = some(t.acme).unwrap_or_else(|| LETS_ENCRYPT.to_string());
+                if !acme.starts_with("https://") { return Err("app.tls.acme: the https URL of the CA's directory".into()); }
+                if let Some(e) = t.email.as_deref().filter(|e| !e.is_empty() && !e.contains('@')) { return Err(format!("app.tls.email: {e:?} is not an email address")); }
+                let Some(listen) = c.listen.app.clone() else { return Err("app.tls: set listen.app (the address to serve https on, such as 0.0.0.0:443)".into()) };
+                if c.app.public_url.is_none() { if let Some(d) = domains.first() {
+                    let port = listen.rsplit_once(':').map(|(_, p)| p).filter(|p| *p != "443");
+                    c.app.public_url = Some(format!("https://{d}{}", port.map(|p| format!(":{p}")).unwrap_or_default()));
+                } }
+                c.app.tls = Some(TlsPolicy { domains, email: some(t.email), cert, key, acme, acme_root: some(t.acme_root).map(PathBuf::from), dir: some(t.dir).map(PathBuf::from), redirect: some(t.redirect) });
+            }
         }
         if let Some(a) = self.auth {
             if let Some(d) = a.session_ttl { let d = dur_of(d, "auth.sessionTtl")?; if d < Duration::from_secs(60) { return Err("auth.sessionTtl: at least 60s".into()); } c.auth.session_ttl = d; }
@@ -309,6 +361,22 @@ mod tests {
         assert_eq!(c.log.sync_delay, None, "fsync right away unless asked");
         assert_eq!(Config::from_json(r#"{"log":{"syncDelay":"200ms","threadsIdleAfter":"1s"}}"#).unwrap().log.sync_delay, Some(Duration::from_millis(200)));
         assert!(Config::from_json(r#"{"log":{"syncDelay":"5m"}}"#).unwrap_err().contains("syncDelay"));
+    }
+    #[test] fn app_tls() {
+        let tls = |j: &str| Config::from_json(&format!(r#"{{"listen":{{"app":"0.0.0.0:443"}},"app":{{"tls":{j}}}}}"#));
+        let c = tls(r#"{"domains":["API.Example.com."],"email":"ops@example.com"}"#).unwrap(); let t = c.app.tls.unwrap();
+        assert_eq!(t.domains, ["api.example.com"]); assert_eq!(t.acme, LETS_ENCRYPT); assert!(t.cert.is_none());
+        assert_eq!(c.app.public_url.as_deref(), Some("https://api.example.com"), "publicUrl from the first domain");
+        let c = Config::from_json(r#"{"listen":{"app":"0.0.0.0:8443"},"app":{"tls":{"domains":["a.example.com"]}}}"#).unwrap();
+        assert_eq!(c.app.public_url.as_deref(), Some("https://a.example.com:8443"), "and its port, when not 443");
+        let c = Config::from_json(r#"{"listen":{"app":"0.0.0.0:443"},"app":{"publicUrl":"https://app.example","tls":{"domains":["a.example.com"]}}}"#).unwrap();
+        assert_eq!(c.app.public_url.as_deref(), Some("https://app.example"), "a publicUrl given stays");
+        assert!(tls(r#"{"cert":"/c.pem","key":"/k.pem"}"#).unwrap().app.tls.unwrap().cert.is_some(), "your own certificate, no domains needed");
+        for (bad, says) in [(r#"{}"#, "domains"), (r#"{"cert":"/c.pem"}"#, "together"), (r#"{"domains":["*.example.com"]}"#, "wildcards"), (r#"{"domains":["10.0.0.1"]}"#, "IP"),
+                            (r#"{"domains":["a.example.com"],"acme":"http://ca.example/dir"}"#, "https"), (r#"{"domains":["a.example.com"],"email":"nope"}"#, "email"), (r#"{"domains":["a.example.com"],"stapling":true}"#, "stapling")] {
+            assert!(tls(bad).unwrap_err().contains(says), "{bad}: {}", tls(bad).unwrap_err());
+        }
+        assert!(Config::from_json(r#"{"app":{"tls":{"domains":["a.example.com"]}}}"#).unwrap_err().contains("listen.app"));
     }
     #[test] fn file_then_code_then_env() {
         let dir = std::env::temp_dir().join(format!("sqweezdb-config-test-{}", std::process::id())); std::fs::create_dir_all(&dir).unwrap();

@@ -11,6 +11,7 @@ bindings/go/sse/sse
 
 # Experiment working data (databases, buckets, sockets) and downloaded third-party tools (see README)
 /data/
+demos/*/data/
 /tools/
 
 # Measurements ledger (kept out of the repo by the owner's choice; raw outputs in results/ are tracked)

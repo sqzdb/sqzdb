@@ -14,7 +14,7 @@
 //!   costs the same hash as a known one, and both fail with the same message.
 use crate::sql::{Session, Sql};
 use crate::table::{decode_col, encode_row, encode_value, now_micros, ColType, Key, Table, Txn, Value};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{Output, ParamsString, PasswordHash, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -47,7 +47,16 @@ pub fn is_system(name: &str) -> bool { name.len() >= 6 && name[..6].eq_ignore_as
 /// the users table and the auth system tables bump on every write (`Table::watch`).
 #[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>, create_lock: Mutex<()> }
 
-fn hasher() -> Argon2<'static> { Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(19_456, 2, 1, None).expect("argon2 parameters")) }
+fn params() -> Params { Params::new(19_456, 2, 1, None).expect("argon2 parameters") }
+/// Argon2 into working memory of its own: an anonymous mapping, returned to the system when the hash is done. From
+/// the allocator, each thread that ever hashed would keep its 19 MiB (glibc doesn't trim other threads' arenas).
+fn derive(alg: Algorithm, version: Version, params: &Params, pw: &[u8], salt: &[u8], out: &mut [u8]) -> Result<(), String> {
+    let n = params.block_count();
+    let mut mem = memmap2::MmapMut::map_anon(n * argon2::Block::SIZE).map_err(|e| format!("argon2 memory: {e}"))?;
+    // zeroed, page-aligned memory is valid as blocks (1 KiB of u64s each, aligned to 64 bytes)
+    let blocks = unsafe { std::slice::from_raw_parts_mut(mem.as_mut_ptr() as *mut argon2::Block, n) };
+    Argon2::new(alg, version, params.clone()).hash_password_into_with_memory(pw, salt, out, blocks).map_err(|e| e.to_string())
+}
 /// At most this many hashes at once: each holds 19 MiB.
 fn gate() -> &'static (Mutex<usize>, Condvar) { static G: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new(); G.get_or_init(|| (Mutex::new(0), Condvar::new())) }
 fn gated<T>(f: impl FnOnce() -> T) -> T {
@@ -59,13 +68,23 @@ fn gated<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 fn random<const N: usize>() -> [u8; N] { let mut b = [0u8; N]; getrandom::fill(&mut b).expect("the operating system's random source"); b }
+/// A new argon2id hash of `pw` as a PHC string (`$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`).
 fn hash_password(pw: &str) -> Result<String, String> {
-    let salt = SaltString::encode_b64(&random::<16>()).map_err(|e| e.to_string())?;
-    gated(|| hasher().hash_password(pw.as_bytes(), &salt).map(|h| h.to_string()).map_err(|e| e.to_string()))
+    let raw = random::<16>(); let salt = SaltString::encode_b64(&raw).map_err(|e| e.to_string())?; let p = params();
+    let mut out = [0u8; Params::DEFAULT_OUTPUT_LEN];
+    gated(|| derive(Algorithm::Argon2id, Version::V0x13, &p, pw.as_bytes(), &raw, &mut out))?;
+    let h = PasswordHash { algorithm: Algorithm::Argon2id.ident(), version: Some(Version::V0x13.into()), params: ParamsString::try_from(&p).map_err(|e| e.to_string())?, salt: Some(salt.as_salt()), hash: Some(Output::new(&out).map_err(|e| e.to_string())?) };
+    Ok(h.to_string())
 }
+/// Whether `pw` matches a PHC string, by the algorithm, version and parameters stored in it (constant-time compare).
 fn verify_password(pw: &str, stored: &str) -> bool {
     let Ok(h) = PasswordHash::new(stored) else { return false };
-    gated(|| hasher().verify_password(pw.as_bytes(), &h).is_ok())
+    let (Some(salt), Some(expected)) = (h.salt, h.hash) else { return false };
+    let (Ok(alg), Ok(p)) = (Algorithm::try_from(h.algorithm), Params::try_from(&h)) else { return false };
+    let Ok(version) = h.version.map(Version::try_from).transpose() else { return false };
+    let mut sb = [0u8; 64]; let Ok(salt) = salt.decode_b64(&mut sb) else { return false };
+    let mut out = vec![0u8; expected.len()];
+    gated(|| derive(alg, version.unwrap_or_default(), &p, pw.as_bytes(), salt, &mut out)).is_ok() && Output::new(&out).map(|o| o == expected).unwrap_or(false)
 }
 /// What an unknown login is checked against, so it costs as much as a known one.
 fn dummy_hash() -> &'static str { static D: OnceLock<String> = OnceLock::new(); D.get_or_init(|| hash_password(&format!("{:x?}", random::<16>())).unwrap_or_default()) }
@@ -265,8 +284,9 @@ impl Sql {
         let row = t.with_pk(pk, |r| r.to_vec())?; Some((t, row))
     }
     /// Sign in (or up) with a provider identity: an identity already linked signs in its user; a new one links to
-    /// `link` (a signed-in user's password-row id), or makes a user; it never attaches to an existing user by email.
-    pub(crate) fn oauth_sign_in(&self, table: &str, provider: &str, who: crate::oauth::Identity, link: Option<&str>) -> Result<SignedIn, String> {
+    /// `link` (a signed-in user's password-row id), or makes a user (if `create`); it never attaches to an existing
+    /// user by email.
+    pub(crate) fn oauth_sign_in(&self, table: &str, provider: &str, who: crate::oauth::Identity, link: Option<&str>, create: bool) -> Result<SignedIn, String> {
         let (t, cfg) = self.auth_table(table)?; let ids = self.identities()?; let secrets = self.system(SECRETS)?;
         let email = normalize(&who.email); let id = format!("{provider}:{}", who.subject);
         if id.len() > 400 { return Err("sign-in failed: the provider's account id is too long".into()); }
@@ -293,6 +313,7 @@ impl Sql {
                 // never by email: the account may be someone else's (made with their address, or through a provider
                 // that checks emails less strictly). Its owner signs in and links the provider.
                 Some(_) => return Err(format!("sign-in failed: an account with this email already exists; sign in to it, then link {provider} from that account")),
+                None if !create => return Err(format!("sign-in failed: no account of {} is linked to this {provider} account, and accounts are not made here", t.schema.name)),
                 None => {
                     // a new user whose login is the verified email: inserted through SQL (defaults, automatic ids, the
                     // insert hook), then the identity, a password row without a password, and the session
@@ -394,6 +415,23 @@ mod tests {
                    "ALTER TABLE users ENABLE AUTH (ROLE FROM role)"] { q(s, st); }
     }
     fn as_token(s: &Sql, token: &str) -> Result<Session, String> { let mut x = Session::default(); s.session_from_token(&mut x, token)?; Ok(x) }
+
+    /// Hashes made on memory of our own are standard argon2id PHC strings: the argon2 crate checks ours, we check its,
+    /// and the parameters a stored hash names are the ones used to check it.
+    #[test] fn password_hashes_are_standard_argon2id() {
+        use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+        let ours = hash_password("correct horse").unwrap();
+        assert!(ours.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{ours}");
+        let theirs = Argon2::new(Algorithm::Argon2id, Version::V0x13, params());
+        assert!(theirs.verify_password(b"correct horse", &PasswordHash::new(&ours).unwrap()).is_ok());
+        assert!(theirs.verify_password(b"correct horse!", &PasswordHash::new(&ours).unwrap()).is_err());
+        let made = theirs.hash_password(b"battery staple", &SaltString::encode_b64(&random::<16>()).unwrap()).unwrap().to_string();
+        assert!(verify_password("battery staple", &made) && !verify_password("battery stapl", &made) && !verify_password("", &made));
+        let light = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(1024, 1, 1, None).unwrap()).hash_password(b"x y z", &SaltString::encode_b64(&random::<16>()).unwrap()).unwrap().to_string();
+        assert!(verify_password("x y z", &light) && !verify_password("x y", &light));
+        assert!(!verify_password("x y z", "$argon2id$v=19$m=1024,t=1,p=1$c2FsdHNhbHQ$"), "a hash with no output matches nothing");
+        assert!(!verify_password("x y z", "not a hash"));
+    }
 
     #[test] fn sign_up_sign_in_and_policies_per_user() {
         let d = tmp("flow"); let s = Sql::open_with(&d, Config::default()).unwrap(); setup(&s);

@@ -81,7 +81,9 @@ impl Sql {
 
     /// Finish a sign-in: exchange `code` (with `state` and the `cookie` from the same start, the cookie read from the
     /// browser), find the user, start a session.
-    pub fn oauth_finish(&self, table: &str, provider: &str, code: &str, state: &str, cookie: &str) -> Result<SignedIn, String> {
+    pub fn oauth_finish(&self, table: &str, provider: &str, code: &str, state: &str, cookie: &str) -> Result<SignedIn, String> { self.oauth_finish_as(table, provider, code, state, cookie, true) }
+    /// `oauth_finish`; with `create` false it makes no new user (a provider account not yet linked is refused).
+    pub(crate) fn oauth_finish_as(&self, table: &str, provider: &str, code: &str, state: &str, cookie: &str, create: bool) -> Result<SignedIn, String> {
         let flow = {
             let mut flows = self.oauth.flows.lock().unwrap();
             let f = flows.get(state).ok_or_else(|| fail("unknown or already used sign-in state; start again"))?;
@@ -93,7 +95,7 @@ impl Sql {
         if flow.provider != provider || flow.table != table.to_lowercase() { return Err(fail("this state belongs to another sign-in")); }
         let p = self.provider(provider)?.clone();
         let who = match p.kind { OAuthKind::Oidc => self.oidc_identity(&p, provider, code, &flow)?, OAuthKind::Github => github_identity(&p, code, &flow)? };
-        self.oauth_sign_in(table, provider, who, flow.link.as_deref())
+        self.oauth_sign_in(table, provider, who, flow.link.as_deref(), create)
     }
 
     fn oidc_identity(&self, p: &OAuthProvider, name: &str, code: &str, flow: &Flow) -> Result<Identity, String> {

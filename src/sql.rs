@@ -1718,6 +1718,7 @@ impl Sql {
         if let Some(a) = &cfg.listen.tcp { sv.listeners.push(crate::net::Server::start_tcp(sql.clone(), a, cfg.listen.token.as_deref().unwrap_or("")).map_err(|e| e.to_string())?); }
         if cfg.snapshot.log_bytes.is_some() || cfg.snapshot.idle_after.is_some() { sv.snapshotter = Some(spawn_snapshotter(&sql.db, cfg.snapshot.clone(), sv.snapshots.clone())); }
         if let Some(a) = &cfg.listen.http { sv.listeners.push(start_http(&sql, a, cfg.listen.token.as_deref().unwrap_or(""))?); }
+        if let Some(a) = &cfg.listen.app { sv.listeners.push(crate::app::start(sql.clone(), a)?); }
         *sql.services.lock().unwrap() = Some(sv);
         Ok(sql)
     }

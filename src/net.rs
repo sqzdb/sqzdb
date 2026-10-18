@@ -129,11 +129,15 @@ impl Listener {
 impl Drop for Listener { fn drop(&mut self) { self.shutdown(); } }
 /// Accept TCP connections until stopped or until `on` returns false (the database is gone).
 pub fn accept_tcp(listener: TcpListener, mut on: impl FnMut(TcpStream) -> bool + Send + 'static) -> std::io::Result<Listener> {
-    let mut addr = listener.local_addr()?;
+    Ok(spawn_listener(listener.local_addr()?, move |stop| { for conn in listener.incoming() { if stop.load(Ordering::Relaxed) { return; } let Ok(stream) = conn else { continue }; if !on(stream) { return; } } }))
+}
+/// A TCP listener bound to `addr` whose accept loop is `run` on a thread of its own; the loop checks the flag it is
+/// given after each connection it accepts (`shutdown` sets it, then connects once to wake the loop).
+pub(crate) fn spawn_listener(mut addr: std::net::SocketAddr, run: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) + Send + 'static) -> Listener {
     if addr.ip().is_unspecified() { addr.set_ip(if addr.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() }); }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false)); let s2 = stop.clone();
-    let h = std::thread::spawn(move || { for conn in listener.incoming() { if s2.load(Ordering::Relaxed) { return; } let Ok(stream) = conn else { continue }; if !on(stream) { return; } } });
-    Ok(Listener { stop, wake: Wake::Tcp(addr), thread: Some(h) })
+    let h = std::thread::spawn(move || run(s2));
+    Listener { stop, wake: Wake::Tcp(addr), thread: Some(h) }
 }
 fn accept_unix(listener: UnixListener, path: &Path, mut on: impl FnMut(UnixStream) -> bool + Send + 'static) -> Listener {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false)); let s2 = stop.clone();

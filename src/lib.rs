@@ -1,3 +1,4 @@
+pub mod app;
 pub mod auth;
 pub mod capi;
 pub mod cloud;
@@ -10,5 +11,6 @@ pub mod oauth;
 pub mod sql;
 pub mod table;
 pub mod tenants;
+pub mod tls;
 #[cfg(feature = "ui")] pub mod ui;
 pub mod util;

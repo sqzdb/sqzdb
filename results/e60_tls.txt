@@ -1,0 +1,8 @@
+own certificate: ok
+SQL point read over wss                                          p50 0.014 ms, p99 0.058 ms
+SQL point read over https (fetch, keep-alive)                    p50 0.095 ms, p99 0.496 ms
+server memory, 500 devices on wss with 2 live queries each       28 MB (15 MB before; 27 KB per device)
+a certificate from the CA, from start (account, order, TLS-ALPN-01, issue) 1.08 s
+restart: the stored certificate served                           6 ms from start to its banner
+renewed with no restart                                          60 s after the restart (certificate Oct 18 20:49:00 2026 GMT .. Oct 18 20:50:29 2026 GMT)
+ACME: ok

@@ -1,0 +1,145 @@
+// sqweezdb client: sign in and query a sqweezdb app API (`listen.app`) from a browser, React Native or Node (22+).
+// Every statement runs as the signed-in user, under the database's row policies; live queries update themselves.
+//
+//   import { connect } from 'sqweezdb-client'
+//   const db = connect('https://api.example')
+//   await db.auth.signIn('ann@example.com', password)        // or db.auth.signInWith('google')
+//   const notes = await db.sql('SELECT * FROM notes ORDER BY created DESC LIMIT 20')
+//   const sub = db.live('SELECT count(*) AS n FROM notes', [], (rows) => render(rows[0].n))
+
+export class SqweezError extends Error {
+  constructor(code, message) { super(message); this.name = 'SqweezError'; this.code = code; }
+}
+const err = (e) => new SqweezError(e.code || 'ERROR', e.error || String(e));
+const toObjects = (r) => r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
+
+class Auth {
+  constructor(client, table) { this._c = client; this.table = table; this.user = null; this._listeners = new Set(); }
+  /** Make an account (fields include the login column, such as email) and sign in. */
+  async signUp(fields, password) { return this._took(await this._c._post(`/api/auth/${this.table}/sign-up`, { fields, password }, false)); }
+  /** Sign in with a login and password; rejects with AUTH when they don't match. */
+  async signIn(login, password) { return this._took(await this._c._post(`/api/auth/${this.table}/sign-in`, { login, password }, false)); }
+  /** How users of this table sign in: `{ signUp, providers }` (whether they may make an account, and the provider
+   *  names `signInWith` takes). */
+  async methods() { const r = await this._c._fetch(`/api/auth/${this.table}/methods`); const v = await r.json(); if (v.error) throw err(v); return v; }
+  /** Sign in with a provider configured on the server (auth.oauth.<provider>): the browser leaves for the provider
+   *  and comes back to `returnTo` (this page by default), where `connect` finishes the sign-in. */
+  signInWith(provider, { returnTo } = {}) {
+    const back = returnTo || globalThis.location?.href.split('#')[0];
+    if (!back) throw new SqweezError('ARGUMENTS', 'signInWith needs returnTo outside a browser');
+    const to = `${this._c.url}/api/auth/${this.table}/oauth/${encodeURIComponent(provider)}?return=${encodeURIComponent(back)}`;
+    if (globalThis.location) globalThis.location.assign(to); return to;
+  }
+  async signOut() {
+    const t = this._c.token; this._set(null, null);
+    if (t) await this._c._fetch('/api/auth/sign-out', { method: 'POST', headers: { authorization: `Bearer ${t}` } }).catch(() => {});
+  }
+  /** Called with the user (or null) whenever sign-in changes; returns a function that stops it. */
+  onChange(fn) { this._listeners.add(fn); return () => this._listeners.delete(fn); }
+  _took(r) { this._set(r.token, r.user); return r; }
+  _set(token, user) {
+    this._c.token = token; this.user = user;
+    try { if (token) this._c._store?.setItem(this._c._key, JSON.stringify({ token, user })); else this._c._store?.removeItem(this._c._key); } catch {}
+    this._c._reauth();
+    for (const fn of this._listeners) { try { fn(user); } catch {} }
+  }
+}
+
+class Live {
+  constructor(client, sql, params, fn, onError) { Object.assign(this, { _c: client, sql, params, fn, onError, rows: null, closed: false }); this.id = 0; }
+  close() { if (this.closed) return; this.closed = true; this._c._lives.delete(this.id); this._c._send({ op: 'unlive', id: this.id }, true); }
+}
+
+class Client {
+  constructor(url, opts = {}) {
+    this.url = url.replace(/\/+$/, ''); this.token = null;
+    this._store = opts.storage !== undefined ? opts.storage : globalThis.localStorage;
+    this._key = `sqweezdb:${this.url}`; this._fetchImpl = opts.fetch || globalThis.fetch.bind(globalThis);   // a browser's fetch must be called on the window
+    this._WS = opts.WebSocket || globalThis.WebSocket;
+    this._ws = null; this._open = false; this._wait = []; this._pending = new Map(); this._lives = new Map(); this._next = 1; this._backoff = 500;
+    this.auth = new Auth(this, opts.users || 'users');
+    try { const s = this._store && JSON.parse(this._store.getItem(this._key) || 'null'); if (s) { this.token = s.token; this.auth.user = s.user; } } catch {}
+    // back from a provider: trade the one-time code for a session, then take it out of the address bar
+    this.ready = this._finishRedirect();
+  }
+  async _finishRedirect() {
+    const loc = globalThis.location; if (!loc?.hash) return;
+    const h = new URLSearchParams(loc.hash.slice(1)); const code = h.get('sqz_code'), e = h.get('sqz_error');
+    if (!code && !e) return;
+    globalThis.history?.replaceState(null, '', loc.href.split('#')[0]);
+    if (e) throw new SqweezError('AUTH', e);
+    this.auth._took(await this._post('/api/auth/exchange', { code }, false));
+  }
+  _fetch(path, init) { return this._fetchImpl(this.url + path, init); }
+  async _post(path, body, signed = true) {
+    const headers = { 'content-type': 'application/json' }; if (signed && this.token) headers.authorization = `Bearer ${this.token}`;
+    const res = await this._fetch(path, { method: 'POST', headers, body: JSON.stringify(body) });
+    const v = await res.json().catch(() => ({ error: `HTTP ${res.status}`, code: 'ERROR' }));
+    if (v.error) { if (v.code === 'AUTH' && signed && this.token) this.auth._set(null, null); throw err(v); }
+    return v;
+  }
+  /** Run one statement as the signed-in user; resolves to rows as objects (an INSERT also has `lastInsertId`). */
+  async sql(text, params = []) {
+    await this.ready;
+    const r = this._WS ? await this._call({ op: 'sql', sql: text, params }) : await this._post('/api/sql', { sql: text, params });
+    const rows = toObjects(r); if (r.lastInsertId !== undefined) rows.lastInsertId = r.lastInsertId; return rows;
+  }
+  /** Several statements as one transaction: [[sql, params], …]; resolves to each one's rows. */
+  async batch(statements) {
+    await this.ready;
+    const body = { statements: statements.map((s) => (Array.isArray(s) ? { sql: s[0], params: s[1] || [] } : s)) };
+    const r = this._WS ? await this._call({ op: 'batch', ...body }) : await this._post('/api/batch', body);
+    return r.results.map(toObjects);
+  }
+  /** A query that keeps its result current: `fn(rows)` now and on every change. `onError(e)` if it can't run. */
+  live(text, params, fn, onError) {
+    if (typeof params === 'function') { onError = fn; fn = params; params = []; }
+    const l = new Live(this, text, params || [], fn, onError); l.id = this._next++;
+    this._lives.set(l.id, l); this.ready.then(() => this._subscribe(l), (e) => onError?.(e));
+    return l;
+  }
+  _subscribe(l) { if (!l.closed) this._send({ op: 'live', id: l.id, sql: l.sql, params: l.params }, true); }
+  // ---------- the socket ----------
+  _socket() {
+    if (this._ws) return;
+    const u = this.url.replace(/^http/, 'ws') + '/api/socket';
+    const ws = new this._WS(u); this._ws = ws;
+    ws.onopen = () => {
+      this._open = true; this._backoff = 500;
+      if (this.token) ws.send(JSON.stringify({ op: 'auth', id: 0, token: this.token }));
+      for (const l of this._lives.values()) this._subscribe(l);
+      for (const m of this._wait.splice(0)) ws.send(m);
+    };
+    ws.onmessage = (ev) => this._receive(JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)));
+    ws.onclose = () => {
+      this._ws = null; this._open = false;
+      for (const [, p] of this._pending) p.reject(new SqweezError('CLOSED', 'the connection closed'));
+      this._pending.clear();
+      if (this._lives.size) { setTimeout(() => this._socket(), this._backoff); this._backoff = Math.min(this._backoff * 2, 30000); }
+    };
+    ws.onerror = () => {};
+  }
+  _send(m, isLive) { const s = JSON.stringify(m); if (this._open) this._ws.send(s); else { if (!isLive) this._wait.push(s); this._socket(); } }
+  _call(m) {
+    return new Promise((resolve, reject) => { const id = this._next++; this._pending.set(id, { resolve, reject }); this._send({ ...m, id }); })
+      .then((v) => { if (v.error) { if (v.code === 'AUTH' && this.token) this.auth._set(null, null); throw err(v); } return v; });
+  }
+  _receive(m) {
+    if (m.id === 0) { if (m.error && m.code === 'AUTH') this.auth._set(null, null); return; }   // the socket's own auth message
+    const l = this._lives.get(m.id);
+    if (l) {
+      if (m.live) { l.rows = toObjects(m); try { l.fn(l.rows, { initial: !!m.initial }); } catch (e) { console.error(e); } return; }
+      if (m.ended) { if (!l.closed) this._subscribe(l); return; }   // the server dropped it (it fell behind, or the user changed): make it again
+      if (m.error) { this._lives.delete(m.id); if (m.code === 'AUTH' && this.token) this.auth._set(null, null); l.onError?.(err(m)); return; }
+    }
+    const p = this._pending.get(m.id); if (p) { this._pending.delete(m.id); p.resolve(m); }
+  }
+  // the open socket follows sign-in: a new token, or null when signed out (its live queries end either way)
+  _reauth() { if (this._open) this._ws.send(JSON.stringify({ op: 'auth', id: 0, token: this.token })); }
+  /** Close the socket (live queries stop). */
+  close() { for (const l of this._lives.values()) l.closed = true; this._lives.clear(); this._ws?.close(); }
+}
+
+/** Connect to a sqweezdb app API. Options: `users` (the table users sign in to, default 'users'), `storage` (where
+ *  the session is kept: localStorage in a browser, or null), `fetch` and `WebSocket` (for other runtimes). */
+export function connect(url, opts) { return new Client(url, opts); }

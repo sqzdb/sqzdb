@@ -1,3 +1,6 @@
+use crate::table::{ColType, Value};
+use serde_json::{json, Value as J};
+
 pub struct Rng(pub u64);
 impl Rng { pub fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x } }
 
@@ -36,3 +39,32 @@ impl std::hash::Hasher for TxnKeyHasher {
     fn write_i128(&mut self, k: i128) { self.0 ^= (k as u64) ^ ((k >> 64) as u64).rotate_left(17); }
 }
 pub type TxnKeyMap = std::collections::HashMap<(u16, i128), usize, std::hash::BuildHasherDefault<TxnKeyHasher>>;
+
+// ---------- shared by the HTTP APIs (the console in `ui.rs`, the app API in `app.rs`) ----------
+/// A result's columns: names, and types where known (a timestamp is shown as text).
+pub type Cols = Vec<(String, Option<ColType>)>;
+pub fn url_decode(s: &str) -> String {
+    let b = s.as_bytes(); let mut out = Vec::with_capacity(b.len()); let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() { if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) { out.push(v); i += 3; continue; } }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] }); i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+pub fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((b.len() + 2) / 3 * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char); out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' }); out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+pub fn err_json(e: String) -> J { json!({"error": e, "code": crate::sql::error_code(&e)}) }
+pub fn j_to_value(v: &J) -> Value { match v { J::Null => Value::Null, J::Bool(b) => Value::Bool(*b), J::Number(n) => match n.as_i64() { Some(i) => Value::Int(i), None => Value::Float(n.as_f64().unwrap_or(0.0)) }, J::String(s) => Value::Text(s.clone()), other => Value::Text(other.to_string()) } }
+pub fn value_json(v: &Value, ty: Option<&ColType>) -> J {
+    match v { Value::Null => J::Null, Value::Bool(b) => json!(b), Value::Int(i) => if matches!(ty, Some(ColType::Timestamp)) { json!(crate::table::format_timestamp(*i)) } else { json!(i) }, Value::Float(f) => json!(f), Value::Text(s) => json!(s), Value::Bytes(b) => json!(format!("0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())) }
+}
+pub fn row_json(cols: &Cols, r: &[Value]) -> J { J::Array(r.iter().enumerate().map(|(i, v)| value_json(v, cols.get(i).and_then(|c| c.1.as_ref()))).collect()) }
+pub fn names(cols: &Cols) -> Vec<&str> { cols.iter().map(|c| c.0.as_str()).collect() }

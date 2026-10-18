@@ -266,10 +266,17 @@ pub struct LogState { pub buf: Vec<u8>, pub seq: u64, pub written: u64, pub dura
 pub struct GLog { pub st: Mutex<LogState>, pub cv_batch: Condvar, pub cv_durable: Condvar, pub cv_sync: Condvar, /// appenders waiting for room in a full buffer (kept apart from the many commits waiting on `cv_durable`)
     pub cv_space: Condvar, pub dir: PathBuf, /// live in-process change feeds; the memory ring is only kept while there is at least one
     pub feeds: std::sync::atomic::AtomicUsize, /// signalled on an append while a reactor is waiting (never costs the writer otherwise)
-    pub cv_feed: Condvar, pub feed_wake: std::sync::atomic::AtomicBool }
+    pub cv_feed: Condvar, pub feed_wake: std::sync::atomic::AtomicBool,
+    /// Writes between their log record and the end of publishing their rows (indexes included). A query that starts
+    /// once this is 0, read under `st`, sees every write logged before; live queries rely on it (`live.rs`).
+    pub publishing: std::sync::atomic::AtomicU64 }
 impl GLog {
-    pub fn new(dir: &Path) -> GLog { GLog { st: Mutex::new(LogState { buf: Vec::with_capacity(1 << 16), seq: 0, written: 0, durable: 0, stop: false, batches: 0, bytes: 0, rotate: false, segments: vec![], catalog: vec![], sync_fd: None, writer_done: false, recent: VecDeque::new(), recent_bytes: 0, cloud: 0, cloud_wait: false, cloud_kick: None, running: false, idle_exit: None, started: false, threads: 0, sync_delay: None, durable_waiters: 0, reuse_tail: None }), cv_batch: Condvar::new(), cv_durable: Condvar::new(), cv_sync: Condvar::new(), cv_space: Condvar::new(), dir: dir.to_path_buf(), feeds: std::sync::atomic::AtomicUsize::new(0), cv_feed: Condvar::new(), feed_wake: std::sync::atomic::AtomicBool::new(false) } }
+    pub fn new(dir: &Path) -> GLog { GLog { st: Mutex::new(LogState { buf: Vec::with_capacity(1 << 16), seq: 0, written: 0, durable: 0, stop: false, batches: 0, bytes: 0, rotate: false, segments: vec![], catalog: vec![], sync_fd: None, writer_done: false, recent: VecDeque::new(), recent_bytes: 0, cloud: 0, cloud_wait: false, cloud_kick: None, running: false, idle_exit: None, started: false, threads: 0, sync_delay: None, durable_waiters: 0, reuse_tail: None }), cv_batch: Condvar::new(), cv_durable: Condvar::new(), cv_sync: Condvar::new(), cv_space: Condvar::new(), dir: dir.to_path_buf(), feeds: std::sync::atomic::AtomicUsize::new(0), cv_feed: Condvar::new(), feed_wake: std::sync::atomic::AtomicBool::new(false), publishing: Default::default() } }
     pub fn seg_path(&self, first: u64) -> PathBuf { Self::seg_path_in(&self.dir, first) }
+    /// A write appended with `append` or `append_with_ring` is fully visible (see `publishing`).
+    pub fn published(&self) { self.publishing.fetch_sub(1, Ordering::Release); }
+    /// Whether every write logged so far is visible: read under the lock, so it covers each record a feed has read.
+    pub fn settled(&self) -> bool { let _s = self.st.lock().unwrap(); self.publishing.load(Ordering::Acquire) == 0 }
     pub fn seg_path_in(dir: &Path, first: u64) -> PathBuf { dir.join(format!("log.{first:020}")) }
     pub fn list_segments(dir: &Path) -> Vec<u64> {
         let mut v: Vec<u64> = fs::read_dir(dir).map(|rd| rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_prefix("log.").and_then(|x| x.parse().ok()))).collect()).unwrap_or_default();
@@ -288,13 +295,14 @@ impl GLog {
         seq
     }
     /// record: [len u32][crc32c u32][seq u64][op u8][table u16][payload]
-    pub fn append(self: &Arc<Self>, op: u8, table: u16, payload: &[u8]) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let seq = self.push_record(&mut s, op, table, payload); let restart = s.started && !s.running; if restart { s.running = true; } drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
+    pub fn append(self: &Arc<Self>, op: u8, table: u16, payload: &[u8]) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let seq = self.push_record(&mut s, op, table, payload); self.publishing.fetch_add(1, Ordering::Relaxed); let restart = s.started && !s.running; if restart { s.running = true; } drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
     /// Start (or restart) the writer and syncer threads; with `idle_exit` set they leave after that much silence.
     pub fn spawn_threads(self: &Arc<Self>) { let a = self.clone(); std::thread::spawn(move || a.committer()); let b = self.clone(); std::thread::spawn(move || b.syncer()); }
     /// Append with a different payload for in-process feeds (a delete logs the key, feeds get the old row).
-    pub fn append_with_ring(self: &Arc<Self>, op: u8, table: u16, payload: &[u8], ring: &[u8]) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let seq = self.push_record2(&mut s, op, table, payload, Some(ring)); let restart = s.started && !s.running; if restart { s.running = true; } drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
-    /// Block until a record after `last_seq` exists or the timeout passes; returns the current sequence.
-    pub fn wait_feed(&self, last_seq: u64, timeout: std::time::Duration) -> u64 { let mut s = self.st.lock().unwrap(); if s.seq <= last_seq { self.feed_wake.store(true, Ordering::Release); let (g, _) = self.cv_feed.wait_timeout(s, timeout).unwrap(); s = g; self.feed_wake.store(false, Ordering::Release); } s.seq }
+    pub fn append_with_ring(self: &Arc<Self>, op: u8, table: u16, payload: &[u8], ring: &[u8]) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let seq = self.push_record2(&mut s, op, table, payload, Some(ring)); self.publishing.fetch_add(1, Ordering::Relaxed); let restart = s.started && !s.running; if restart { s.running = true; } drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
+    /// Block until a record after `last_seq` exists (a durable one, for a feed that only reads those) or the timeout
+    /// passes; returns the current sequence.
+    pub fn wait_feed(&self, last_seq: u64, durable_only: bool, timeout: std::time::Duration) -> u64 { let mut s = self.st.lock().unwrap(); if (if durable_only { s.durable } else { s.seq }) <= last_seq { self.feed_wake.store(true, Ordering::Release); let (g, _) = self.cv_feed.wait_timeout(s, timeout).unwrap(); s = g; self.feed_wake.store(false, Ordering::Release); } s.seq }
     /// A DDL or ACL statement: appended to the log and to the in-memory catalog under one lock, so a snapshot
     /// taken at sequence S sees exactly the statements with sequence <= S.
     pub fn append_meta(self: &Arc<Self>, text: &str) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let restart = s.started && !s.running; if restart { s.running = true; } let seq = self.push_record(&mut s, OP_META, u16::MAX, text.as_bytes()); s.catalog.push(text.to_string()); drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
@@ -359,6 +367,7 @@ impl GLog {
                 (s.written, s.sync_fd.as_ref().unwrap().try_clone().unwrap()) };
             fd.sync_data().unwrap();
             let mut s = self.st.lock().unwrap(); if target > s.durable { s.durable = target; } self.cv_durable.notify_all();
+            if self.feed_wake.swap(false, Ordering::AcqRel) { self.cv_feed.notify_all(); }   // a reactor reading durable records only
         }
     }
     /// Stop the log threads once everything appended is written and synced. Also waits for threads that were spawned but
@@ -705,7 +714,7 @@ impl Table {
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
         match guard { Some(mut m) => { m.remove(&pk); drop(m); if let Some(k) = self.unique_key(&row) { self.uniq_remove(k, slot); } self.idx_remove(&row, slot); } None => self.unpublish(slot, &row) }
-        self.touched();
+        self.touched(); self.log.published();
         self.free_slot(slot);
         self.mirror_delete(pk);
         self.fk_apply(pk, todo)?;
@@ -863,7 +872,7 @@ impl Table {
           let d = Self::alloc(&mut c, self.stride);
           d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); }
         self.touched();
-        self.idx_add(row, slot);
+        self.idx_add(row, slot); self.log.published();
         self.mirror_insert(row);
         Ok(seq)
     }
@@ -916,7 +925,7 @@ impl Table {
           d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(&new); }
         self.touched();
         if key_changed { if let Some(k) = old_key { self.uniq_remove(&k, slot); } }
-        self.idx_replace(&row, &new, slot);
+        self.idx_replace(&row, &new, slot); self.log.published();
         self.mirror_update(&new);
         Ok(seq)
     }
@@ -1420,6 +1429,7 @@ impl Database {
         }
         for w in &txn.writes { if let TxnWrite::Update { table, row, old_key: Some(k), slot, .. } = w { if table.unique_key(row) != Some(&k[..]) { table.uniq_remove(k, *slot); } } }
         for w in &txn.writes { w.table().touched(); }   // after publishing: a sign-in check before this sees the change next time
+        self.log.published();
         for w in &txn.writes { match w { TxnWrite::Insert { table, row, .. } => table.mirror_insert(row), TxnWrite::Update { table, row, .. } => table.mirror_update(row), TxnWrite::Delete { table, row, .. } => table.mirror_delete(table.pk_of(row)) } }
         Ok(seq)
     }

@@ -4,7 +4,8 @@
 //! The console runs as the application session: it sees everything, like the application does.
 use crate::live::Event;
 use crate::sql::{ChangeOp, PolicyRhs, Session, Sql, P_DELETE, P_INSERT, P_SELECT, P_UPDATE};
-use crate::table::{ColType, Value};
+use crate::table::Value;
+use crate::util::{base64, err_json, j_to_value, names, row_json, url_decode, value_json, Cols};
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,7 +18,6 @@ pub const PAGE: &str = include_str!("ui/index.html");
 const MAX_BODY: usize = 1 << 20; const MAX_LINE: u64 = 16 << 10; const MAX_HEADERS: usize = 64;
 /// Idle keep-alive connections and stalled writers are dropped after this long.
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
-type Cols = Vec<(String, Option<ColType>)>;
 
 pub fn start(sql: Arc<Sql>, addr: &str, token: &str) -> Result<crate::net::Listener, String> {
     if token.is_empty() { return Err("listen.http needs listen.token".into()); }
@@ -57,14 +57,6 @@ fn read_req(r: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req>> {
     let query = q.split('&').filter(|s| !s.is_empty()).map(|kv| { let (k, v) = kv.split_once('=').unwrap_or((kv, "")); (url_decode(k), url_decode(v)) }).collect();
     Ok(Some(Req { method, path, query, headers, body }))
 }
-fn url_decode(s: &str) -> String {
-    let b = s.as_bytes(); let mut out = Vec::with_capacity(b.len()); let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() { if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) { out.push(v); i += 3; continue; } }
-        out.push(if b[i] == b'+' { b' ' } else { b[i] }); i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
 fn respond(w: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
     let reason = match status { 200 => "OK", 400 => "Bad Request", 401 => "Unauthorized", 404 => "Not Found", 405 => "Method Not Allowed", _ => "Error" };
     // one write per response: a response written in fragments waits on the peer's delayed ACK for each one
@@ -81,16 +73,6 @@ fn csp() -> &'static str {
         let hash = base64(&sha2::Sha256::digest(script.as_bytes()));
         format!("default-src 'none'; script-src 'sha256-{hash}'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
     })
-}
-fn base64(b: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((b.len() + 2) / 3 * 4);
-    for c in b.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        out.push(T[(n >> 18) as usize & 63] as char); out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' }); out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
-    }
-    out
 }
 fn json_resp(w: &mut TcpStream, status: u16, v: &J) -> std::io::Result<()> { respond(w, status, "application/json", v.to_string().as_bytes()) }
 fn authorized(req: &Req, token: &str) -> bool {
@@ -135,13 +117,6 @@ fn api_backup_test(sql: &Sql) -> J {
     let steps = crate::cloud::probe(&b.cloud());
     json!({ "ok": steps.iter().all(|s| s.1) && steps.len() == 3, "steps": steps.iter().map(|(name, ok, ms, err)| json!({"step": name, "ok": ok, "ms": ms, "error": if err.is_empty() { J::Null } else { json!(err) }})).collect::<Vec<_>>() })
 }
-fn err_json(e: String) -> J { json!({"error": e, "code": crate::sql::error_code(&e)}) }
-fn j_to_value(v: &J) -> Value { match v { J::Null => Value::Null, J::Bool(b) => Value::Bool(*b), J::Number(n) => match n.as_i64() { Some(i) => Value::Int(i), None => Value::Float(n.as_f64().unwrap_or(0.0)) }, J::String(s) => Value::Text(s.clone()), other => Value::Text(other.to_string()) } }
-fn value_json(v: &Value, ty: Option<&ColType>) -> J {
-    match v { Value::Null => J::Null, Value::Bool(b) => json!(b), Value::Int(i) => if matches!(ty, Some(ColType::Timestamp)) { json!(crate::table::format_timestamp(*i)) } else { json!(i) }, Value::Float(f) => json!(f), Value::Text(s) => json!(s), Value::Bytes(b) => json!(format!("0x{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())) }
-}
-fn row_json(cols: &Cols, r: &[Value]) -> J { J::Array(r.iter().enumerate().map(|(i, v)| value_json(v, cols.get(i).and_then(|c| c.1.as_ref()))).collect()) }
-fn names(cols: &Cols) -> Vec<&str> { cols.iter().map(|c| c.0.as_str()).collect() }
 
 fn api_sql(sql: &Sql, sess: &mut Session, body: &[u8]) -> J {
     let v: J = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return json!({"error": format!("bad JSON: {e}"), "code": "ARGUMENTS"}) };

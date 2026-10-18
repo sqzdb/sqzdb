@@ -26,7 +26,7 @@ fn main() {
     }
 }
 fn usage() -> ! {
-    eprintln!("usage:\n  sqweezdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--token <secret>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqweezdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqweezdb shell <host:port> --token <t>    The same over TCP against a running server.");
+    eprintln!("usage:\n  sqweezdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps; with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqweezdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqweezdb shell <host:port> --token <t>    The same over TCP against a running server.");
     std::process::exit(2)
 }
 fn flag(a: &[String], name: &str) -> Option<String> { a.iter().position(|s| s == name).and_then(|i| a.get(i + 1).cloned()) }
@@ -34,7 +34,12 @@ fn has(a: &[String], name: &str) -> bool { a.iter().any(|s| s == name) }
 fn fail(e: impl std::fmt::Display) -> ! { eprintln!("sqweezdb: {e}"); std::process::exit(1) }
 fn random_token() -> String { let mut b = [0u8; 16]; std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).unwrap_or_else(|e| fail(format!("/dev/urandom: {e}"))); b.iter().map(|x| format!("{x:02x}")).collect() }
 
+/// Every connected user holds a socket: take the hard limit on open files (a service often starts with 1,024).
+fn raise_open_files() {
+    unsafe { let mut r: libc::rlimit = std::mem::zeroed(); if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) == 0 && r.rlim_cur < r.rlim_max { r.rlim_cur = r.rlim_max; libc::setrlimit(libc::RLIMIT_NOFILE, &r); } }
+}
 fn serve(a: &[String]) {
+    raise_open_files();
     let dir = a.first().filter(|s| !s.starts_with("--")).map(std::path::PathBuf::from).unwrap_or_else(|| usage());
     let mut opts = Map::new(); let mut listen = Map::new();
     if let Some(f) = flag(a, "--config") { opts.insert("configFile".into(), json!(f)); }
@@ -42,6 +47,11 @@ fn serve(a: &[String]) {
     if let Some(v) = flag(a, "--ui") { listen.insert("http".into(), json!(v)); }
     if let Some(v) = flag(a, "--tcp") { listen.insert("tcp".into(), json!(v)); }
     if let Some(v) = flag(a, "--socket") { listen.insert("socket".into(), json!(v)); }
+    if let Some(v) = flag(a, "--app") { listen.insert("app".into(), json!(v)); }
+    let mut tls = Map::new();
+    if let Some(d) = flag(a, "--domain") { tls.insert("domains".into(), json!(d.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>())); }
+    if let Some(e) = flag(a, "--email") { tls.insert("email".into(), json!(e)); }
+    if !tls.is_empty() { opts.insert("app".into(), json!({ "tls": tls })); }
     let mut printed_token = None;
     match flag(a, "--token") { Some(t) => { listen.insert("token".into(), json!(t)); } None => if listen.contains_key("http") || listen.contains_key("tcp") { let t = random_token(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t); } }
     if !listen.is_empty() { opts.insert("listen".into(), J::Object(listen)); }
@@ -53,6 +63,12 @@ fn serve(a: &[String]) {
     if let Some(p) = &cfg.listen.socket { println!("  socket:     {}", p.display()); }
     if let Some(t) = &cfg.listen.tcp { println!("  tcp:        {t}"); }
     if let Some(h) = &cfg.listen.http { println!("  console:    http://{h}/"); }
+    if let Some(h) = &cfg.listen.app {
+        let url = match &cfg.app.tls { Some(_) => cfg.app.public_url.clone().unwrap_or_else(|| format!("https://{h}")), None => format!("http://{h}") };
+        let tls = cfg.app.tls.as_ref().map(|t| if t.cert.is_some() { format!("  (on {h}, your certificate)") } else { format!("  (on {h}, certificate from {})", t.acme.split('/').nth(2).unwrap_or(&t.acme)) }).unwrap_or_default();
+        println!("  app API:    {url}/api/{tls}{}", cfg.app.static_dir.as_ref().map(|d| format!("  (and the files in {})", d.display())).unwrap_or_default());
+        if let Some(r) = cfg.app.tls.as_ref().and_then(|t| t.redirect.as_ref()) { println!("  redirect:   http://{r}/ to https"); }
+    }
     if let Some(t) = printed_token { println!("  token:      {t}   (generated; pass --token to choose one)"); }
     unsafe { libc::signal(libc::SIGINT, on_signal as libc::sighandler_t); libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t); }
     while !STOP.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(100)); }
@@ -74,6 +90,7 @@ fn shell(a: &[String]) {
         let mut line = String::new(); if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
         let l = line.trim();
         if buf.is_empty() && l.starts_with('.') { match l { ".quit" | ".exit" => break, ".tables" => { let t = Instant::now(); match &mut conn { Conn::Local(s, _) => { let rows: Vec<Vec<Value>> = s.db.table_names().into_iter().map(|n| vec![Value::Text(n)]).collect(); print_rows(&mut out, &[("table".into(), None)], &rows, t.elapsed()) } Conn::Remote(_) => eprintln!(".tables is not available over TCP yet; query the console's /api/tables") } } other => eprintln!("unknown command {other}") } continue; }
+        if l.starts_with("--") { continue; }   // a comment line (lines are joined with spaces: it would swallow the next)
         buf.push_str(l); buf.push(' ');
         if !l.ends_with(';') { continue; }
         let text = buf.trim().trim_end_matches(';').trim().to_string(); buf.clear(); if text.is_empty() { continue; }
