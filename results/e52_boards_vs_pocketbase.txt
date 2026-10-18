@@ -1,0 +1,91 @@
+E52: demos/boards (multi-tenant task board, Go) on sqweezdb vs the same app on PocketBase 0.40.5, 2026-10-17
+Load tool: demos/boards/bench. 10 orgs x 20 members, HTTP on loopback, both servers with no fsync per commit
+(sqweezdb Visible durability; PocketBase SQLite WAL + synchronous=NORMAL). Each run starts from an empty data directory.
+Note: in the throughput runs sqweezdb inserts ~12x more cards than PocketBase in the same seconds, so the realtime
+'memory' figures are not comparable; the equal-fill run at the end is the memory comparison.
+
+== sqweezdb (bench_sq)
+sqweezdb    signed in 200 users in 0.03 s; server memory 30 MB
+sqweezdb    writes,  1 clients:   21491 cards/s  p50   0.04 ms  p99   0.12 ms  errors 0  server CPU 108%
+sqweezdb    writes, 16 clients:   98340 cards/s  p50   0.13 ms  p99   0.55 ms  errors 0  server CPU 615%
+sqweezdb    writes, 64 clients:  100322 cards/s  p50   0.37 ms  p99   3.22 ms  errors 0  server CPU 646%
+sqweezdb    reads,   1 clients:    4040 lists/s  p50   0.22 ms  p99   0.48 ms  (100 cards each, 0 bad)
+sqweezdb    reads,  16 clients:   13634 lists/s  p50   1.08 ms  p99   2.85 ms  (100 cards each, 0 bad)
+sqweezdb    reads,  64 clients:   15123 lists/s  p50   2.90 ms  p99  15.90 ms  (100 cards each, 0 bad)
+sqweezdb    realtime,  200 subscribers: 1600 cards -> 32000 of 32000 deliveries (100.00%), leaks 0, latency p50 0.5 ms p99 1.1 ms max 2.1 ms, server CPU 6%, memory 673 MB
+sqweezdb    realtime, 1000 subscribers: 1600 cards -> 160000 of 160000 deliveries (100.00%), leaks 0, latency p50 1.2 ms p99 2.6 ms max 3.6 ms, server CPU 14%, memory 714 MB
+
+== sqweezdb (bench_sq_2)
+sqweezdb    signed in 200 users in 0.02 s; server memory 30 MB
+sqweezdb    writes,  1 clients:   21501 cards/s  p50   0.04 ms  p99   0.11 ms  errors 0  server CPU 108%
+sqweezdb    writes, 16 clients:   98189 cards/s  p50   0.13 ms  p99   0.56 ms  errors 0  server CPU 614%
+sqweezdb    writes, 64 clients:  100672 cards/s  p50   0.37 ms  p99   3.22 ms  errors 0  server CPU 652%
+sqweezdb    reads,   1 clients:    4010 lists/s  p50   0.23 ms  p99   0.47 ms  (100 cards each, 0 bad)
+sqweezdb    reads,  16 clients:   13257 lists/s  p50   1.10 ms  p99   3.07 ms  (100 cards each, 0 bad)
+sqweezdb    reads,  64 clients:   14913 lists/s  p50   2.80 ms  p99  16.54 ms  (100 cards each, 0 bad)
+sqweezdb    realtime,  200 subscribers: 1600 cards -> 32000 of 32000 deliveries (100.00%), leaks 0, latency p50 0.5 ms p99 1.2 ms max 1.5 ms, server CPU 6%, memory 666 MB
+sqweezdb    realtime, 1000 subscribers: 1600 cards -> 160000 of 160000 deliveries (100.00%), leaks 0, latency p50 1.1 ms p99 2.3 ms max 3.5 ms, server CPU 13%, memory 705 MB
+
+== pocketbase, defaults (bench_pb)
+pocketbase  setup: collections, rules and 10 orgs x 20 users created in 15.1 s
+pocketbase  signed in 200 users in 0.72 s; server memory 67 MB
+pocketbase  writes,  1 clients:    2911 cards/s  p50   0.30 ms  p99   0.83 ms  errors 0  server CPU 109%
+pocketbase  writes, 16 clients:    8548 cards/s  p50   1.17 ms  p99  10.50 ms  errors 0  server CPU 421%
+pocketbase  writes, 64 clients:    7973 cards/s  p50   4.78 ms  p99  34.95 ms  errors 0  server CPU 401%
+pocketbase  reads,   1 clients:    1323 lists/s  p50   0.72 ms  p99   1.14 ms  (100 cards each, 0 bad)
+pocketbase  reads,  16 clients:    5070 lists/s  p50   2.96 ms  p99   6.75 ms  (100 cards each, 0 bad)
+pocketbase  reads,  64 clients:    5184 lists/s  p50   9.73 ms  p99  43.02 ms  (100 cards each, 0 bad)
+pocketbase  realtime,  200 subscribers: 1600 cards -> 32000 of 32000 deliveries (100.00%), leaks 0, latency p50 8.3 ms p99 19.3 ms max 56.6 ms, server CPU 200%, memory 209 MB
+pocketbase  realtime, 1000 subscribers: 1113 cards -> 111300 of 111300 deliveries (100.00%), leaks 0, latency p50 33.0 ms p99 80.4 ms max 134.9 ms, server CPU 738%, memory 298 MB
+
+== pocketbase, defaults (bench_pb_2)
+pocketbase  setup: collections, rules and 10 orgs x 20 users created in 15.0 s
+pocketbase  signed in 200 users in 0.72 s; server memory 66 MB
+pocketbase  writes,  1 clients:    3023 cards/s  p50   0.30 ms  p99   0.74 ms  errors 0  server CPU 112%
+pocketbase  writes, 16 clients:    8589 cards/s  p50   1.17 ms  p99  10.46 ms  errors 0  server CPU 422%
+pocketbase  writes, 64 clients:    8074 cards/s  p50   4.79 ms  p99  35.03 ms  errors 0  server CPU 407%
+pocketbase  reads,   1 clients:    1327 lists/s  p50   0.72 ms  p99   1.12 ms  (100 cards each, 0 bad)
+pocketbase  reads,  16 clients:    5147 lists/s  p50   2.94 ms  p99   6.52 ms  (100 cards each, 0 bad)
+pocketbase  reads,  64 clients:    5364 lists/s  p50   9.51 ms  p99  40.13 ms  (100 cards each, 0 bad)
+pocketbase  realtime,  200 subscribers: 1600 cards -> 32000 of 32000 deliveries (100.00%), leaks 0, latency p50 8.3 ms p99 20.8 ms max 31.5 ms, server CPU 201%, memory 206 MB
+pocketbase  realtime, 1000 subscribers: 1125 cards -> 112500 of 112500 deliveries (100.00%), leaks 0, latency p50 32.1 ms p99 73.1 ms max 99.2 ms, server CPU 743%, memory 315 MB
+
+== pocketbase, request log off (bench_pbnolog_1)
+pocketbase  setup: collections, rules and 10 orgs x 20 users created in 15.1 s
+pocketbase  signed in 200 users in 0.73 s; server memory 64 MB
+pocketbase  writes,  1 clients:    3132 cards/s  p50   0.28 ms  p99   0.77 ms  errors 0  server CPU 104%
+pocketbase  writes, 16 clients:    9525 cards/s  p50   1.05 ms  p99   9.13 ms  errors 0  server CPU 412%
+pocketbase  writes, 64 clients:    9185 cards/s  p50   4.18 ms  p99  29.93 ms  errors 0  server CPU 399%
+pocketbase  reads,   1 clients:    1350 lists/s  p50   0.71 ms  p99   1.08 ms  (100 cards each, 0 bad)
+pocketbase  reads,  16 clients:    5488 lists/s  p50   2.78 ms  p99   5.77 ms  (100 cards each, 0 bad)
+pocketbase  reads,  64 clients:    5442 lists/s  p50   8.16 ms  p99  43.54 ms  (100 cards each, 0 bad)
+pocketbase  realtime,  200 subscribers: 1600 cards -> 32000 of 32000 deliveries (100.00%), leaks 0, latency p50 8.4 ms p99 46.6 ms max 55.3 ms, server CPU 195%, memory 135 MB
+pocketbase  realtime, 1000 subscribers: 1109 cards -> 110900 of 110900 deliveries (100.00%), leaks 0, latency p50 33.4 ms p99 83.6 ms max 140.8 ms, server CPU 722%, memory 231 MB
+
+== pocketbase, request log off (bench_pbnolog_2)
+pocketbase  setup: collections, rules and 10 orgs x 20 users created in 15.1 s
+pocketbase  signed in 200 users in 0.72 s; server memory 74 MB
+pocketbase  writes,  1 clients:    3168 cards/s  p50   0.28 ms  p99   0.73 ms  errors 0  server CPU 104%
+pocketbase  writes, 16 clients:    9484 cards/s  p50   1.06 ms  p99   9.22 ms  errors 0  server CPU 414%
+pocketbase  writes, 64 clients:    9070 cards/s  p50   4.10 ms  p99  32.31 ms  errors 0  server CPU 391%
+pocketbase  reads,   1 clients:    1341 lists/s  p50   0.71 ms  p99   1.10 ms  (100 cards each, 0 bad)
+pocketbase  reads,  16 clients:    5460 lists/s  p50   2.79 ms  p99   5.83 ms  (100 cards each, 0 bad)
+pocketbase  reads,  64 clients:    5483 lists/s  p50   7.84 ms  p99  43.51 ms  (100 cards each, 0 bad)
+pocketbase  realtime,  200 subscribers: 1600 cards -> 32000 of 32000 deliveries (100.00%), leaks 0, latency p50 8.6 ms p99 46.4 ms max 59.6 ms, server CPU 198%, memory 134 MB
+pocketbase  realtime, 1000 subscribers: 1111 cards -> 111100 of 111100 deliveries (100.00%), leaks 0, latency p50 33.2 ms p99 83.3 ms max 128.4 ms, server CPU 734%, memory 214 MB
+
+== equal fill: exactly 200,000 cards from 16 clients, then server memory and disk
+sqweezdb    signed in 200 users in 0.02 s; server memory 30 MB
+sqweezdb    filled 200000 cards in 1.9 s; server memory 102 MB
+sqweezdb    disk: 60M
+--- pocketbase with its request log on (default)
+pocketbase  setup: collections, rules and 10 orgs x 20 users created in 15.1 s
+pocketbase  signed in 200 users in 0.72 s; server memory 70 MB
+pocketbase  filled 200000 cards in 24.3 s; server memory 205 MB
+pocketbase  disk: 139M (data.db 45M, auxiliary.db 84M)
+--- pocketbase -no-request-log
+pocketbase  setup: collections, rules and 10 orgs x 20 users created in 14.9 s
+pocketbase  signed in 200 users in 0.72 s; server memory 68 MB
+pocketbase  filled 200000 cards in 21.3 s; server memory 115 MB
+pocketbase  disk: 50M (data.db 45M, auxiliary.db 24K)
+sqweezdb    disk after its final snapshot (log compacted): 63M

@@ -2,6 +2,7 @@ pub mod capi;
 pub mod cloud;
 pub mod config;
 pub mod engine;
+pub mod expr;
 pub mod live;
 pub mod net;
 pub mod sql;

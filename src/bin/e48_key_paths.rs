@@ -1,5 +1,6 @@
 //! Experiment 48: the primary-key paths, measured before and after widening keys to 128 bits (UUID primary keys).
-//! INT keys must not get slower; UUID keys are measured on the same paths once supported (pass `uuid`).
+//! INT keys must not get slower; UUID keys are measured on the same paths once supported (pass `uuid`), and text keys
+//! (pass `text` for 15-character keys, packed exactly, or `textlong` for 27-character keys, which are hashed).
 use sqweezdb::config::{Config, SnapshotPolicy};
 use sqweezdb::sql::{Session, Sql};
 use sqweezdb::table::Value;
@@ -9,11 +10,12 @@ const N: i64 = 1_000_000; const ROOT: &str = "data/nocow/e48";
 fn pr(label: &str, n: i64, el: f64) { println!("{label:<62} {:>9.3} us/op {:>11.0}/s", el * 1e6 / n as f64, n as f64 / el); }
 fn cfg() -> Config { Config { snapshot: SnapshotPolicy { log_bytes: None, idle_after: None }, ..Config::default() } }
 fn main() {
-    let uuid = std::env::args().nth(1).as_deref() == Some("uuid");
-    let kt = if uuid { "UUID" } else { "INT" };
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    let (uuid, text, long) = (mode == "uuid", mode.starts_with("text"), mode == "textlong");
+    let kt = if uuid { "UUID" } else if long { "VARCHAR(32)" } else if text { "VARCHAR(15)" } else { "INT" };
     println!("=== E48: primary-key paths with {kt} keys (1M rows, in-process) ===");
-    let d = std::path::Path::new(ROOT).join(kt); let _ = std::fs::remove_dir_all(&d);
-    let key = |i: i64| -> Value { if uuid { Value::Text(format!("0190f3a2-{:04x}-7000-8000-{:012x}", (i >> 48) & 0xffff, i & 0xffff_ffff_ffff)) } else { Value::Int(i) } };
+    let d = std::path::Path::new(ROOT).join(if mode.is_empty() { "INT" } else { mode.as_str() }); let _ = std::fs::remove_dir_all(&d);
+    let key = |i: i64| -> Value { if uuid { Value::Text(format!("0190f3a2-{:04x}-7000-8000-{:012x}", (i >> 48) & 0xffff, i & 0xffff_ffff_ffff)) } else if long { Value::Text(format!("customer-account-{i:010}")) } else if text { Value::Text(format!("r{i:014}")) } else { Value::Int(i) } };
     let sql = Sql::open_with(&d, cfg()).unwrap(); let mut s = Session::default();
     sql.exec_s(&mut s, &format!("CREATE TABLE users(id {kt} PRIMARY KEY, name VARCHAR(16))"), &[]).unwrap();
     sql.exec_s(&mut s, &format!("CREATE TABLE orders(id {kt} PRIMARY KEY, user_id {kt} NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount DOUBLE)"), &[]).unwrap();
@@ -26,7 +28,7 @@ fn main() {
     let get = sql.prepare("SELECT name FROM users WHERE id = ?").unwrap(); let t = Instant::now();
     for i in 0..300_000i64 { assert_eq!(sql.execute_s(&mut s, &get, &[key((i * 7919) % N + 1)]).unwrap().len(), 1); }
     pr("point read by primary key", 300_000, t.elapsed().as_secs_f64());
-    if !uuid { let rg = sql.prepare("SELECT count(*) FROM users WHERE id >= ? AND id <= ?").unwrap(); let t = Instant::now(); for i in 0..2000i64 { sql.execute_s(&mut s, &rg, &[Value::Int(i * 400 + 1), Value::Int(i * 400 + 1000)]).unwrap(); } pr("range count of 1000 keys", 2000, t.elapsed().as_secs_f64()); }
+    if !uuid && !text { let rg = sql.prepare("SELECT count(*) FROM users WHERE id >= ? AND id <= ?").unwrap(); let t = Instant::now(); for i in 0..2000i64 { sql.execute_s(&mut s, &rg, &[Value::Int(i * 400 + 1), Value::Int(i * 400 + 1000)]).unwrap(); } pr("range count of 1000 keys", 2000, t.elapsed().as_secs_f64()); }
     let j = sql.prepare("SELECT o.amount, u.name FROM orders o JOIN users u ON o.user_id = u.id WHERE o.id = ?").unwrap(); let t = Instant::now();
     for i in 0..100_000i64 { assert_eq!(sql.execute_s(&mut s, &j, &[key(10_000_000 + (i * 7919) % N + 1)]).unwrap().len(), 1); }
     pr("join order -> user through the foreign key, by order key", 100_000, t.elapsed().as_secs_f64());

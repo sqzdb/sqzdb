@@ -36,7 +36,7 @@ schema changes without downtime, and backup to any S3-compatible bucket.
 | **Concurrent writers** | Commits share one append-only log with group commit, so concurrent writers share each fsync: 256 writers make 130,000 to 165,000 durable commits per second, where SQLite stays near 2,300. Transactions conflict per row, not per database. |
 | **Lock-free reads** | Readers never take a lock. A point read costs about 0.4 µs in-process, and 8 threads make 17.5 million point reads per second. |
 | **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT(n)`, `BYTES(n)`, `TIMESTAMP`, `UUID`. A value of the wrong type is rejected, never stored. |
-| **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), `DEFAULT now()`, and `INSERT … RETURNING`. |
+| **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
 | **Online schema changes** | `ALTER TABLE` adds, drops, renames or retypes a column while reads and writes continue. |
@@ -109,7 +109,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.2.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.3.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -277,7 +277,7 @@ One process owns a database at a time. A second process, or a second handle in t
 refused instead of corrupting the log. Other processes connect to the owner; see
 [Configuration](#configuration) for `listen`.
 
-### Primary keys: INT or UUID
+### Primary keys: INT, UUID or text
 
 ```sql
 CREATE TABLE accounts (id UUID PRIMARY KEY DEFAULT uuid(), name VARCHAR(64));
@@ -296,28 +296,35 @@ which reveal nothing.
 Without a column list, `INSERT` needs a value for every column; write `DEFAULT` for a generated one.
 With a column list, the columns left out take their defaults.
 
-A UUID key stores 16 bytes instead of 8 and costs more per operation. With 1 million rows per table:
+A text key (`TEXT`, `VARCHAR(n)` or `BYTES(n)` as the primary key) fits ids that already exist
+elsewhere: slugs, codes, ids from another system. It compares exactly, so case and trailing spaces
+count. A key of up to 15 bytes is kept as it is; a longer one is keyed by 120 bits of its SHA-256, so
+two keys could only be confused through a SHA-256 collision. The application supplies text keys; there
+is no automatic one. A range over a text key (`id >= 'm'`) runs as a filter.
 
-| Operation | `INT` key | `UUID` key |
-|---|---|---|
-| Insert | 0.40 µs | 0.58 µs |
-| Insert with a foreign key check | 0.67 µs | 1.07 µs |
-| Point read by key | 0.27 µs | 0.50 µs |
-| Join one row by key | 0.93 µs | 1.18 µs |
-| Join all 1M orders to their users | 16 ms | 74 ms |
-| Delete by key | 0.50 µs | 0.72 µs |
-| Restart from snapshot | 90 ms | 87 ms |
+Wider keys cost more per operation. With 1 million rows per table:
+
+| Operation | `INT` key | `UUID` key | Text, 15 bytes | Text, 27 bytes |
+|---|---|---|---|---|
+| Insert | 0.39 µs | 0.58 µs | 0.66 µs | 0.73 µs |
+| Insert with a foreign key check | 0.63 µs | 1.01 µs | 1.32 µs | 1.46 µs |
+| Point read by key | 0.25 µs | 0.44 µs | 0.43 µs | 0.42 µs |
+| Join one row by key | 0.90 µs | 1.09 µs | 1.11 µs | 1.11 µs |
+| Join all 1M orders to their users | 16 ms | 62 ms | 109 ms | 182 ms |
+| Delete by key | 0.50 µs | 0.71 µs | 1.11 µs | 1.23 µs |
+| Restart from snapshot | 75 ms | 66 ms | 83 ms | 119 ms |
 
 Use `INT` when ids stay inside your system and speed matters most. Use `UUID` when ids are shown to
-users, appear in URLs, or are created by clients. Either way, an access check protects a row; an id
-that is hard to guess does not.
+users, appear in URLs, or are created by clients. Use text when the ids come from outside. Either way,
+an access check protects a row; an id that is hard to guess does not.
 
 ### Transactions and durability
 
 `BEGIN`, `COMMIT` and `ROLLBACK` use optimistic concurrency: transactions run without locks, and a
 commit that conflicts with a concurrent one fails with `CONFLICT`. `db.transaction(fn)` in Node retries
-those automatically. Reads inside an open transaction see committed data, not the transaction's own
-writes.
+those automatically. Reads inside an open transaction see committed data. A lookup by primary key also
+sees the transaction's own writes; any other read of a table the transaction has written fails with
+`TRANSACTION` instead of returning rows without those writes.
 
 | `durable` | A commit returns when | A crash can lose |
 |---|---|---|
@@ -325,7 +332,9 @@ writes.
 | `true` | it is fsynced; concurrent writers share one fsync | nothing acknowledged |
 | `'cloud'` | its log record is in the backup bucket | nothing acknowledged |
 
-With `durable: false`, Node's `run().durable` promise resolves at the moment a specific write is on disk.
+With `durable: false`, Node's `run().durable` promise resolves at the moment a specific write is on disk. With
+`log.syncDelay` set, the background fsync may wait up to that long (see [configuration](#configuration)); a commit or
+`durable` promise that waits for the disk still gets its sync right away.
 
 ### Live queries and subscriptions
 
@@ -481,6 +490,7 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `live.debounce` | `5ms` | How long a live query waits to batch changes before re-running. |
 | `live.queue` | `65536` | Events a subscriber may fall behind before it is dropped. |
 | `log.threadsIdleAfter` | off | Let log threads exit when idle; for many idle databases in one process. |
+| `log.syncDelay` | off | With `durable: false`, hold the background fsync up to this long so one fsync covers more writes. For hosts with thousands of small databases (one per tenant or agent) on one disk. A machine crash can then lose up to this much; a process crash still loses nothing, and anything that waits for durability syncs at once. At most `60s`. |
 
 Durations are written as `'5ms'`, `'1s'`, `'2m'`, `'1h'`, `'7d'` or a number of milliseconds. Sizes are
 `'256MB'`, `'1GB'` or a number of bytes. `0` turns a snapshot policy off.
@@ -510,24 +520,43 @@ token = "${DB_TOKEN}"
 
 **Tables and constraints**
 
-- `CREATE TABLE` with an `INT` or `UUID` primary key, `NOT NULL`, `DEFAULT` (a constant, `uuid()`,
-  `gen_random_uuid()` or `now()`), one `UNIQUE` column, and
-  `FOREIGN KEY … REFERENCES … ON DELETE RESTRICT | CASCADE | SET NULL`.
-- `CREATE INDEX` on `INT`, `TIMESTAMP` and `UUID` columns.
+- `CREATE TABLE [IF NOT EXISTS]` with an `INT`, `UUID`, text or bytes primary key, `NOT NULL`, `DEFAULT`
+  (a constant, `uuid()`, `gen_random_uuid()` or `now()`), one `UNIQUE` column, and
+  `FOREIGN KEY … REFERENCES … ON DELETE RESTRICT | CASCADE | SET NULL`. The key and the `UNIQUE`
+  column can also be declared at the end: `PRIMARY KEY (id)`, `UNIQUE (email)`.
+- `CREATE INDEX` on one column of type `INT`, `TIMESTAMP`, `UUID`, `TEXT` or `BYTES`.
 - `ALTER TABLE … ADD | DROP | RENAME COLUMN`, `ALTER COLUMN … TYPE`, `SET | DROP NOT NULL`, all online.
 
 **Queries**
 
-- `SELECT` with `WHERE` (`=`, `<>`, `<`, `>`, `<=`, `>=`, `AND`, `IN`, `NOT IN`, `IS NULL`, `BETWEEN`),
-  `GROUP BY` one column with `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, `ORDER BY` one column with `LIMIT`,
-  and aliases.
-- Equality `JOIN` across any number of tables, and scalar, `IN`, `EXISTS` and correlated subqueries.
+- `SELECT` with `WHERE` (comparisons, `AND`, `OR`, `NOT`, `IN`, `NOT IN`, `IS NULL`, `BETWEEN`, `LIKE`,
+  `ILIKE`), `DISTINCT`, `GROUP BY` any number of columns or expressions, `HAVING`, `ORDER BY` several
+  columns, positions or aliases, `LIMIT` and `OFFSET`. `LIKE` is case-sensitive; `ILIKE` is not.
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT …)` and the other `DISTINCT` forms,
+  `group_concat` and `string_agg`, over columns or expressions, and expressions over aggregates.
+- Expressions wherever a value goes: arithmetic, `||`, `CASE`, `CAST`, JSON `->` and `->>`, and functions
+  for text (`lower`, `upper`, `length`, `substr`, `replace`, `trim`, `instr`, `concat`, `concat_ws`, `left`,
+  `right`, `reverse`, `repeat`, `hex`), numbers (`abs`, `round`, `ceil`, `floor`, `sqrt`, `power`, `sign`,
+  `mod`, `greatest`, `least`), NULL (`coalesce`, `ifnull`, `nullif`, `iif`), time (`now()`,
+  `current_date`, `date`, `time`, `datetime`, `strftime`, `unixepoch`, `EXTRACT`), JSON (`json_extract`,
+  `json`, `json_valid`, `json_array_length`, `json_object`, `json_array`, `json_type`), and `uuid()`,
+  `gen_random_uuid()` and `typeof`. Unlike SQLite, a division by zero, an integer overflow (in `SUM` too)
+  and a value of the wrong type are errors, not NULL or a guess.
+- `SELECT` without `FROM`: `SELECT 1 + 1`, `SELECT now()`.
+- `JOIN` and `LEFT JOIN` on equalities across up to eight tables, and scalar, `IN`, `EXISTS` and
+  correlated subqueries. Joined columns hold the same kind of value: integers (`INT`, `TIMESTAMP`),
+  UUIDs, text, or bytes.
 
 **Writes**
 
-- `INSERT … VALUES` with several rows (all or none), `DEFAULT` as a value, and `RETURNING`.
-- `UPDATE … WHERE id = ?` by primary key, and `DELETE … WHERE …`.
-- `BEGIN`, `COMMIT`, `ROLLBACK`.
+- `INSERT … VALUES` with several rows (all or none), `DEFAULT` as a value, `INSERT … SELECT`, and
+  `RETURNING`.
+- Upserts: `ON CONFLICT (col) DO NOTHING`, `ON CONFLICT (col) DO UPDATE SET … [WHERE …]` with
+  `excluded.col`, `INSERT OR IGNORE`, `INSERT OR REPLACE` and `REPLACE INTO`.
+- `UPDATE … SET col = expression WHERE id = ?` by primary key, and `DELETE … WHERE` any condition.
+- `BEGIN`, `COMMIT`, `ROLLBACK`. Inside a transaction, a lookup by primary key sees the transaction's own
+  writes. Any other read of a table the transaction has already written is refused with `TRANSACTION`,
+  because reads see committed data only: read before writing, or commit first.
 
 **Access control**
 
@@ -539,15 +568,16 @@ token = "${DB_TOKEN}"
 - `TIMESTAMP` literals as text: `'2026-10-15'`, `'2026-10-15 19:30:00'`, `'2026-10-15T19:30:00.123Z'`.
 - `UUID` literals as text, with or without hyphens.
 
-**Not supported yet:** `OR`, `LIKE`, `DISTINCT`, `HAVING`, arithmetic and functions inside expressions,
-variable-length text (every text column has a maximum), multi-column indexes, indexes on text columns,
-`UPDATE` by anything other than the primary key, `INSERT … SELECT`, `DROP TABLE`, `RIGHT` and `FULL`
-joins, views and triggers. A correlated `IN (subquery)` can't be keyed on a UUID column; use `EXISTS` or
-a join. A table holds at most 16.7 million rows.
+**Not supported yet:** `UPDATE` by anything other than the primary key, `UPDATE … RETURNING`, `RIGHT`
+and `FULL` joins, `WITH`, `UNION`, window functions, subqueries in `FROM`, correlated subqueries on text
+columns, `DISTINCT ON`, `NULLS FIRST` and `NULLS LAST`, variable-length text (every text column has a
+maximum, at most 65,535 bytes), `CHECK` constraints, generated columns, a second `UNIQUE` column,
+composite primary keys, multi-column indexes, `DELETE … LIMIT`, savepoints, `DROP TABLE`, views and
+triggers. A correlated `IN (subquery)` can't be keyed on a UUID column; use `EXISTS` or a join. A table
+holds at most 16.7 million rows.
 
-> [!NOTE]
-> These are accepted today but not enforced, and will be refused until they are: a second `UNIQUE`
-> column, `CHECK` constraints, and `TEXT` or `BYTES` wider than 65,535 bytes.
+Anything not supported is refused with `SYNTAX` ("unsupported: … is not implemented yet"); nothing is
+accepted and then ignored.
 
 ### Error codes
 
@@ -557,7 +587,7 @@ Every binding reports errors with a stable code. In Node it is `err.code` on a `
 |---|---|
 | `SYNTAX` | The statement can't be parsed or uses something unsupported. |
 | `SCHEMA` | No such table, column or role. |
-| `TYPE` | A value doesn't fit its column: the wrong type, too long, or NULL in a `NOT NULL` column. |
+| `TYPE` | A value doesn't fit: the wrong type for its column, operator or function, too long, NULL in a `NOT NULL` column, a division by zero, or a number out of range. |
 | `DUPLICATE` | A primary key or `UNIQUE` value already exists. |
 | `FOREIGN_KEY` | A referenced row is missing, or a delete is blocked by children. |
 | `DENIED` | The session lacks a grant, or a row falls outside its policy. |
@@ -583,6 +613,19 @@ all readers of that same log.
 
 Other processes never open the files. They connect to the owner over a Unix socket, upgrade to a
 shared-memory ring for reads of about 0.6 µs, or connect over TCP with a token.
+
+## Demos
+
+Two Go apps on the Go binding, each benchmarked against the same app on PocketBase:
+
+- [`demos/boards`](demos/boards): a multi-tenant task board. The tenant rule is a row policy, each
+  request runs as the signed-in member, and live updates are one subscription per organization. Against
+  PocketBase 0.40.5 it handled 11 to 12 times the card inserts, and live updates took 1 ms instead of 33 ms (p50,
+  1,000 browsers).
+- [`demos/agents`](demos/agents): a database per AI agent, created in a quarter of a millisecond, closed
+  when idle and forgotten by deleting its directory; also compared with SQLite and Turso at 10,000
+  agents. Its README lists where it is behind as well: fixed-width text makes long memories expensive,
+  and there is no text or vector search yet.
 
 ## Building from source
 
@@ -620,7 +663,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.2.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.3.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

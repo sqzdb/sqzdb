@@ -1,0 +1,25 @@
+category	feature	pocketbase
+Backend	Admin UI	yes: the admin dashboard at /_/
+Backend	REST API generated for each table	yes: create, list, view, update and delete for every collection, no code
+Backend	Server-side code (hooks, custom routes)	yes: JavaScript hooks (custom routes, record events), or Go when used as a library
+Backend	Scheduled jobs (cron)	yes: cronAdd() in hooks; listed and runnable from the API
+Backend	Filtering, sorting and paging through the API	yes: filter expressions (=, !=, >, ~ contains, ?= any), JSON paths, multi-column sort, pages
+Backend	Expand relations in one request	yes: expand=relation returns the related record inline
+Backend	SQL views as API collections	yes: a SQL SELECT with joins and JSON functions becomes a read-only collection; its column parser refused a window function
+Backend	Transactions through the API (batch)	yes: /api/batch (off by default), all or nothing
+Backend	Export and import the schema	yes: export the collections as JSON and import them into another instance
+Backend	Migration files	yes: every schema change made in the UI or API is written as a JS migration file (2 so far)
+Auth	Email and password sign-in	yes: sign-up, sign-in, token refresh, built-in users collection
+Auth	OAuth2 sign-in (Google, GitHub, …)	yes: providers configured by settings, the sign-in URL and code exchange handled by the server (verified up to the provider's redirect; no real Google account used)
+Auth	Email verification	yes: the email is sent and its link verifies the account
+Auth	Password reset by email	yes: reset email with a link (also email change)
+Auth	One-time code by email (OTP)	yes: a one-time code by email signs the user in
+Auth	Act as a user (impersonation)	yes: a superuser gets a token acting as any user
+Auth	Multi-factor authentication	yes: with MFA on, a password alone returns an mfaId that a second method (OTP, OAuth2) must complete
+Auth	Per-user access rules	yes: per-collection rules on the request's user and on related records (E52)
+Files	File uploads with thumbnails	yes: file fields, size and type limits, thumbnails generated on request (100x100 verified)
+Files	Files in S3-compatible storage	yes: files stored in an S3-compatible bucket (tested against a local S3 server)
+Operations	Backups	yes: a zip of pb_data from the API or UI, scheduled backups, optionally to S3; restore replaces the data and restarts
+Operations	Rate limiting	yes: per-route rules by IP or user (8 quick requests got 5 × 429)
+Operations	Request logs	yes: every request logged to a separate SQLite file, searchable in the UI (66 so far)
+Operations	Data readable by other tools	yes: the data is a plain SQLite file any SQLite tool can read (8 notes)

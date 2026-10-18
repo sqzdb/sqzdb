@@ -1,0 +1,91 @@
+E53: a database per agent, 2026-10-17. src/bin/e53_agents.rs, two full runs; each engine in its own child process.
+SQLite: system libsqlite3 3.53.4, WAL, synchronous=OFF. Turso 0.8.3, synchronous=OFF. Ours: durable off, log threads exit after 300 ms idle;
+default fsyncs each write in the background at once; '1000ms' rows use log.syncDelay = 1s. PocketBase 0.40.5: one process per agent.
+
+== run 1
+=== E53: a database per agent, 10000 agents x 20 memories, each engine in its own process ===
+sqweezdb        spawn: create + schema + 20 writes + read      234 us per agent (2.34 s for 10000)
+sqweezdb        memory with every agent open                   101 KB per agent (984 MB for 10000)
+sqweezdb        disk per agent (20 memories)                   16.0 KB
+sqweezdb        random agents, 8 threads: write + read last 10 29270 agent steps/s
+sqweezdb        reopen a closed agent + read last 10           188 us per agent
+sqweezdb 1000ms spawn: create + schema + 20 writes + read      285 us per agent (2.85 s for 10000)
+sqweezdb 1000ms memory with every agent open                   156 KB per agent (1519 MB for 10000)
+sqweezdb 1000ms disk per agent (20 memories)                   16.0 KB
+sqweezdb 1000ms random agents, 8 threads: write + read last 10 81447 agent steps/s
+sqweezdb 1000ms reopen a closed agent + read last 10           209 us per agent
+sqlite          spawn: create + schema + 20 writes + read      253 us per agent (2.53 s for 10000)
+sqlite          memory with every agent open                   188 KB per agent (1838 MB for 10000)
+sqlite          disk per agent (20 memories)                   128.0 KB
+sqlite          random agents, 8 threads: write + read last 10 52714 agent steps/s
+sqlite          reopen a closed agent + read last 10           74 us per agent
+turso           spawn: create + schema + 20 writes + read      1927 us per agent (19.27 s for 10000)
+turso           memory with every agent open                   865 KB per agent (8448 MB for 10000)
+turso           disk per agent (20 memories)                   96.0 KB
+turso           random agents, 1 thread: write + read last 10  43948 agent steps/s
+turso           random agents, 8 threads: write + read last 10 55673 agent steps/s (each thread owns an eighth of the agents)
+turso           reopen a closed agent + read last 10           195 us per agent
+pocketbase      spawn: start a process until it answers        44 ms per agent (median of 40), slowest 70 ms
+pocketbase      memory per idle process                        35 MB per agent (1402 MB for 40; 10000 would need 342.2 GB)
+pocketbase      disk per idle agent (empty)                    1100 KB
+
+== run 2
+=== E53: a database per agent, 10000 agents x 20 memories, each engine in its own process ===
+sqweezdb        spawn: create + schema + 20 writes + read      235 us per agent (2.35 s for 10000)
+sqweezdb        memory with every agent open                   102 KB per agent (991 MB for 10000)
+sqweezdb        disk per agent (20 memories)                   16.0 KB
+sqweezdb        random agents, 8 threads: write + read last 10 25990 agent steps/s
+sqweezdb        reopen a closed agent + read last 10           189 us per agent
+sqweezdb 1000ms spawn: create + schema + 20 writes + read      292 us per agent (2.92 s for 10000)
+sqweezdb 1000ms memory with every agent open                   157 KB per agent (1531 MB for 10000)
+sqweezdb 1000ms disk per agent (20 memories)                   16.0 KB
+sqweezdb 1000ms random agents, 8 threads: write + read last 10 80381 agent steps/s
+sqweezdb 1000ms reopen a closed agent + read last 10           206 us per agent
+sqlite          spawn: create + schema + 20 writes + read      251 us per agent (2.51 s for 10000)
+sqlite          memory with every agent open                   188 KB per agent (1838 MB for 10000)
+sqlite          disk per agent (20 memories)                   128.0 KB
+sqlite          random agents, 8 threads: write + read last 10 54320 agent steps/s
+sqlite          reopen a closed agent + read last 10           73 us per agent
+turso           spawn: create + schema + 20 writes + read      1818 us per agent (18.18 s for 10000)
+turso           memory with every agent open                   1201 KB per agent (11725 MB for 10000)
+turso           disk per agent (20 memories)                   96.0 KB
+turso           random agents, 1 thread: write + read last 10  43898 agent steps/s
+turso           random agents, 8 threads: write + read last 10 50291 agent steps/s (each thread owns an eighth of the agents)
+turso           reopen a closed agent + read last 10           812 us per agent
+pocketbase      spawn: start a process until it answers        43 ms per agent (median of 40), slowest 72 ms
+pocketbase      memory per idle process                        35 MB per agent (1406 MB for 40; 10000 would need 343.2 GB)
+pocketbase      disk per idle agent (empty)                    1100 KB
+
+== probes (10,000 agents unless noted)
+ours, log threads kept alive (threadsIdleAfter 60 s, per-write fsync): 12,341 steps/s, 404 KB per agent
+ours on tmpfs (fsync nearly free): 159,177 steps/s; per step: get 5.9 us, insert 28.1 us, last-10 16.1 us
+ours on btrfs, per-write fsync: 29,424 steps/s; per step: get 88.0 us, insert 171.0 us, last-10 12.9 us
+ours with log.syncDelay 200 ms: 32,663 steps/s (each agent writes about every 0.4 s, so 200 ms batches nothing)
+first run, SQLite synchronous=NORMAL, no sync() between phases: create 5,203 us per agent; 2,580 steps/s (writes stalled behind the creation phase's writeback)
+SQLite NORMAL, 2,000 agents: create 3,068 us per agent on btrfs vs 128 us on tmpfs (file creation syncs); 93,718 steps/s
+
+== final engine (log segment reuse on idle restart, stop() waits for restarted threads): ours only, two runs per setting; the SQLite, Turso and PocketBase rows above are unchanged code
+== run 1
+sqweezdb        spawn: create + schema + 20 writes + read      232 us per agent (2.32 s for 10000)
+sqweezdb        memory with every agent open                   101 KB per agent (988 MB for 10000)
+sqweezdb        disk per agent (20 memories)                   16.0 KB
+sqweezdb        random agents, 8 threads: write + read last 10 32300 agent steps/s
+sqweezdb        reopen a closed agent + read last 10           175 us per agent
+== run 1
+sqweezdb 1000ms spawn: create + schema + 20 writes + read      274 us per agent (2.74 s for 10000)
+sqweezdb 1000ms memory with every agent open                   149 KB per agent (1456 MB for 10000)
+sqweezdb 1000ms disk per agent (20 memories)                   16.0 KB
+sqweezdb 1000ms random agents, 8 threads: write + read last 10 92713 agent steps/s
+sqweezdb 1000ms reopen a closed agent + read last 10           202 us per agent
+== run 2
+sqweezdb        spawn: create + schema + 20 writes + read      243 us per agent (2.43 s for 10000)
+sqweezdb        memory with every agent open                   99 KB per agent (971 MB for 10000)
+sqweezdb        disk per agent (20 memories)                   16.0 KB
+sqweezdb        random agents, 8 threads: write + read last 10 42699 agent steps/s
+sqweezdb        reopen a closed agent + read last 10           181 us per agent
+== run 2
+sqweezdb 1000ms spawn: create + schema + 20 writes + read      284 us per agent (2.84 s for 10000)
+sqweezdb 1000ms memory with every agent open                   154 KB per agent (1507 MB for 10000)
+sqweezdb 1000ms disk per agent (20 memories)                   16.0 KB
+sqweezdb 1000ms random agents, 8 threads: write + read last 10 100977 agent steps/s
+sqweezdb 1000ms reopen a closed agent + read last 10           206 us per agent

@@ -8,6 +8,7 @@ use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use crate::util::FastMap;
 use std::sync::{Arc, Mutex};
+use crate::expr::{SExpr, Op, Cast as XCast};
 
 #[derive(Clone)] pub enum Expr { Lit(Value), Param(usize), List(Vec<Expr>), Set(Arc<SelectPlan>), Scalar(Arc<SelectPlan>), /// INSERT: the next automatic primary key
     AutoId, /// INSERT: a value computed per row (`uuid()`, `now()`)
@@ -16,14 +17,205 @@ impl std::fmt::Debug for Expr { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -
 #[derive(Clone, Copy, Debug, PartialEq)] pub enum Cmp { Eq, Ne, Lt, Le, Gt, Ge, IsNull, IsNotNull, In, NotIn }
 #[derive(Clone, Debug)] pub struct Pred { pub col: usize, pub cmp: Cmp, pub rhs: Expr }
 #[derive(Clone, Debug)] pub enum Agg { CountStar, CountCol(usize), Sum(usize), Avg(usize), Min(usize), Max(usize) }
-#[derive(Clone, Debug)] pub enum Proj { Col(usize), Agg(Agg), Sub(usize) }
+/// One output column: a column, an aggregate, a scalar subquery, a row expression (`exprs[i]`), or a value the post
+/// step computes after aggregation (an expression over aggregates).
+#[derive(Clone, Debug)] pub enum Proj { Col(usize), Agg(Agg), Sub(usize), Expr(usize), Later }
 #[derive(Clone)] pub enum Access { Pk(Expr), Unique(Expr), Range { lo: Expr, lo_excl: bool, hi: Expr, hi_excl: bool }, Index(Arc<SecIndex>, Expr), Scan }
 /// Equi-join chain. The probe table is scanned (or reached by key/index); each step joins one more table whose join
 /// column is its primary key, copying that table's needed columns next to the row, so the pipeline sees one virtual row.
-pub struct JoinStep { pub build: Arc<Table>, pub build_key: usize, pub key_vidx: usize, pub build_preds: Vec<Pred>, pub build_cols: Vec<usize>, pub base: usize, pub vbase: usize, pub build_access: Access }
-pub struct JoinPlan { pub probe: Arc<Table>, pub probe_access: Access, pub probe_preds: Vec<Pred>, pub steps: Vec<JoinStep>, pub index_first: Option<Arc<SecIndex>> }
-pub struct SelectPlan { pub table: Arc<Table>, pub schema: Schema, pub access: Access, pub preds: Vec<Pred>, pub proj: Vec<Proj>, pub names: Vec<String>, pub group_by: Option<usize>, pub order: Option<(usize, bool)>, pub limit: Option<usize>, pub join: Option<JoinPlan>, pub corr: Option<(usize, usize)>, pub subs: Vec<(Arc<SelectPlan>, Option<usize>)> }
-pub enum Plan { CreateTable(Schema), Insert { table: Arc<Table>, rows: Vec<Vec<Expr>>, returning: Option<Vec<usize>> }, Select(SelectPlan), Update { table: Arc<Table>, sets: Vec<(usize, Expr)>, pk: Expr }, Delete { table: Arc<Table>, access: Access, preds: Vec<Pred> }, Begin, Commit, Rollback, Alter { table: String, ops: Vec<AlterOp> } }
+pub struct JoinStep { pub build: Arc<Table>, pub build_key: usize, pub key_vidx: usize, pub build_preds: Vec<Pred>, pub build_cols: Vec<usize>, pub base: usize, pub vbase: usize, pub build_access: Access,
+    /// LEFT JOIN: a row with no match continues with this table's columns NULL; `multi`: the join column is not the
+    /// table's primary key, so a row can match several (one-to-many)
+    pub outer: bool, pub multi: bool }
+pub struct JoinPlan { pub probe: Arc<Table>, pub probe_access: Access, pub probe_preds: Vec<Pred>, pub steps: Vec<JoinStep>, pub index_first: Option<Arc<SecIndex>>,
+    /// any outer or one-to-many step: run by `run_joins_general`
+    pub general: bool }
+pub struct SelectPlan { pub table: Arc<Table>, pub schema: Schema, pub access: Access, pub preds: Vec<Pred>, pub proj: Vec<Proj>, pub names: Vec<String>, pub group_by: Option<usize>, pub order: Option<(usize, bool)>, pub limit: Option<usize>, pub join: Option<JoinPlan>, pub corr: Option<(usize, usize)>, pub subs: Vec<(Arc<SelectPlan>, Option<usize>)>,
+    /// What runs after the scan's own aggregation and top k; None keeps the single-pass path
+    pub post: Option<Arc<Post>>,
+    /// Row expressions for `Proj::Expr`, and WHERE conditions the compiled predicates cannot express (E55)
+    pub exprs: Vec<SExpr>, pub filters: Vec<SExpr> }
+/// HAVING, DISTINCT, ORDER BY on several keys or on what the scan cannot sort, OFFSET, and the LIMIT that has to wait
+/// for them, applied to the rows the scan produced. With `grouping`, the grouping itself also happens here (several GROUP
+/// BY columns, aggregates over DISTINCT values). Rows carry hidden helper columns after `visible` (ORDER BY or HAVING
+/// items that are not selected), dropped at the end.
+pub struct Post { grouping: Option<GenAgg>, exprs: Vec<(usize, SExpr)>, having: Option<SExpr>, distinct: bool, order: Vec<(usize, bool)>, offset: usize, limit: Option<usize>, visible: usize, pub types: Vec<Option<ColType>> }
+#[derive(Clone, Copy, Debug, PartialEq)] enum GenFn { Count, Sum, Avg, Min, Max, Concat }
+/// One output of the general aggregation: a grouping key, an aggregate over a raw column (None: count(*)), or a value
+/// the post step fills in (an expression over aggregates).
+enum GenOut { Key(usize), Agg { f: GenFn, arg: Option<usize>, distinct: bool, sep: String }, Null }
+/// Grouping over decoded rows: the first `nkeys` values of each raw row are the group key.
+struct GenAgg { nkeys: usize, outs: Vec<GenOut> }
+#[derive(Default)] struct GState { n: i64, sum_i: i64, sum_f: f64, float: bool, ovf: bool, best: Option<Value>, seen: Option<std::collections::HashSet<Vec<u8>>>, text: String }
+const SUM_OVERFLOW: &str = "sum(): the total does not fit a 64-bit integer";
+/// A value's identity for grouping and DISTINCT: integral floats count as the integer, -0.0 as 0.0.
+fn canon(v: &Value, out: &mut Vec<u8>) {
+    match v {
+        Value::Null => out.push(0),
+        Value::Int(i) => { out.push(1); out.extend_from_slice(&i.to_le_bytes()); }
+        Value::Float(f) => { let f = if *f == 0.0 { 0.0 } else { *f }; if f.fract() == 0.0 && f.abs() < 9.0e15 { out.push(1); out.extend_from_slice(&(f as i64).to_le_bytes()); } else { out.push(2); out.extend_from_slice(&f.to_bits().to_le_bytes()); } }
+        Value::Bool(b) => { out.push(3); out.push(*b as u8); }
+        Value::Text(t) => { out.push(4); out.extend_from_slice(&(t.len() as u32).to_le_bytes()); out.extend_from_slice(t.as_bytes()); }
+        Value::Bytes(b) => { out.push(5); out.extend_from_slice(&(b.len() as u32).to_le_bytes()); out.extend_from_slice(b); }
+    }
+}
+/// SQL comparison of two values: None when either is NULL or the types do not compare; integers and floats compare as numbers.
+fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    let num = |v: &Value| match v { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => 0.0 };
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => num(a).partial_cmp(&num(b)),
+        (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)), (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)), (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+impl GenAgg {
+    fn run(&self, rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, String> {
+        use std::cmp::Ordering::*;
+        let naggs = self.outs.iter().filter(|o| matches!(o, GenOut::Agg { .. })).count();
+        let mut index: HashMap<Vec<u8>, usize> = HashMap::new(); let mut keys: Vec<Vec<Value>> = vec![]; let mut states: Vec<Vec<GState>> = vec![];
+        let mut kb = vec![];
+        for r in rows {
+            kb.clear(); for v in &r[..self.nkeys] { canon(v, &mut kb); }
+            let gi = match index.get(&kb) { Some(&i) => i, None => { index.insert(kb.clone(), keys.len()); keys.push(r[..self.nkeys].to_vec()); states.push((0..naggs).map(|_| GState::default()).collect()); keys.len() - 1 } };
+            let mut k = 0;
+            for o in &self.outs {
+                let GenOut::Agg { f, arg, distinct, sep } = o else { continue };
+                let st = &mut states[gi][k]; k += 1;
+                let v = match arg { None => { st.n += 1; continue; } Some(a) => &r[*a] };
+                if *v == Value::Null { continue; }
+                if *distinct { let mut b = vec![]; canon(v, &mut b); if !st.seen.get_or_insert_with(Default::default).insert(b) { continue; } }
+                st.n += 1;
+                match f {
+                    GenFn::Count => {}
+                    GenFn::Concat => { if st.n > 1 { st.text.push_str(sep); } match v { Value::Bytes(_) => st.text.push_str("?"), v => st.text.push_str(&crate::expr::num_text(v)) } }
+                    GenFn::Sum | GenFn::Avg => match v {
+                        Value::Int(i) => { match st.sum_i.checked_add(*i) { Some(t) => st.sum_i = t, None => st.ovf = true } st.sum_f += *i as f64; }
+                        Value::Bool(b) => { st.sum_i += *b as i64; st.sum_f += *b as i64 as f64; }
+                        Value::Float(x) => { st.float = true; st.sum_f += x; }
+                        v => return Err(format!("{}() over {}: not a number", if *f == GenFn::Sum { "sum" } else { "avg" }, crate::expr::num_text(v))),
+                    },
+                    GenFn::Min => if st.best.as_ref().map(|b| cmp_values(v, b) == Some(Less)).unwrap_or(true) { st.best = Some(v.clone()); },
+                    GenFn::Max => if st.best.as_ref().map(|b| cmp_values(v, b) == Some(Greater)).unwrap_or(true) { st.best = Some(v.clone()); },
+                }
+            }
+        }
+        if self.nkeys == 0 && keys.is_empty() { keys.push(vec![]); states.push((0..naggs).map(|_| GState::default()).collect()); }  // aggregates without GROUP BY: one row, even over no rows
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|&a, &b| keys[a].iter().zip(&keys[b]).map(|(x, y)| value_order(x, y)).find(|o| o.is_ne()).unwrap_or(Equal));
+        order.into_iter().map(|gi| { let mut k = 0; self.outs.iter().map(|o| Ok(match o {
+            GenOut::Key(i) => keys[gi][*i].clone(),
+            GenOut::Null => Value::Null,
+            GenOut::Agg { f, .. } => { let st = &states[gi][k]; k += 1; match f {
+                GenFn::Concat => if st.n == 0 { Value::Null } else { Value::Text(st.text.clone()) },
+                GenFn::Count => Value::Int(st.n),
+                GenFn::Sum => if st.n == 0 { Value::Null } else if st.float { Value::Float(st.sum_f) } else if st.ovf { return Err(SUM_OVERFLOW.to_string()) } else { Value::Int(st.sum_i) },
+                GenFn::Avg => if st.n == 0 { Value::Null } else { Value::Float(st.sum_f / st.n as f64) },
+                GenFn::Min | GenFn::Max => st.best.clone().unwrap_or(Value::Null) } }
+        })).collect() }).collect()
+    }
+}
+/// The output type of one projection item (the console shows it per column).
+fn proj_type(pr: &Proj, schema: &Schema) -> Option<ColType> {
+    match pr {
+        Proj::Col(v) => schema.columns.get(*v).map(|c| c.ty.clone()),
+        Proj::Agg(Agg::Min(c)) | Proj::Agg(Agg::Max(c)) => schema.columns.get(*c).map(|c| c.ty.clone()),
+        Proj::Agg(Agg::Sum(c)) => schema.columns.get(*c).map(|c| if c.ty == ColType::Float { ColType::Float } else { ColType::Int }),
+        Proj::Agg(Agg::CountStar) | Proj::Agg(Agg::CountCol(_)) => Some(ColType::Int),
+        Proj::Agg(Agg::Avg(_)) => Some(ColType::Float),
+        Proj::Sub(_) | Proj::Expr(_) | Proj::Later => None,
+    }
+}
+const AGGS: &[&str] = &["count", "sum", "avg", "min", "max", "group_concat", "string_agg"];
+/// An aggregate call (min and max with two or more arguments are SQLite's scalar functions).
+fn is_agg_call(f: &ast::Function) -> bool {
+    let name = obj_name(&f.name).to_lowercase();
+    let nargs = match &f.args { FunctionArguments::List(l) => l.args.len(), _ => 0 };
+    AGGS.contains(&name.as_str()) && !(matches!(name.as_str(), "min" | "max") && nargs > 1)
+}
+/// The aggregate calls inside an expression (not inside its subqueries).
+fn collect_aggs<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Expr>) {
+    use ast::Expr as A;
+    let mut kids: Vec<&ast::Expr> = vec![];
+    match e {
+        A::Function(f) => { if is_agg_call(f) { out.push(e); return; } if let FunctionArguments::List(l) = &f.args { for a in &l.args { if let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a { kids.push(x); } } } }
+        A::BinaryOp { left, right, .. } => { kids.push(left); kids.push(right); }
+        A::UnaryOp { expr, .. } | A::Nested(expr) | A::IsNull(expr) | A::IsNotNull(expr) | A::Cast { expr, .. } | A::Extract { expr, .. } | A::Ceil { expr, .. } | A::Floor { expr, .. } => kids.push(expr),
+        A::InList { expr, list, .. } => { kids.push(expr); kids.extend(list.iter()); }
+        A::Between { expr, low, high, .. } => { kids.push(expr); kids.push(low); kids.push(high); }
+        A::Like { expr, pattern, .. } | A::ILike { expr, pattern, .. } => { kids.push(expr); kids.push(pattern); }
+        A::Case { operand, conditions, else_result, .. } => { if let Some(o) = operand { kids.push(o); } for c in conditions { kids.push(&c.condition); kids.push(&c.result); } if let Some(x) = else_result { kids.push(x); } }
+        A::Substring { expr, substring_from, substring_for, .. } => { kids.push(expr); if let Some(x) = substring_from { kids.push(x); } if let Some(x) = substring_for { kids.push(x); } }
+        A::Trim { expr, trim_what, .. } => { kids.push(expr); if let Some(x) = trim_what { kids.push(x); } }
+        _ => {}
+    }
+    for k in kids { collect_aggs(k, out); }
+}
+fn has_agg(e: &ast::Expr) -> bool { let mut v = vec![]; collect_aggs(e, &mut v); !v.is_empty() }
+/// The table columns an expression mentions (outside its subqueries), as FROM positions.
+fn sides_of(srcs: &[Src], e: &ast::Expr, out: &mut Vec<usize>) {
+    use ast::Expr as A;
+    match e {
+        A::Identifier(_) | A::CompoundIdentifier(_) => { if let Ok(Some((s, _))) = jcol(srcs, e) { if !out.contains(&s) { out.push(s); } } }
+        A::Function(f) => { if let FunctionArguments::List(l) = &f.args { for a in &l.args { if let FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) = a { sides_of(srcs, x, out); } } } }
+        A::BinaryOp { left, right, .. } => { sides_of(srcs, left, out); sides_of(srcs, right, out); }
+        A::UnaryOp { expr, .. } | A::Nested(expr) | A::IsNull(expr) | A::IsNotNull(expr) | A::IsTrue(expr) | A::IsFalse(expr) | A::Cast { expr, .. } | A::Extract { expr, .. } | A::Ceil { expr, .. } | A::Floor { expr, .. } => sides_of(srcs, expr, out),
+        A::InList { expr, list, .. } => { sides_of(srcs, expr, out); for x in list { sides_of(srcs, x, out); } }
+        A::InSubquery { expr, .. } => sides_of(srcs, expr, out),
+        A::Between { expr, low, high, .. } => { sides_of(srcs, expr, out); sides_of(srcs, low, out); sides_of(srcs, high, out); }
+        A::Like { expr, pattern, .. } | A::ILike { expr, pattern, .. } => { sides_of(srcs, expr, out); sides_of(srcs, pattern, out); }
+        A::Case { operand, conditions, else_result, .. } => { if let Some(o) = operand { sides_of(srcs, o, out); } for c in conditions { sides_of(srcs, &c.condition, out); sides_of(srcs, &c.result, out); } if let Some(x) = else_result { sides_of(srcs, x, out); } }
+        A::Substring { expr, substring_from, substring_for, .. } => { sides_of(srcs, expr, out); if let Some(x) = substring_from { sides_of(srcs, x, out); } if let Some(x) = substring_for { sides_of(srcs, x, out); } }
+        A::Trim { expr, trim_what, .. } => { sides_of(srcs, expr, out); if let Some(x) = trim_what { sides_of(srcs, x, out); } }
+        _ => {}
+    }
+}
+/// An equality between a column of one table and a column of another: (side, col, side, col).
+/// A column named TRUE, FALSE or NULL without quotes: refused, as in PostgreSQL, because `SELECT true` reads the
+/// value (SQLite would read the column).
+fn literal_name(id: &ast::Ident) -> Result<(), String> {
+    if id.quote_style.is_none() && ["true", "false", "null"].contains(&id.value.to_lowercase().as_str()) { return Err(format!("a column can't be named {} without quotes; write \"{}\"", id.value, id.value)); }
+    Ok(())
+}
+fn col_eq(srcs: &[Src], e: &ast::Expr) -> Option<(usize, usize, usize, usize)> {
+    let ast::Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = e else { return None };
+    match (jcol(srcs, left).ok().flatten(), jcol(srcs, right).ok().flatten()) { (Some((a, ca)), Some((b, cb))) if a != b => Some((a, ca, b, cb)), _ => None }
+}
+/// An aggregate the planner has read: its function, argument, DISTINCT and (for group_concat) separator.
+enum AggArg { Star, Col(usize), Expr(SExpr) }
+struct AggSpec { f: GenFn, arg: AggArg, distinct: bool, sep: String }
+/// A GROUP BY key: a column of the (virtual) row, or an expression over it; `text` matches select-list items.
+struct GKey { col: Option<usize>, expr: Option<SExpr>, text: String }
+/// An output item of an aggregating query.
+enum UItem { Key(usize), Agg(AggSpec), Later(SExpr), Sub(usize) }
+/// When one side of a comparison is a TIMESTAMP or a UUID and the other a text literal, read the literal as that type.
+fn coerce(x: SExpr, other: &SExpr, ty_of: &dyn Fn(usize) -> Option<ColType>) -> Result<SExpr, String> {
+    if let SExpr::Lit(Value::Text(t)) = &x {
+        match other.ty(ty_of) {
+            Some(ColType::Timestamp) => return Ok(SExpr::Lit(Value::Int(crate::table::parse_timestamp(t).ok_or(format!("not a timestamp: {t:?}"))?))),
+            Some(ColType::Uuid) => return Ok(SExpr::Lit(Value::Text(crate::expr::uuid_text(t).ok_or(format!("not a UUID: {t:?}"))?))),
+            _ => {}
+        }
+    }
+    Ok(x)
+}
+/// A non-negative integer literal (ORDER BY 2, LIMIT 10).
+fn int_lit(e: &ast::Expr) -> Option<i64> { if let ast::Expr::Value(v) = e { if let ast::Value::Number(n, _) = &v.value { return n.parse().ok(); } } None }
+/// An expression's text for matching ORDER BY or HAVING items against the select list.
+fn norm_sql(e: &ast::Expr) -> String { e.to_string().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ") }
+pub enum Plan { /// the table, and whether IF NOT EXISTS was given
+    CreateTable(Schema, bool), Insert { table: Arc<Table>, rows: Vec<Vec<Expr>>, returning: Option<Vec<usize>>, from: Option<InsertFrom>, conflict: Conflict }, Select(SelectPlan), Update { table: Arc<Table>, sets: Vec<(usize, SetVal)>, pk: Expr }, Delete { table: Arc<Table>, access: Access, preds: Vec<Pred>, filters: Vec<SExpr> }, Begin, Commit, Rollback, Alter { table: String, ops: Vec<AlterOp> },
+    /// SELECT without FROM: one row of expressions
+    Const { exprs: Vec<SExpr>, names: Vec<String> } }
+/// INSERT … SELECT: the query, the destination column of each of its output columns, and for every other column
+/// what VALUES would put there (the automatic key, a generator, the default or NULL).
+pub struct InsertFrom { pub plan: Box<Plan>, pub targets: Vec<usize>, pub fill: Vec<Option<Expr>> }
+/// What an INSERT does when a row's primary key or UNIQUE value already exists. `Update` reads the existing row as
+/// columns 0..n and the row being inserted (`excluded`) as n..2n.
+pub enum Conflict { None, Nothing(Option<usize>), Update { target: usize, sets: Vec<(usize, SExpr)>, cond: Option<SExpr> }, Replace }
+/// An UPDATE's new value: a value known before the row is read, or an expression over the row's current values.
+#[derive(Clone, Debug)] pub enum SetVal { Value(Expr), Row(SExpr) }
 #[derive(Clone, Debug)] pub enum AlterOp { Add { col: Column, default: Value }, Drop(String), Rename(String, String), SetType(String, ColType), SetNotNull(String), DropNotNull(String) }
 pub struct Prepared { pub plan: Plan, pub nparams: usize, pub text: String, pub epoch: u64 }
 #[derive(Default)] pub struct Session { pub txn: Option<Txn>, pub user: Option<String>, pub roles: Vec<String>, pub attrs: HashMap<String, Value>,
@@ -93,6 +285,9 @@ fn index_key(schema: &Schema, col: usize, v: &Value) -> Result<crate::table::Key
         (ColType::Uuid, Value::Bytes(b)) if b.len() == 16 => Ok(crate::table::key_from_uuid(b)),
         (ColType::Uuid, v) => Err(format!("column {}: expected a UUID, got {v:?}", c.name)),
         (ColType::Timestamp, Value::Text(s)) => crate::table::parse_timestamp(s).map(|t| t as i128).ok_or_else(|| format!("column {}: not a timestamp {s:?}", c.name)),
+        (ColType::Text(_), Value::Text(s)) => Ok(crate::table::text_key(s.as_bytes())),
+        (ColType::Bytes(_), Value::Bytes(b)) => Ok(crate::table::text_key(b)),
+        (ColType::Text(_) | ColType::Bytes(_), v) => Err(format!("column {}: expected {}, got {v:?}", c.name, c.ty.name())),
         (_, v) => v.as_i64().map(|i| i as i128).map_err(|e| format!("column {}: {e}", c.name)),
     }
 }
@@ -139,6 +334,7 @@ fn values_count_error(schema: &Schema, table: &str, listed: Option<&[usize]>, go
 pub fn error_code(msg: &str) -> &'static str {
     let m = msg.trim_start();
     if m.starts_with("Conflict") { "CONFLICT" }
+    else if m.contains("in the same transaction") { "TRANSACTION" }
     else if m.contains(" VALUES gives ") { "SYNTAX" }
     else if m.starts_with("Duplicate") { "DUPLICATE" }
     else if m.starts_with("NotFound") { "NOT_FOUND" }
@@ -148,14 +344,108 @@ pub fn error_code(msg: &str) -> &'static str {
     else if m.contains("is not a sqweezdb database") || m.contains("a sqweezdb database is a directory") || m.contains("written by a newer sqweezdb") || m.contains("sqweezdb.meta") || m.contains("holds no sqweezdb database") { "PATH" }
     else if m.starts_with("options:") || m.contains(".toml") || m.contains(" is required") || m.starts_with("no database in") || m.starts_with("durable") || m.starts_with("follow") || m.starts_with("listen.") || m.starts_with("snapshot.") || m.starts_with("live.") || m.starts_with("log.") || m.starts_with("backup.") { "CONFIG" }
     else if m.starts_with("already in a transaction") || m.starts_with("not in a transaction") { "TRANSACTION" }
+    else if m.contains("can't be named ") { "SYNTAX" }
+    // a value of the wrong type for an operator or function, or arithmetic out of range (PostgreSQL's "data exception")
+    else if m.contains("division by zero") || m.contains("integer overflow") || m.contains("does not fit a 64-bit integer") || m.contains("() needs ") || m.contains("() takes numbers")
+        || m.contains("): not a number") || m.starts_with("LIKE needs") || m.starts_with("|| needs") || m.starts_with("-> needs") || m.starts_with("a date needs") || m.starts_with("cannot cast")
+        || m.starts_with("cannot compare") || m.starts_with("cannot apply") || m.starts_with("cannot negate") || m.starts_with("a condition must be BOOLEAN") || m.contains("of a negative number") { "TYPE" }
     else if m.contains("type mismatch") || m.contains(" exceeds ") || m.contains("is NOT NULL") || (m.starts_with("expected ") && m.contains(", got ")) || m.contains(": expected ") || m.contains("not a timestamp") || m.contains("not a UUID") || m.contains("expected a UUID") { "TYPE" }
     else if m.starts_with("sql parser error") || m.contains("Expected") || m.starts_with("expected ") || m.starts_with("unsupported") { "SYNTAX" }
     else if m.starts_with("no such") || m.starts_with("unknown") || m.contains(" no such ") { "SCHEMA" }
     else { "ERROR" }
 }
+/// What the planner does not implement is refused with this error instead of being parsed and skipped (E54: skipped
+/// clauses gave wrong answers without an error). `error_code` reports it as SYNTAX.
+fn unsup(what: impl std::fmt::Display) -> String { format!("unsupported: {what} is not implemented yet") }
+/// The tables a SELECT reads: its own, the joined ones and those of its subqueries.
+fn plan_tables(sp: &SelectPlan, out: &mut Vec<Arc<Table>>) {
+    out.push(sp.table.clone());
+    let mut preds: Vec<&Pred> = sp.preds.iter().collect();
+    if let Some(j) = &sp.join { out.push(j.probe.clone()); preds.extend(j.probe_preds.iter()); for st in &j.steps { out.push(st.build.clone()); preds.extend(st.build_preds.iter()); } }
+    for p in preds { expr_tables(&p.rhs, out); }
+    for (q, _) in &sp.subs { plan_tables(q, out); }
+    for x in sp.exprs.iter().chain(&sp.filters) { sexpr_tables(x, out); }
+}
+/// A read inside a transaction sees committed data only, so reading a table the transaction has written would miss its
+/// own rows (E54): refused until reads see the transaction's writes.
+fn written_and_read(t: &Txn, sp: &SelectPlan) -> Option<String> {
+    if t.writes.is_empty() { return None; }
+    let mut read = vec![]; plan_tables(sp, &mut read);
+    if sp.join.is_none() && matches!(sp.access, Access::Pk(_)) { read.remove(0); }   // a lookup by primary key reads through the transaction (txn_get)
+    written_among(t, &read)
+}
+fn written_among(t: &Txn, read: &[Arc<Table>]) -> Option<String> {
+    t.writes.iter().map(|w| match w { TxnWrite::Insert { table, .. } | TxnWrite::Update { table, .. } | TxnWrite::Delete { table, .. } => table }).find(|w| read.iter().any(|r| Arc::ptr_eq(r, w))).map(|t| t.schema.name.clone())
+}
+/// The tables read by the scalar subqueries inside an expression-engine expression.
+fn sexpr_tables(x: &SExpr, out: &mut Vec<Arc<Table>>) { x.walk(&mut |n| if let SExpr::Sub(q) = n { plan_tables(q, out); }); }
+/// The tables read by the subqueries inside an expression.
+fn expr_tables(e: &Expr, out: &mut Vec<Arc<Table>>) { match e { Expr::Set(q) | Expr::Scalar(q) => plan_tables(q, out), Expr::List(v) => for x in v { expr_tables(x, out); }, _ => {} } }
+fn own_writes(table: &str) -> String { format!("unsupported: reading {table} after writing it in the same transaction is not implemented yet (reads see committed data only); commit first, or read before writing") }
+/// Clauses of a query the planner does not carry out.
+fn check_query(q: &ast::Query) -> Result<(), String> {
+    if q.with.is_some() { return Err(unsup("WITH")); }
+    if q.fetch.is_some() { return Err(unsup("FETCH FIRST")); }
+    if !q.locks.is_empty() { return Err(unsup("FOR UPDATE / FOR SHARE")); }
+    if q.for_clause.is_some() || q.settings.is_some() || q.format_clause.is_some() || !q.pipe_operators.is_empty() { return Err(unsup("this query clause")); }
+    match &q.limit_clause {
+        None => {}
+        Some(LimitClause::LimitOffset { limit_by, .. }) => {
+            if !limit_by.is_empty() { return Err(unsup("LIMIT BY")); }
+        }
+        Some(_) => return Err(unsup("LIMIT offset, count")),
+    }
+    if let Some(ob) = &q.order_by {
+        if ob.interpolate.is_some() { return Err(unsup("INTERPOLATE")); }
+        match &ob.kind {
+            OrderByKind::All(_) => return Err(unsup("ORDER BY ALL")),
+            OrderByKind::Expressions(v) => {
+                for o in v { if o.options.nulls_first.is_some() { return Err(unsup("NULLS FIRST / NULLS LAST")); } if o.with_fill.is_some() { return Err(unsup("WITH FILL")); } }
+            }
+        }
+    }
+    if let SetExpr::Select(sel) = &*q.body { check_select(sel)?; }
+    Ok(())
+}
+fn check_select(s: &ast::Select) -> Result<(), String> {
+    if matches!(s.distinct, Some(ast::Distinct::On(_))) { return Err(unsup("DISTINCT ON")); }
+    if s.top.is_some() { return Err(unsup("TOP")); }
+    if s.into.is_some() { return Err(unsup("SELECT INTO")); }
+    if s.qualify.is_some() || !s.named_window.is_empty() { return Err(unsup("window functions")); }
+    if !s.lateral_views.is_empty() || s.prewhere.is_some() || !s.connect_by.is_empty() || !s.cluster_by.is_empty() || !s.distribute_by.is_empty() || !s.sort_by.is_empty() || s.value_table_mode.is_some() || s.exclude.is_some() || s.select_modifiers.is_some() { return Err(unsup("this SELECT clause")); }
+    match &s.group_by { GroupByExpr::All(_) => return Err(unsup("GROUP BY ALL")), GroupByExpr::Expressions(_, mods) if !mods.is_empty() => return Err(unsup("GROUP BY modifiers (ROLLUP, CUBE, GROUPING SETS)")), _ => {} }
+    for twj in &s.from { check_table(&twj.relation)?; for j in &twj.joins { check_table(&j.relation)?; } }
+    Ok(())
+}
+fn check_table(tf: &TableFactor) -> Result<(), String> {
+    if let TableFactor::Table { alias, args, version, sample, partitions, json_path, with_ordinality, .. } = tf {
+        if args.is_some() { return Err(unsup("table functions")); }
+        if version.is_some() { return Err(unsup("AS OF")); }
+        if sample.is_some() { return Err(unsup("TABLESAMPLE")); }
+        if !partitions.is_empty() || json_path.is_some() || *with_ordinality { return Err(unsup("this FROM clause")); }
+        if alias.as_ref().map(|a| !a.columns.is_empty()).unwrap_or(false) { return Err(unsup("renaming columns in a table alias")); }
+    }
+    Ok(())
+}
+/// An aggregate's modifiers: DISTINCT, FILTER, OVER and the rest change the answer, so they are refused, not dropped.
+fn check_function(f: &ast::Function) -> Result<(), String> {
+    let name = obj_name(&f.name).to_lowercase();
+    if f.over.is_some() { return Err(unsup(format!("{name}(…) OVER (window functions)"))); }
+    if f.filter.is_some() { return Err(unsup(format!("{name}(…) FILTER (WHERE …)"))); }
+    if !f.within_group.is_empty() { return Err(unsup("WITHIN GROUP")); }
+    if f.null_treatment.is_some() { return Err(unsup("IGNORE NULLS / RESPECT NULLS")); }
+    if !matches!(f.parameters, FunctionArguments::None) { return Err(unsup(format!("parameters on {name}"))); }
+    if let FunctionArguments::List(l) = &f.args {
+        if matches!(l.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct)) && !AGGS.contains(&name.as_str()) { return Err(unsup(format!("{name}(DISTINCT …)"))); }
+        if !l.clauses.is_empty() { return Err(unsup(format!("{name}(… ORDER BY / SEPARATOR / LIMIT …)"))); }
+    }
+    Ok(())
+}
 fn coltype_of(dt: &ast::DataType) -> Result<ColType, String> {
     let s = format!("{dt}").to_uppercase();
     let num = |s: &str| s.split(|c| c == '(' || c == ')').nth(1).and_then(|x| x.trim().parse::<usize>().ok());
+    // a value's length is stored in two bytes: a wider column would cut longer values (E54)
+    let width = |n: usize| if n > 65_535 { Err(unsup(format!("{s}: text and binary columns wider than 65,535 bytes"))) } else { Ok(n) };
     Ok(match s.as_str() {
         "INT" | "INTEGER" | "BIGINT" | "INT64" | "SMALLINT" => ColType::Int,
         "UUID" => ColType::Uuid,
@@ -163,8 +453,8 @@ fn coltype_of(dt: &ast::DataType) -> Result<ColType, String> {
         "DOUBLE" | "DOUBLE PRECISION" | "REAL" | "FLOAT" | "FLOAT64" => ColType::Float,
         "BOOL" | "BOOLEAN" => ColType::Bool,
         "TEXT" => ColType::Text(255), "BLOB" | "BYTEA" => ColType::Bytes(255),
-        _ if s.starts_with("VARCHAR") || s.starts_with("CHAR") || s.starts_with("TEXT") || s.starts_with("STRING") => ColType::Text(num(&s).ok_or(format!("need a length: {s}"))?),
-        _ if s.starts_with("BLOB") || s.starts_with("VARBINARY") || s.starts_with("BYTES") || s.starts_with("BINARY") => ColType::Bytes(num(&s).ok_or(format!("need a length: {s}"))?),
+        _ if s.starts_with("VARCHAR") || s.starts_with("CHAR") || s.starts_with("TEXT") || s.starts_with("STRING") => ColType::Text(width(num(&s).ok_or(format!("need a length: {s}"))?)?),
+        _ if s.starts_with("BLOB") || s.starts_with("VARBINARY") || s.starts_with("BYTES") || s.starts_with("BINARY") => ColType::Bytes(width(num(&s).ok_or(format!("need a length: {s}"))?)?),
         _ => return Err(format!("unsupported type {s}")),
     })
 }
@@ -190,7 +480,27 @@ fn jcol(srcs: &[Src], e: &ast::Expr) -> Result<Option<(usize, usize)>, String> {
     }
 }
 
-struct Planner<'a> { db: &'a Database, nparams: usize, outer: Vec<Src>, cur: Vec<Src>, corr: Option<(usize, usize, usize, usize)>, exists_mode: bool }
+struct Planner<'a> { db: &'a Database, nparams: usize, outer: Vec<Src>, cur: Vec<Src>, corr: Option<(usize, usize, usize, usize)>, exists_mode: bool,
+    /// where each `?` sits in the SQL text (line, column): parameters are numbered in text order, whatever order the
+    /// planner reads the clauses in (it reads WHERE before the select list)
+    params_at: Vec<(u64, u64)> }
+/// The (line, column) of every `?` outside quotes and comments, in text order; columns count characters from 1, as the parser does.
+fn placeholder_positions(sql: &str) -> Vec<(u64, u64)> {
+    let mut out = vec![]; let (mut line, mut col) = (1u64, 0u64); let mut it = sql.chars().peekable();
+    let mut state = 0u8;   // 0 code, 1 'string', 2 "identifier", 3 -- comment, 4 /* comment */
+    while let Some(c) = it.next() {
+        if c == '\n' { line += 1; col = 0; if state == 3 { state = 0; } continue; }
+        col += 1;
+        match state {
+            0 => match c { '\'' => state = 1, '"' => state = 2, '?' => out.push((line, col)), '-' if it.peek() == Some(&'-') => state = 3, '/' if it.peek() == Some(&'*') => { it.next(); col += 1; state = 4; } _ => {} },
+            1 => if c == '\'' { if it.peek() == Some(&'\'') { it.next(); col += 1; } else { state = 0; } },
+            2 => if c == '"' { state = 0; },
+            4 => if c == '*' && it.peek() == Some(&'/') { it.next(); col += 1; state = 0; },
+            _ => {}
+        }
+    }
+    out
+}
 impl<'a> Planner<'a> {
     fn resolve_ref(&self, srcs: &[Src], e: &ast::Expr) -> Result<Ref, String> {
         match jcol(srcs, e) { Ok(Some((s, c))) => Ok(Ref::Inner(s, c)), Ok(None) => Ok(Ref::None), Err(err) => { if !self.outer.is_empty() { if let Ok(Some((s, c))) = jcol(&self.outer, e) { return Ok(Ref::Outer(s, c)); } } Err(err) } }
@@ -209,14 +519,177 @@ impl<'a> Planner<'a> {
                 ast::Value::SingleQuotedString(s) => Ok(Expr::Lit(Value::Text(s.clone()))),
                 ast::Value::Boolean(b) => Ok(Expr::Lit(Value::Bool(*b))),
                 ast::Value::Null => Ok(Expr::Lit(Value::Null)),
-                ast::Value::Placeholder(_) => { let i = self.nparams; self.nparams += 1; Ok(Expr::Param(i)) }
+                ast::Value::Placeholder(t) => {
+                    if let Some(n) = t.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1) { self.nparams = self.nparams.max(n); return Ok(Expr::Param(n - 1)); }
+                    let at = (v.span.start.line, v.span.start.column);
+                    match self.params_at.iter().position(|p| *p == at) { Some(i) => Ok(Expr::Param(i)), None => { let i = self.nparams; self.nparams += 1; Ok(Expr::Param(i)) } }
+                }
                 other => Err(format!("unsupported literal {other}")),
             },
             ast::Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match self.expr(expr)? { Expr::Lit(Value::Int(i)) => Ok(Expr::Lit(Value::Int(-i))), Expr::Lit(Value::Float(f)) => Ok(Expr::Lit(Value::Float(-f))), _ => Err("cannot negate".into()) },
             ast::Expr::Nested(e) => self.expr(e),
-            ast::Expr::Subquery(q) => { let cur = self.cur.clone(); let sp = self.plan_sub(q, &cur, false)?; if sp.corr.is_none() && sp.proj.len() != 1 { return Err("scalar subquery must select one column".into()); } Ok(Expr::Scalar(Arc::new(sp))) }
+            ast::Expr::Subquery(q) => { let cur = self.cur.clone(); let sp = self.plan_sub(q, &cur, false)?; if sp.corr.is_none() && sp.post.as_ref().map(|p| p.visible).unwrap_or(sp.proj.len()) != 1 { return Err("scalar subquery must select one column".into()); } Ok(Expr::Scalar(Arc::new(sp))) }
             other => Err(format!("unsupported expression {other}")),
         }
+    }
+    /// An expression for the expression engine. `leaf` resolves what this context knows (columns of the row, or
+    /// aggregates and group keys after aggregation) and returns None for everything else, which is converted here.
+    /// `ty_of` gives a planned column's type, so a TIMESTAMP or UUID compared with text compares as that type.
+    fn sexpr(&mut self, e: &ast::Expr, leaf: &mut dyn FnMut(&ast::Expr) -> Result<Option<SExpr>, String>, ty_of: &dyn Fn(usize) -> Option<ColType>) -> Result<SExpr, String> {
+        use ast::Expr as A;
+        if let Some(x) = leaf(e)? { return Ok(x); }
+        let go = |this: &mut Self, x: &ast::Expr, leaf: &mut dyn FnMut(&ast::Expr) -> Result<Option<SExpr>, String>| this.sexpr(x, leaf, ty_of);
+        Ok(match e {
+            A::Value(_) => match self.expr(e)? { Expr::Lit(v) => SExpr::Lit(v), Expr::Param(i) => SExpr::Param(i), _ => return Err(format!("unsupported literal {e}")) },
+            A::TypedString(ts) => {
+                let ast::Value::SingleQuotedString(v) = &ts.value.value else { return Err(format!("unsupported literal {e}")) };
+                match format!("{}", ts.data_type).to_uppercase().as_str() {
+                    "DATE" | "TIMESTAMP" | "DATETIME" | "TIMESTAMPTZ" => SExpr::Lit(Value::Int(crate::table::parse_timestamp(v).ok_or(format!("not a timestamp: {v:?}"))?)),
+                    other => return Err(unsup(format!("{other} literals"))),
+                }
+            }
+            A::Nested(x) => go(self, x, leaf)?,
+            A::UnaryOp { op: UnaryOperator::Minus, expr } => match go(self, expr, leaf)? { SExpr::Lit(Value::Int(i)) => SExpr::Lit(Value::Int(-i)), SExpr::Lit(Value::Float(f)) => SExpr::Lit(Value::Float(-f)), x => SExpr::Neg(x.bx()) },
+            A::UnaryOp { op: UnaryOperator::Plus, expr } => go(self, expr, leaf)?,
+            A::UnaryOp { op: UnaryOperator::Not, expr } => SExpr::Not(go(self, expr, leaf)?.bx()),
+            A::BinaryOp { left, op, right } => {
+                let o = match op {
+                    BinaryOperator::Plus => Op::Add, BinaryOperator::Minus => Op::Sub, BinaryOperator::Multiply => Op::Mul, BinaryOperator::Divide => Op::Div, BinaryOperator::Modulo => Op::Mod,
+                    BinaryOperator::StringConcat => Op::Concat, BinaryOperator::Eq => Op::Eq, BinaryOperator::NotEq => Op::Ne, BinaryOperator::Lt => Op::Lt, BinaryOperator::LtEq => Op::Le,
+                    BinaryOperator::Gt => Op::Gt, BinaryOperator::GtEq => Op::Ge, BinaryOperator::And => Op::And, BinaryOperator::Or => Op::Or, BinaryOperator::Arrow => Op::JsonGet, BinaryOperator::LongArrow => Op::JsonGetText,
+                    other => return Err(unsup(format!("the {other} operator"))),
+                };
+                let (l, r) = (go(self, left, leaf)?, go(self, right, leaf)?);
+                let (l, r) = if matches!(o, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) { let l2 = coerce(l.clone(), &r, ty_of)?; let r2 = coerce(r, &l, ty_of)?; (l2, r2) } else { (l, r) };
+                SExpr::Bin(o, l.bx(), r.bx())
+            }
+            A::IsNull(x) => SExpr::IsNull(go(self, x, leaf)?.bx(), false),
+            A::IsNotNull(x) => SExpr::IsNull(go(self, x, leaf)?.bx(), true),
+            A::IsTrue(x) => SExpr::Bin(Op::Eq, go(self, x, leaf)?.bx(), SExpr::Lit(Value::Bool(true)).bx()),
+            A::IsFalse(x) => SExpr::Bin(Op::Eq, go(self, x, leaf)?.bx(), SExpr::Lit(Value::Bool(false)).bx()),
+            A::InList { expr, list, negated } => { let a = go(self, expr, leaf)?; let l = list.iter().map(|x| go(self, x, leaf).and_then(|v| coerce(v, &a, ty_of))).collect::<Result<_, _>>()?; SExpr::In(a.bx(), l, *negated) }
+            A::Between { expr, negated, low, high } => { let a = go(self, expr, leaf)?; let lo = coerce(go(self, low, leaf)?, &a, ty_of)?; let hi = coerce(go(self, high, leaf)?, &a, ty_of)?; SExpr::Between(a.bx(), lo.bx(), hi.bx(), *negated) }
+            A::Like { negated, any: false, expr, pattern, escape_char } | A::ILike { negated, any: false, expr, pattern, escape_char } => {
+                let esc = match escape_char { None => None, Some(x) => match self.expr(x)? { Expr::Lit(Value::Text(t)) if t.chars().count() == 1 => t.chars().next(), _ => return Err("ESCAPE takes one character".into()) } };
+                SExpr::Like { e: go(self, expr, leaf)?.bx(), pat: go(self, pattern, leaf)?.bx(), ci: matches!(e, A::ILike { .. }), negated: *negated, esc }
+            }
+            A::Case { operand, conditions, else_result, .. } => {
+                let op = operand.as_ref().map(|o| go(self, o, leaf).map(|x| x.bx())).transpose()?;
+                let whens = conditions.iter().map(|c| Ok((go(self, &c.condition, leaf)?, go(self, &c.result, leaf)?))).collect::<Result<Vec<_>, String>>()?;
+                SExpr::Case { op, whens, els: else_result.as_ref().map(|x| go(self, x, leaf).map(|x| x.bx())).transpose()? }
+            }
+            A::Cast { expr, data_type, .. } => {
+                let x = go(self, expr, leaf)?; let t = format!("{data_type}").to_uppercase(); let base = t.split('(').next().unwrap_or("").trim().to_string();
+                match base.as_str() {
+                    "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "INT8" | "INT4" | "INT64" => SExpr::Cast(x.bx(), XCast::Int),
+                    "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" | "FLOAT64" | "DECIMAL" | "NUMERIC" => SExpr::Cast(x.bx(), XCast::Float),
+                    "TEXT" | "VARCHAR" | "CHAR" | "STRING" | "CHARACTER VARYING" => if x.ty(ty_of) == Some(ColType::Timestamp) { SExpr::Call(crate::expr::F::TsText, vec![x]) } else { SExpr::Cast(x.bx(), XCast::Text) },
+                    "BOOL" | "BOOLEAN" => SExpr::Cast(x.bx(), XCast::Bool),
+                    "TIMESTAMP" | "DATETIME" | "DATE" | "TIMESTAMPTZ" => SExpr::Cast(x.bx(), XCast::Timestamp),
+                    other => return Err(unsup(format!("CAST to {other}"))),
+                }
+            }
+            A::Extract { field, expr, .. } => SExpr::Call(crate::expr::F::Extract, vec![SExpr::Lit(Value::Text(field.to_string())), go(self, expr, leaf)?]),
+            A::Ceil { expr, .. } => SExpr::Call(crate::expr::F::Ceil, vec![go(self, expr, leaf)?]),
+            A::Floor { expr, .. } => SExpr::Call(crate::expr::F::Floor, vec![go(self, expr, leaf)?]),
+            A::Substring { expr, substring_from, substring_for, .. } => {
+                let mut a = vec![go(self, expr, leaf)?, match substring_from { Some(x) => go(self, x, leaf)?, None => SExpr::Lit(Value::Int(1)) }];
+                if let Some(x) = substring_for { a.push(go(self, x, leaf)?); }
+                SExpr::Call(crate::expr::F::Substr, a)
+            }
+            A::Trim { expr, trim_where, trim_what, trim_characters } => {
+                if trim_characters.is_some() { return Err(unsup("TRIM with a character list")); }
+                let f = match trim_where { Some(ast::TrimWhereField::Leading) => crate::expr::F::Ltrim, Some(ast::TrimWhereField::Trailing) => crate::expr::F::Rtrim, _ => crate::expr::F::Trim };
+                let mut a = vec![go(self, expr, leaf)?]; if let Some(w) = trim_what { a.push(go(self, w, leaf)?); }
+                SExpr::Call(f, a)
+            }
+            A::Function(f) => {
+                check_function(f)?;
+                let name = obj_name(&f.name).to_lowercase();
+                if is_agg_call(f) { return Err(format!("{e}: an aggregate is not allowed here")); }
+                let args: Vec<&ast::Expr> = match &f.args {
+                    FunctionArguments::None => vec![],
+                    FunctionArguments::List(l) => l.args.iter().map(|a| match a { FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Ok(x), other => Err(unsup(format!("the argument {other}"))) }).collect::<Result<_, String>>()?,
+                    FunctionArguments::Subquery(_) => return Err(unsup(format!("{name}(subquery)"))),
+                };
+                let (fun, lo, hi) = match name.as_str() {
+                    "min" if args.len() > 1 => (crate::expr::F::MinOf, 2, 64), "max" if args.len() > 1 => (crate::expr::F::MaxOf, 2, 64),
+                    n => crate::expr::function(n).ok_or_else(|| unsup(format!("the function {name}()")))?,
+                };
+                if args.len() < lo || args.len() > hi { return Err(format!("{name}() takes {}", if lo == hi { format!("{lo} argument{}", if lo == 1 { "" } else { "s" }) } else { format!("{lo} to {hi} arguments") })); }
+                SExpr::Call(fun, args.into_iter().map(|x| go(self, x, leaf)).collect::<Result<_, _>>()?)
+            }
+            A::Subquery(q) => {
+                let cur = self.cur.clone(); let sp = self.plan_sub(q, &cur, false)?;
+                if sp.corr.is_some() { return Err(unsup("a correlated subquery inside an expression")); }
+                if sp.post.as_ref().map(|p| p.visible).unwrap_or(sp.proj.len()) != 1 { return Err("scalar subquery must select one column".into()); }
+                SExpr::Sub(Arc::new(sp))
+            }
+            A::Identifier(_) | A::CompoundIdentifier(_) => return Err(format!("no such column {e}")),
+            other => return Err(unsup(format!("the expression {other}"))),
+        })
+    }
+    /// A row expression over the FROM tables: columns become `SExpr::Col` of the (virtual) row.
+    fn row_sexpr(&mut self, e: &ast::Expr, srcs: &[Src], vidx: &mut dyn FnMut(usize, usize) -> usize, types: &std::cell::RefCell<HashMap<usize, ColType>>) -> Result<SExpr, String> {
+        let ty_of = |i: usize| types.borrow().get(&i).cloned();
+        let mut leaf = |x: &ast::Expr| -> Result<Option<SExpr>, String> {
+            if let Some((s, c)) = jcol(srcs, x)? { let v = vidx(s, c); types.borrow_mut().insert(v, srcs[s].table.schema.columns[c].ty.clone()); return Ok(Some(SExpr::Col(v))); }
+            Ok(None)
+        };
+        self.sexpr(e, &mut leaf, &ty_of)
+    }
+    /// An aggregate call: count, sum, avg, min, max, group_concat or string_agg over a column, an expression or *.
+    fn agg_spec(&mut self, f: &ast::Function, srcs: &[Src], vidx: &mut dyn FnMut(usize, usize) -> usize, types: &std::cell::RefCell<HashMap<usize, ColType>>) -> Result<AggSpec, String> {
+        check_function(f)?;
+        let name = obj_name(&f.name).to_lowercase();
+        let (args, distinct) = match &f.args { FunctionArguments::List(l) => (l.args.iter().collect::<Vec<_>>(), matches!(l.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct))), FunctionArguments::None => (vec![], false), _ => return Err(unsup(format!("{name}(subquery)"))) };
+        let gf = match name.as_str() { "count" => GenFn::Count, "sum" => GenFn::Sum, "avg" => GenFn::Avg, "min" => GenFn::Min, "max" => GenFn::Max, "group_concat" | "string_agg" => GenFn::Concat, _ => return Err(format!("unsupported function {name}")) };
+        let (lo, hi) = match name.as_str() { "count" => (0, 1), "group_concat" => (1, 2), "string_agg" => (2, 2), _ => (1, 1) };
+        if args.len() < lo || args.len() > hi { return Err(format!("{name}() takes {}", if lo == hi { format!("{lo} argument{}", if lo == 1 { "" } else { "s" }) } else { format!("{lo} to {hi} arguments") })); }
+        let arg = match args.first() {
+            None => AggArg::Star,
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) if name == "count" => { if distinct { return Err("count(DISTINCT *) is not valid; name a column".into()); } AggArg::Star }
+            Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(x))) => match self.row_sexpr(x, srcs, vidx, types)? { SExpr::Col(v) => AggArg::Col(v), x => AggArg::Expr(x) },
+            Some(other) => return Err(unsup(format!("the argument {other}"))),
+        };
+        if matches!(gf, GenFn::Sum | GenFn::Avg) {
+            let ty = match &arg { AggArg::Col(v) => types.borrow().get(v).cloned(), AggArg::Expr(x) => x.ty(&|i| types.borrow().get(&i).cloned()), AggArg::Star => None };
+            if let Some(t @ (ColType::Text(_) | ColType::Bytes(_) | ColType::Uuid | ColType::Timestamp)) = ty { return Err(format!("{f}: {name}() takes numbers, and this is {}", t.name())); }
+        }
+        let sep = match args.get(1) { None => ",".to_string(), Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(x))) => match self.expr(x)? { Expr::Lit(Value::Text(t)) => t, _ => return Err(format!("{name}(): the separator must be a text literal")) }, Some(_) => return Err(format!("{name}(): the separator must be a text literal")) };
+        Ok(AggSpec { f: gf, arg, distinct: distinct && !matches!(gf, GenFn::Min | GenFn::Max), sep })
+    }
+    /// An expression evaluated after aggregation: its aggregates become (hidden) output items, its columns must be
+    /// group keys; the result reads output columns (`SExpr::Out`).
+    fn post_sexpr(&mut self, e: &ast::Expr, items: &mut Vec<UItem>, itexts: &mut Vec<String>, keys: &[GKey], aliases: &[String], srcs: &[Src], vidx: &mut dyn FnMut(usize, usize) -> usize, types: &std::cell::RefCell<HashMap<usize, ColType>>) -> Result<SExpr, String> {
+        let mut found = vec![]; collect_aggs(e, &mut found);
+        for a in found {
+            let t = norm_sql(a);
+            if itexts.contains(&t) { continue; }
+            let ast::Expr::Function(f) = a else { continue };
+            let spec = self.agg_spec(f, srcs, vidx, types)?; items.push(UItem::Agg(spec)); itexts.push(t);
+        }
+        let mut leaf = |x: &ast::Expr| -> Result<Option<SExpr>, String> {
+            let t = norm_sql(x);
+            if let Some(i) = itexts.iter().position(|y| !y.is_empty() && *y == t) { return Ok(Some(SExpr::Out(i))); }
+            if let ast::Expr::Identifier(id) = x { if jcol(srcs, x).ok().flatten().is_none() { if let Some(i) = aliases.iter().position(|a| a.eq_ignore_ascii_case(&id.value)) { return Ok(Some(SExpr::Out(i))); } } }
+            let key = match keys.iter().position(|k| k.text == t) { Some(k) => Some(k), None => match jcol(srcs, x)? { Some((s, c)) => { let v = vidx(s, c); match keys.iter().position(|k| k.col == Some(v)) { Some(k) => Some(k), None => return Err(format!("{x} must appear in GROUP BY or inside an aggregate")) } } None => None } };
+            if let Some(k) = key { items.push(UItem::Key(k)); itexts.push(t); return Ok(Some(SExpr::Out(items.len() - 1))); }
+            Ok(None)
+        };
+        self.sexpr(e, &mut leaf, &|_| None)
+    }
+    /// SELECT without FROM: one row of expressions.
+    fn plan_const(&mut self, q: &ast::Query, sel: &ast::Select) -> Result<Plan, String> {
+        if sel.selection.is_some() || sel.having.is_some() || !matches!(&sel.group_by, GroupByExpr::Expressions(v, _) if v.is_empty()) { return Err(unsup("WHERE, GROUP BY or HAVING without FROM")); }
+        let _ = q;
+        let mut exprs = vec![]; let mut names = vec![];
+        for item in &sel.projection {
+            let (e, alias) = match item { SelectItem::UnnamedExpr(e) => (e, None), SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())), other => return Err(format!("{other} needs FROM")) };
+            if has_agg(e) { return Err(format!("{e}: an aggregate needs FROM")); }
+            exprs.push(self.sexpr(e, &mut |_| Ok(None), &|_| None)?); names.push(alias.unwrap_or_else(|| e.to_string()));
+        }
+        Ok(Plan::Const { exprs, names })
     }
     fn table_src(&self, tf: &TableFactor) -> Result<Src, String> {
         match tf { TableFactor::Table { name, alias, .. } => { let n = obj_name(name); let table = self.db.table(&n).ok_or(format!("no such table {n}"))?; Ok(Src { table, alias: alias.as_ref().map(|a| a.name.value.clone()).unwrap_or(n) }) }, other => Err(format!("unsupported FROM {other}")) }
@@ -228,32 +701,98 @@ impl<'a> Planner<'a> {
                 let action = |a: &Option<ast::ReferentialAction>| -> Result<FkAction, String> { match a { None | Some(ast::ReferentialAction::NoAction) | Some(ast::ReferentialAction::Restrict) => Ok(FkAction::Restrict), Some(ast::ReferentialAction::Cascade) => Ok(FkAction::Cascade), Some(ast::ReferentialAction::SetNull) => Ok(FkAction::SetNull), Some(other) => Err(format!("unsupported referential action {other}")) } };
                 let mut auto: Option<usize> = None;
                 for (i, c) in ct.columns.iter().enumerate() {
+                    literal_name(&c.name)?;
                     let mut nullable = true;
                     let mut default = Value::Null; let mut generated = None;
                     let ty = if is_serial(&c.data_type) { auto = Some(i); ColType::Int } else { coltype_of(&c.data_type)? };
                     for o in &c.options {
-                        let s = format!("{}", o.option).to_uppercase();
-                        if let ast::ColumnOption::ForeignKey(fk) = &o.option { fks.push(FkDef { col: i, parent: obj_name(&fk.foreign_table), on_delete: action(&fk.on_delete)? }); }
-                        else if s.starts_with("PRIMARY KEY") { pk = Some(i); nullable = false; }
-                        else if s.starts_with("UNIQUE") { unique = Some(i); }
-                        else if s.starts_with("NOT NULL") { nullable = false; }
-                        else if s.contains("AUTOINCREMENT") || s.contains("AUTO_INCREMENT") || matches!(&o.option, ast::ColumnOption::Generated { generation_expr: None, .. }) { auto = Some(i); }
-                        else if let ast::ColumnOption::Default(e) = &o.option { (default, generated) = default_spec(e, &c.name.value, &ty)?; }
+                        match &o.option {
+                            ast::ColumnOption::ForeignKey(fk) => fks.push(FkDef { col: i, parent: obj_name(&fk.foreign_table), on_delete: action(&fk.on_delete)? }),
+                            ast::ColumnOption::PrimaryKey(_) => { if pk.is_some_and(|p| p != i) { return Err(unsup("a primary key on more than one column")); } pk = Some(i); nullable = false; }
+                            ast::ColumnOption::Unique(_) => { if unique.is_some_and(|u| u != i) { return Err(unsup("UNIQUE on more than one column of a table")); } unique = Some(i); }
+                            ast::ColumnOption::NotNull => nullable = false,
+                            ast::ColumnOption::Null | ast::ColumnOption::Comment(_) => {}
+                            ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; }
+                            ast::ColumnOption::Generated { generation_expr: None, .. } => auto = Some(i),
+                            ast::ColumnOption::Generated { .. } => return Err(unsup(format!("generated column {}", c.name.value))),
+                            ast::ColumnOption::Check(_) => return Err(unsup(format!("CHECK constraint on {}", c.name.value))),
+                            ast::ColumnOption::DialectSpecific(_) if { let s = format!("{}", o.option).to_uppercase(); s.contains("AUTOINCREMENT") || s.contains("AUTO_INCREMENT") } => auto = Some(i),
+                            other => return Err(unsup(format!("column option {other} on {}", c.name.value))),
+                        }
                     }
                     cols.push(Column { name: c.name.value.clone(), ty, nullable, default, generated });
                 }
+                if ct.or_replace || ct.temporary || ct.query.is_some() || ct.like.is_some() || ct.clone.is_some() || ct.inherits.is_some() || ct.partition_of.is_some() { return Err(unsup("CREATE TABLE with OR REPLACE, TEMPORARY, AS SELECT, LIKE, CLONE, INHERITS or PARTITION OF")); }
+                let one_col = |cols_: &[ast::IndexColumn], what: &str, cols: &[Column]| -> Result<usize, String> {
+                    if cols_.len() != 1 { return Err(unsup(format!("a {what} on more than one column"))); }
+                    let n = cols_[0].column.expr.to_string(); cols.iter().position(|c| c.name.eq_ignore_ascii_case(&n)).ok_or(format!("unknown column {n}"))
+                };
+                for tc in &ct.constraints { match tc {
+                    ast::TableConstraint::ForeignKey(_) => {}
+                    ast::TableConstraint::PrimaryKey(p) => { let i = one_col(&p.columns, "primary key", &cols)?; if pk.is_some_and(|x| x != i) { return Err(unsup("a primary key on more than one column")); } pk = Some(i); cols[i].nullable = false; }
+                    ast::TableConstraint::Unique(u) => { let i = one_col(&u.columns, "UNIQUE constraint", &cols)?; if unique.is_some_and(|x| x != i) { return Err(unsup("UNIQUE on more than one column of a table")); } unique = Some(i); }
+                    ast::TableConstraint::Check(_) => return Err(unsup("CHECK constraints")),
+                    other => return Err(unsup(format!("table constraint {other}"))),
+                } }
                 for tc in &ct.constraints { if let ast::TableConstraint::ForeignKey(fk) = tc { if fk.columns.len() != 1 { return Err("one column per foreign key (for now)".into()); } let col = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&fk.columns[0].value)).ok_or(format!("unknown column {}", fk.columns[0].value))?; fks.push(FkDef { col, parent: obj_name(&fk.foreign_table), on_delete: action(&fk.on_delete)? }); } }
                 let pk = pk.ok_or("a PRIMARY KEY column is required")?;
                 if let Some(a) = auto { if a != pk { return Err(format!("{} is assigned automatically but is not the primary key; automatic values are for the INT PRIMARY KEY", cols[a].name)); } if cols[pk].ty != ColType::Int { return Err(format!("{}: automatic ids are integers; for a UUID key use DEFAULT uuid()", cols[pk].name)); } }
                 let mut schema = Schema::new(&obj_name(&ct.name), cols, pk, unique)?; schema.fks = fks; schema.auto = auto.is_some();
-                Ok(Plan::CreateTable(schema))
+                Ok(Plan::CreateTable(schema, ct.if_not_exists))
             }
             Statement::Insert(ins) => {
+                // OR IGNORE and OR REPLACE (SQLite), INSERT IGNORE and REPLACE INTO (MySQL), ON CONFLICT (PostgreSQL, SQLite)
+                let mut conflict = match &ins.or { Some(ast::SqliteOnConflict::Ignore) => Conflict::Nothing(None), Some(ast::SqliteOnConflict::Replace) => Conflict::Replace, _ => Conflict::None };
+                if ins.ignore { conflict = Conflict::Nothing(None); }
+                if ins.replace_into { conflict = Conflict::Replace; }
+                if matches!(ins.on, Some(ast::OnInsert::DuplicateKeyUpdate(_))) { return Err(unsup("ON DUPLICATE KEY UPDATE (use ON CONFLICT (column) DO UPDATE SET …)")); }
+                if !ins.assignments.is_empty() || ins.overwrite || ins.partitioned.is_some() || !ins.after_columns.is_empty() || ins.output.is_some() || ins.insert_alias.is_some() || ins.settings.is_some() || ins.format_clause.is_some() { return Err(unsup("this INSERT clause")); }
                 let name = match &ins.table { TableObject::TableName(n) => obj_name(n), other => return Err(format!("unsupported insert target {other}")) };
                 let table = self.db.table(&name).ok_or(format!("no such table {name}"))?;
-                let q = ins.source.as_ref().ok_or("INSERT needs VALUES")?;
-                let vrows: Vec<&Vec<ast::Expr>> = match &*q.body { SetExpr::Values(v) => v.rows.iter().map(|r| &r.content).collect(), _ => return Err("only INSERT ... VALUES is supported".into()) };
-                if vrows.is_empty() { return Err("empty VALUES".into()); }
+                let q = ins.source.as_ref().ok_or("INSERT needs VALUES or a SELECT")?;
+                if let Some(ast::OnInsert::OnConflict(oc)) = &ins.on {
+                    let schema = &table.schema; let n = schema.columns.len();
+                    let target = match &oc.conflict_target {
+                        None => None,
+                        Some(ast::ConflictTarget::Columns(cs)) => {
+                            if cs.len() != 1 { return Err(unsup("ON CONFLICT on several columns")); }
+                            let c = schema.col(&cs[0].value).ok_or(format!("no such column {}", cs[0].value))?;
+                            if c != schema.pk && Some(c) != schema.unique { return Err(format!("ON CONFLICT ({}): only the primary key and the UNIQUE column can conflict", cs[0].value)); }
+                            Some(c)
+                        }
+                        Some(other) => return Err(unsup(format!("ON CONFLICT {other}"))),
+                    };
+                    conflict = match &oc.action {
+                        ast::OnConflictAction::DoNothing => Conflict::Nothing(target),
+                        ast::OnConflictAction::DoUpdate(du) => {
+                            let target = target.ok_or("ON CONFLICT DO UPDATE needs a target: ON CONFLICT (column) DO UPDATE …")?;
+                            // the existing row is columns 0..n, `excluded` (the row being inserted) n..2n
+                            let tname = name.to_lowercase();
+                            let mut leaf = |x: &ast::Expr| -> Result<Option<SExpr>, String> {
+                                let col = |c: &str| schema.col(c).ok_or(format!("no such column {c}"));
+                                match x {
+                                    ast::Expr::Identifier(id) => Ok(Some(SExpr::Col(col(&id.value)?))),
+                                    ast::Expr::CompoundIdentifier(ids) if ids.len() == 2 && ids[0].value.eq_ignore_ascii_case("excluded") => Ok(Some(SExpr::Col(n + col(&ids[1].value)?))),
+                                    ast::Expr::CompoundIdentifier(ids) if ids.len() == 2 && ids[0].value.to_lowercase() == tname => Ok(Some(SExpr::Col(col(&ids[1].value)?))),
+                                    _ => Ok(None),
+                                }
+                            };
+                            let ty_of = |i: usize| schema.columns.get(i % n).map(|c| c.ty.clone());
+                            let mut sets = vec![];
+                            for a in &du.assignments {
+                                let c = match &a.target { ast::AssignmentTarget::ColumnName(o) => { let cn = obj_name(o); schema.col(&cn).ok_or(format!("no such column {cn}"))? } other => return Err(format!("unsupported assignment {other}")) };
+                                let x = self.sexpr(&a.value, &mut leaf, &ty_of)?;
+                                let x = if schema.columns[c].ty == ColType::Timestamp { coerce(x, &SExpr::Lit(Value::Int(0)), &|_| None)? } else { x };
+                                sets.push((c, x));
+                            }
+                            let cond = du.selection.as_ref().map(|w| self.sexpr(w, &mut leaf, &ty_of)).transpose()?;
+                            Conflict::Update { target, sets, cond }
+                        }
+                    };
+                }
+                let vrows: Vec<&Vec<ast::Expr>> = match &*q.body { SetExpr::Values(v) => v.rows.iter().map(|r| &r.content).collect(), _ => vec![] };
+                let select_source = !matches!(&*q.body, SetExpr::Values(_));
+                if vrows.is_empty() && !select_source { return Err("empty VALUES".into()); }
                 let schema = &table.schema; let ncols = schema.columns.len();
                 // a column left out, or given as DEFAULT: the automatic key, a generator, the default, or NULL
                 let fill = |i: usize| -> Result<Expr, String> {
@@ -265,6 +804,15 @@ impl<'a> Planner<'a> {
                     Err(format!("column {} has no value and no default", c.name))
                 };
                 let targets: Vec<usize> = if ins.columns.is_empty() { (0..ncols).collect() } else { ins.columns.iter().map(|c| { let n = obj_name(c); schema.col(&n).ok_or(format!("no such column {n}")) }).collect::<Result<_, _>>()? };
+                // INSERT … SELECT: the query runs when the statement does; each of its rows is one inserted row
+                let mut from = None;
+                if select_source {
+                    let plan = self.plan_query(q)?;
+                    let width = match &plan { Plan::Select(sp) => sp.post.as_ref().map(|p| p.visible).unwrap_or(sp.proj.len()), Plan::Const { exprs, .. } => exprs.len(), _ => return Err("INSERT … needs VALUES or a SELECT".into()) };
+                    if width != targets.len() { return Err(format!("INSERT INTO {name}: the SELECT gives {width} column{} for {} target column{}", if width == 1 { "" } else { "s" }, targets.len(), if targets.len() == 1 { "" } else { "s" })); }
+                    let fill = (0..ncols).map(|i| if targets.contains(&i) { Ok(None) } else { fill(i).map(Some) }).collect::<Result<Vec<_>, String>>()?;
+                    from = Some(InsertFrom { plan: Box::new(plan), targets: targets.clone(), fill });
+                }
                 let mut rows = Vec::with_capacity(vrows.len()); let nrows = vrows.len();
                 for (ri, row) in vrows.into_iter().enumerate() {
                     if row.len() != targets.len() { return Err(values_count_error(schema, &name, if ins.columns.is_empty() { None } else { Some(&targets) }, row.len(), ri, nrows)); }
@@ -284,25 +832,36 @@ impl<'a> Planner<'a> {
                         other => return Err(format!("RETURNING supports column names and * (got {other})")),
                     } } Some(cols) }
                 };
-                Ok(Plan::Insert { table, rows, returning })
+                Ok(Plan::Insert { table, rows, returning, from, conflict })
             }
             Statement::Query(q) => self.plan_query(q),
             Statement::Delete(d) => self.plan_delete(d),
             Statement::Update(u) => {
+                if u.returning.is_some() { return Err(unsup("UPDATE … RETURNING")); }
+                if u.from.is_some() || !u.table.joins.is_empty() { return Err(unsup("UPDATE … FROM another table")); }
+                if u.or.is_some() || u.output.is_some() || !u.order_by.is_empty() || u.limit.is_some() { return Err(unsup("UPDATE OR …, OUTPUT, ORDER BY or LIMIT")); }
+                check_table(&u.table.relation)?;
                 let src = self.table_src(&u.table.relation)?; let table = src.table.clone();
                 let srcs = vec![src]; let schema = table.schema.clone();
                 let mut sets = vec![];
-                for a in &u.assignments { let n = match &a.target { ast::AssignmentTarget::ColumnName(o) => obj_name(o), other => return Err(format!("unsupported assignment {other}")) }; let c = schema.col(&n).ok_or(format!("no such column {n}"))?; let e = self.expr(&a.value)?; sets.push((c, e)); }
+                let types: std::cell::RefCell<HashMap<usize, ColType>> = Default::default();
+                for a in &u.assignments {
+                    let n = match &a.target { ast::AssignmentTarget::ColumnName(o) => obj_name(o), other => return Err(format!("unsupported assignment {other}")) }; let c = schema.col(&n).ok_or(format!("no such column {n}"))?;
+                    // a value known before the row is read takes the old fast path; anything over the row is an expression
+                    let simple = matches!(&a.value, ast::Expr::Value(_) | ast::Expr::Subquery(_)) || matches!(&a.value, ast::Expr::UnaryOp { op: UnaryOperator::Minus, expr } if matches!(**expr, ast::Expr::Value(_)));
+                    let v = if simple { SetVal::Value(self.expr(&a.value)?) } else { let x = self.row_sexpr(&a.value, &srcs, &mut |_, c| c, &types)?; let x = if schema.columns[c].ty == ColType::Timestamp { coerce(x, &SExpr::Lit(Value::Int(0)), &|_| None)? } else { x }; SetVal::Row(x) };
+                    sets.push((c, v));
+                }
                 let mut preds = vec![vec![]];
                 if let Some(w) = &u.selection { let mut cj = vec![]; conjuncts(w, &mut cj); for c in cj { self.classify(&srcs, c, &mut preds, &mut vec![])?; } }
-                if preds[0].len() != 1 || preds[0][0].col != schema.pk || preds[0][0].cmp != Cmp::Eq { return Err("UPDATE needs WHERE <primary key> = <value> (for now)".into()); }
+                if preds[0].len() != 1 || preds[0][0].col != schema.pk || preds[0][0].cmp != Cmp::Eq { return Err(unsup("UPDATE by anything other than WHERE <primary key> = <value>")); }
                 Ok(Plan::Update { table, sets, pk: preds[0].pop().unwrap().rhs })
             }
             Statement::AlterTable(at) => {
                 let mut ops = vec![];
                 for op in &at.operations {
                     ops.push(match op {
-                        ast::AlterTableOperation::AddColumn { column_def: c, .. } => { let mut nullable = true; let mut default = Value::Null; let mut generated = None; let ty = coltype_of(&c.data_type)?; for o in &c.options { match &o.option { ast::ColumnOption::NotNull => nullable = false, ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; } ast::ColumnOption::Null => nullable = true, other => return Err(format!("unsupported column option {other}")) } } if !nullable && default == Value::Null && generated.is_none() { return Err(format!("column {} is NOT NULL and needs a DEFAULT for existing rows", c.name.value)); } AlterOp::Add { col: Column { name: c.name.value.clone(), ty, nullable, default: default.clone(), generated }, default } }
+                        ast::AlterTableOperation::AddColumn { column_def: c, .. } => { literal_name(&c.name)?; let mut nullable = true; let mut default = Value::Null; let mut generated = None; let ty = coltype_of(&c.data_type)?; for o in &c.options { match &o.option { ast::ColumnOption::NotNull => nullable = false, ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; } ast::ColumnOption::Null => nullable = true, other => return Err(format!("unsupported column option {other}")) } } if !nullable && default == Value::Null && generated.is_none() { return Err(format!("column {} is NOT NULL and needs a DEFAULT for existing rows", c.name.value)); } AlterOp::Add { col: Column { name: c.name.value.clone(), ty, nullable, default: default.clone(), generated }, default } }
                         ast::AlterTableOperation::DropColumn { column_names, .. } => { if column_names.len() != 1 { return Err("drop one column at a time".into()); } AlterOp::Drop(column_names[0].value.clone()) }
                         ast::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => AlterOp::Rename(old_column_name.value.clone(), new_column_name.value.clone()),
                         ast::AlterTableOperation::AlterColumn { column_name, op } => match op { ast::AlterColumnOperation::SetNotNull => AlterOp::SetNotNull(column_name.value.clone()), ast::AlterColumnOperation::DropNotNull => AlterOp::DropNotNull(column_name.value.clone()), ast::AlterColumnOperation::SetDataType { data_type, .. } => AlterOp::SetType(column_name.value.clone(), coltype_of(data_type)?), other => return Err(format!("unsupported ALTER COLUMN {other}")) },
@@ -343,7 +902,7 @@ impl<'a> Planner<'a> {
             ast::Expr::InSubquery { expr, subquery, negated } => {
                 let (s, c) = jcol(srcs, expr)?.ok_or(format!("unknown column in {e}"))?;
                 let sp = self.plan_sub(subquery, srcs, false)?;
-                if sp.corr.is_none() && sp.proj.len() != 1 { return Err("IN (subquery) must select exactly one column".into()); }
+                if sp.corr.is_none() && sp.post.as_ref().map(|p| p.visible).unwrap_or(sp.proj.len()) != 1 { return Err("IN (subquery) must select exactly one column".into()); }
                 preds[s].push(Pred { col: c, cmp: if *negated { Cmp::NotIn } else { Cmp::In }, rhs: Expr::Set(Arc::new(sp)) }); Ok(())
             }
             ast::Expr::Exists { subquery, negated } => {
@@ -363,24 +922,66 @@ impl<'a> Planner<'a> {
         }
     }
     fn plan_query(&mut self, q: &ast::Query) -> Result<Plan, String> {
-        let sel = match &*q.body { SetExpr::Select(s) => s, _ => return Err("unsupported query shape".into()) };
+        check_query(q)?;
+        let sel = match &*q.body { SetExpr::Select(s) => s, SetExpr::SetOperation { op, .. } => return Err(unsup(format!("{op}"))), SetExpr::Query(_) => return Err(unsup("a parenthesized query")), _ => return Err("unsupported query shape".into()) };
         // sources
         let mut srcs = vec![]; let mut on_exprs: Vec<&ast::Expr> = vec![];
+        // LEFT JOIN: which tables are joined that way, and each one's ON conditions
+        let mut outer_of: Vec<bool> = vec![]; let mut left_on: Vec<(usize, Vec<&ast::Expr>)> = vec![];
         for twj in &sel.from {
-            srcs.push(self.table_src(&twj.relation)?);
+            srcs.push(self.table_src(&twj.relation)?); outer_of.push(false);
             for j in &twj.joins {
-                match &j.join_operator { JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::Join(JoinConstraint::On(e)) => conjuncts(e, &mut on_exprs), other => return Err(format!("only INNER JOIN ... ON is supported, got {other:?}")) }
+                let i = srcs.len();
+                match &j.join_operator {
+                    JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::Join(JoinConstraint::On(e)) => { conjuncts(e, &mut on_exprs); outer_of.push(false); }
+                    JoinOperator::Left(JoinConstraint::On(e)) | JoinOperator::LeftOuter(JoinConstraint::On(e)) => { let mut v = vec![]; conjuncts(e, &mut v); left_on.push((i, v)); outer_of.push(true); }
+                    JoinOperator::Right(_) | JoinOperator::RightOuter(_) => return Err(unsup("RIGHT JOIN (write it as a LEFT JOIN with the tables swapped)")),
+                    JoinOperator::FullOuter(_) => return Err(unsup("FULL OUTER JOIN")),
+                    other => return Err(unsup(format!("this join ({}); INNER JOIN … ON and LEFT JOIN … ON are", format!("{other:?}").split('(').next().unwrap_or("")))),
+                }
                 srcs.push(self.table_src(&j.relation)?);
             }
         }
-        if srcs.is_empty() || srcs.len() > 8 { return Err("between one and eight tables in FROM".into()); }
+        let has_outer = outer_of.iter().any(|x| *x);
+        if has_outer && sel.from.len() > 1 { return Err(unsup("LEFT JOIN next to comma-separated tables")); }
+        if srcs.is_empty() { return self.plan_const(q, sel); }
+        if srcs.len() > 8 { return Err("between one and eight tables in FROM".into()); }
         let exists = std::mem::replace(&mut self.exists_mode, false);
         let saved_cur = std::mem::replace(&mut self.cur, srcs.clone());
         // predicates
         let mut side_preds: Vec<Vec<Pred>> = vec![vec![]; srcs.len()];
         let mut conds: Vec<(usize, usize, usize, usize)> = vec![];
-        let mut cj = on_exprs; if let Some(w) = &sel.selection { conjuncts(w, &mut cj); }
-        for c in cj { self.classify(&srcs, c, &mut side_preds, &mut conds)?; }
+        let mut cj = on_exprs; let mut resid: Vec<(&ast::Expr, String)> = vec![];
+        if let Some(w) = &sel.selection {
+            let mut wc = vec![]; conjuncts(w, &mut wc);
+            // a WHERE condition on a LEFT JOINed table runs after the join: it must see the rows that table did not match
+            for c in wc { let mut sd = vec![]; sides_of(&srcs, c, &mut sd); if sd.iter().any(|&x| outer_of[x]) { resid.push((c, String::new())); } else { cj.push(c); } }
+        }
+        // LEFT JOIN … ON: one equality with an earlier table is the join key; conditions on the joined table alone filter it
+        let mut outer_keys: Vec<(usize, usize, usize, usize)> = vec![];
+        for (i, conds_i) in &left_on {
+            let mut key = None;
+            for c in conds_i {
+                if key.is_none() { if let Some((a, ca, b, cb)) = col_eq(&srcs, c) { if a == *i && b < *i { key = Some((*i, ca, b, cb)); continue; } if b == *i && a < *i { key = Some((*i, cb, a, ca)); continue; } } }
+                let mut sd = vec![]; sides_of(&srcs, c, &mut sd);
+                if sd.iter().any(|x| x != i) { return Err(unsup(format!("LEFT JOIN … ON {c} (the ON clause takes one equality with an earlier table and conditions on the joined table)"))); }
+                let mut tmp = vec![vec![]; srcs.len()];
+                self.classify(&srcs, c, &mut tmp, &mut vec![]).map_err(|e| format!("LEFT JOIN … ON {c}: {e}"))?;
+                side_preds[*i].append(&mut tmp[*i]);
+            }
+            outer_keys.push(key.ok_or(format!("LEFT JOIN {}: the ON clause needs an equality with a column of an earlier table", srcs[*i].alias))?);
+        }
+        // a condition the compiled predicates cannot express (OR, LIKE, a function, arithmetic) is evaluated per row
+        for c in cj {
+            let (mut sp2, mut cd2, corr0) = (side_preds.clone(), conds.clone(), self.corr);
+            match self.classify(&srcs, c, &mut sp2, &mut cd2) { Ok(()) => { side_preds = sp2; conds = cd2; } Err(e) => { self.corr = corr0; resid.push((c, e)); } }
+        }
+        // a join compares keys of one kind: integers (INT, TIMESTAMP), UUIDs, text, or bytes
+        for &(sa, ca, sb, cb) in conds.iter().chain(outer_keys.iter()) {
+            let (a, b) = (&srcs[sa].table.schema.columns[ca], &srcs[sb].table.schema.columns[cb]);
+            let (ka, kb) = (crate::table::key_kind(&a.ty), crate::table::key_kind(&b.ty));
+            if ka.is_none() || ka != kb { return Err(unsup(format!("a join of {}.{} ({}) with {}.{} ({})", srcs[sa].alias, a.name, a.ty.name(), srcs[sb].alias, b.name, b.ty.name()))); }
+        }
         let corr_spec = self.corr.take();
         let mut subs: Vec<(Arc<SelectPlan>, Option<usize>)> = vec![];
         let joined = srcs.len() > 1;
@@ -404,7 +1005,20 @@ impl<'a> Planner<'a> {
                 }
                 if inc.len() == srcs.len() { if used.iter().any(|u| !u) { return Err("a join condition is neither a primary-key join nor supported as a filter".into()); } order = Some((p, steps)); break 'outer; }
             }
-            if order.is_none() { return Err("cannot order the joins: every joined table must be reached through its primary key".into()); }
+            if order.is_none() && !has_outer && sel.from.len() == 1 && conds.len() == srcs.len() - 1 { order = Some((usize::MAX, vec![])); }   // try the written order below
+            if order.is_none() && !has_outer { return Err("cannot order the joins: every joined table must be reached through its primary key, or join the tables in one chain (a JOIN b ON … JOIN c ON …)".into()); }
+        }
+        // LEFT JOIN (or no primary-key chain): the first table drives, each next table joins on its ON equality with an
+        // earlier one, through its primary key or any other column (one-to-many)
+        if joined && (has_outer || matches!(order, Some((usize::MAX, _)))) {
+            let mut steps = vec![]; let mut used = vec![false; conds.len()];
+            for i in 1..srcs.len() {
+                let step = if outer_of[i] { outer_keys.iter().find(|k| k.0 == i).map(|&(bs, bc, ks, kc)| (bs, bc, ks, kc)) }
+                    else { conds.iter().enumerate().find_map(|(ci, &(sa, ca, sb, cb))| if used[ci] { None } else if sa == i && sb < i { Some((ci, (i, ca, sb, cb))) } else if sb == i && sa < i { Some((ci, (i, cb, sa, ca))) } else { None }).map(|(ci, st)| { used[ci] = true; st }) };
+                steps.push(step.ok_or(format!("JOIN {}: needs an ON equality with a column of an earlier table", srcs[i].alias))?);
+            }
+            if used.iter().any(|u| !u) { return Err(unsup("a second equality between the same joined tables")); }
+            order = Some((0, steps));
         }
         let (probe, step_specs) = order.unwrap_or((0, vec![]));
         let ps = srcs[probe].table.schema.clone();
@@ -423,32 +1037,139 @@ impl<'a> Planner<'a> {
         // step keys must be in the virtual row: register them first (a key may come from the probe or an earlier step)
         let mut key_vidx = vec![0usize; step_specs.len()];
         for (k, &(_, _, ks, kc)) in step_specs.iter().enumerate() { key_vidx[k] = vidx(ks, kc); }
-        let mut proj = vec![]; let mut names: Vec<String> = vec![];
-        for item in sel.projection.iter().filter(|_| !exists) {
-            match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    names.push(match item { SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(), _ => match e { ast::Expr::Identifier(id) => id.value.clone(), ast::Expr::CompoundIdentifier(ids) => ids.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."), other => other.to_string() } });
-                    if let ast::Expr::Subquery(q) = e { let srcs_c = srcs.clone(); let sp = self.plan_sub(q, &srcs_c, false)?; let oc = sp.corr.map(|(_, oc)| oc); subs.push((Arc::new(sp), oc)); proj.push(Proj::Sub(subs.len() - 1)); continue; }
-                    if let Some((s, c)) = jcol(&srcs, e)? { proj.push(Proj::Col(vidx(s, c))); continue; }
-                    if let ast::Expr::Function(f) = e {
-                        let name = obj_name(&f.name).to_lowercase();
-                        let arg = match &f.args { FunctionArguments::List(l) => l.args.first(), _ => None };
-                        let argcol = |a: Option<&FunctionArg>| -> Result<(usize, usize), String> { match a { Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => jcol(&srcs, e)?.ok_or(format!("{name} needs a column")), _ => Err(format!("{name} needs a column")) } };
-                        let agg = match name.as_str() { "count" => match arg { Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => { let (s, c) = jcol(&srcs, e)?.ok_or("count needs a column or *")?; Agg::CountCol(vidx(s, c)) }, _ => Agg::CountStar }, "sum" => { let (s, c) = argcol(arg)?; Agg::Sum(vidx(s, c)) }, "avg" => { let (s, c) = argcol(arg)?; Agg::Avg(vidx(s, c)) }, "min" => { let (s, c) = argcol(arg)?; Agg::Min(vidx(s, c)) }, "max" => { let (s, c) = argcol(arg)?; Agg::Max(vidx(s, c)) }, _ => return Err(format!("unsupported function {name}")) };
-                        proj.push(Proj::Agg(agg)); continue;
+        // ---- the select list, GROUP BY, HAVING, ORDER BY, OFFSET, LIMIT, DISTINCT (E55)
+        let types: std::cell::RefCell<HashMap<usize, ColType>> = Default::default();   // planned columns' types, for coercions
+        let mut filters: Vec<SExpr> = vec![];
+        for (c, e1) in &resid {
+            match self.row_sexpr(c, &srcs, &mut vidx, &types) { Ok(x) => filters.push(x), Err(e2) => return Err(if e1.contains("correlat") || e1.contains("outer") { e1.clone() } else { e2 }) }
+        }
+        let mut proj: Vec<Proj> = vec![]; let mut names: Vec<String> = vec![]; let mut texts: Vec<String> = vec![]; let mut exprs: Vec<SExpr> = vec![];
+        let group_asts: Vec<&ast::Expr> = match &sel.group_by { GroupByExpr::Expressions(v, _) => v.iter().collect(), _ => vec![] };
+        let aggregating = !group_asts.is_empty() || sel.having.is_some() || sel.projection.iter().any(|it| match it { SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => has_agg(e), _ => false });
+        if aggregating && exists { return Err(unsup("GROUP BY, HAVING or an aggregate inside EXISTS")); }
+        let item_name = |item: &SelectItem, e: &ast::Expr| match item { SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(), _ => match e { ast::Expr::Identifier(id) => id.value.clone(), ast::Expr::CompoundIdentifier(ids) => ids.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."), other => other.to_string() } };
+        let mut keys: Vec<GKey> = vec![]; let mut items: Vec<UItem> = vec![]; let mut itexts: Vec<String> = vec![];
+        let visible;
+        if !aggregating {
+            for item in sel.projection.iter().filter(|_| !exists) {
+                match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        names.push(item_name(item, e)); texts.push(norm_sql(e));
+                        if let ast::Expr::Subquery(q) = e { let srcs_c = srcs.clone(); let sp = self.plan_sub(q, &srcs_c, false)?; let oc = sp.corr.map(|(_, oc)| oc); subs.push((Arc::new(sp), oc)); proj.push(Proj::Sub(subs.len() - 1)); continue; }
+                        if let Some((s, c)) = jcol(&srcs, e)? { proj.push(Proj::Col(vidx(s, c))); continue; }
+                        let x = self.row_sexpr(e, &srcs, &mut vidx, &types)?; exprs.push(x); proj.push(Proj::Expr(exprs.len() - 1));
                     }
-                    return Err(format!("unsupported projection {e}"));
+                    SelectItem::Wildcard(_) => {
+                        let mut add = |v: usize, proj: &mut Vec<Proj>| { proj.push(Proj::Col(v)); texts.push(String::new()); names.push(String::new()); };   // finish_names names them
+                        for i in 0..ncols_probe { add(i, &mut proj); }
+                        for &(bs, _, _, _) in &step_specs { for c in 0..srcs[bs].table.schema.columns.len() { let v = vidx(bs, c); add(v, &mut proj); } }
+                    }
+                    other => return Err(format!("unsupported projection {other}")),
                 }
-                SelectItem::Wildcard(_) => { for i in 0..ncols_probe { proj.push(Proj::Col(i)); } for &(bs, _, _, _) in &step_specs { for c in 0..srcs[bs].table.schema.columns.len() { proj.push(Proj::Col(vidx(bs, c))); } } }
-                other => return Err(format!("unsupported projection {other}")),
+            }
+            visible = proj.len();
+        } else {
+            // GROUP BY keys: columns or expressions; a position or an output name refers to a select-list item
+            let sel_items: Vec<(&ast::Expr, Option<String>)> = sel.projection.iter().filter_map(|it| match it { SelectItem::UnnamedExpr(e) => Some((e, None)), SelectItem::ExprWithAlias { expr, alias } => Some((expr, Some(alias.value.clone()))), _ => None }).collect();
+            for g in &group_asts {
+                let target: &ast::Expr = if let Some(n) = int_lit(g) { sel_items.get((n as usize).wrapping_sub(1)).map(|x| x.0).ok_or(format!("GROUP BY {n}: no select-list item at that position"))? }
+                    else if let ast::Expr::Identifier(id) = g { if jcol(&srcs, g).ok().flatten().is_none() { sel_items.iter().find(|x| x.1.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&id.value))).map(|x| x.0).unwrap_or(g) } else { g } } else { g };
+                if has_agg(target) { return Err(format!("GROUP BY {g}: an aggregate cannot be a group key")); }
+                let text = norm_sql(target);
+                if keys.iter().any(|k| k.text == text) { continue; }
+                match jcol(&srcs, target)? {
+                    Some((s, c)) => { let v = vidx(s, c); types.borrow_mut().insert(v, srcs[s].table.schema.columns[c].ty.clone()); if !keys.iter().any(|k| k.col == Some(v)) { keys.push(GKey { col: Some(v), expr: None, text }); } }
+                    None => { let x = self.row_sexpr(target, &srcs, &mut vidx, &types)?; keys.push(GKey { col: None, expr: Some(x), text }); }
+                }
+            }
+            let mut pending: Vec<(usize, &ast::Expr)> = vec![];
+            for item in &sel.projection {
+                let e = match item { SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e, SelectItem::Wildcard(_) => return Err("SELECT * cannot be combined with GROUP BY or aggregates; name the columns".into()), other => return Err(format!("unsupported projection {other}")) };
+                names.push(item_name(item, e)); let t = norm_sql(e); texts.push(t.clone());
+                let it = if let Some(k) = keys.iter().position(|k| k.text == t) { UItem::Key(k) }
+                    else if let Some((s, c)) = jcol(&srcs, e)? { let v = vidx(s, c); match keys.iter().position(|k| k.col == Some(v)) { Some(k) => UItem::Key(k), None => return Err("every selected column must appear in GROUP BY or inside an aggregate".into()) } }
+                    else if let ast::Expr::Function(f) = e.clone() { if is_agg_call(&f) { UItem::Agg(self.agg_spec(&f, &srcs, &mut vidx, &types)?) } else { UItem::Later(SExpr::Lit(Value::Null)) } }
+                    else if let ast::Expr::Subquery(q) = e { let srcs_c = srcs.clone(); let sp = self.plan_sub(q, &srcs_c, false)?; let oc = sp.corr.map(|(_, oc)| oc); subs.push((Arc::new(sp), oc)); UItem::Sub(subs.len() - 1) }
+                    else { UItem::Later(SExpr::Lit(Value::Null)) };
+                if matches!(it, UItem::Later(_)) { pending.push((items.len(), e)); }
+                items.push(it); itexts.push(t);
+            }
+            visible = items.len();
+            // expressions over aggregates and keys: planned once every visible item has its place, so the aggregates
+            // they add come after the visible items; an item's own text is cleared while it is planned (no self reference)
+            for (i, e) in pending { itexts[i] = String::new(); let x = self.post_sexpr(e, &mut items, &mut itexts, &keys, &names, &srcs, &mut vidx, &types)?; items[i] = UItem::Later(x); itexts[i] = norm_sql(e); }
+        }
+        // an ORDER BY or HAVING item: a position, an output name, a select-list item, or a new hidden output
+        let mut order: Vec<(usize, bool)> = vec![];
+        let mut having = None;
+        if let Some(h) = &sel.having { having = Some(self.post_sexpr(h, &mut items, &mut itexts, &keys, &names, &srcs, &mut vidx, &types)?); }
+        if let Some(ob) = &q.order_by { if let OrderByKind::Expressions(v) = &ob.kind { for o in v {
+            let e = &o.expr; let t = norm_sql(e);
+            let idx = if let Some(n) = int_lit(e) { if n >= 1 && (n as usize) <= visible { n as usize - 1 } else { return Err(format!("ORDER BY {n}: no select-list item at that position")) } }
+                else if let Some(i) = match e { ast::Expr::Identifier(id) => names.iter().position(|x| x.eq_ignore_ascii_case(&id.value)), _ => None } { i }
+                else if let Some(i) = (if aggregating { &itexts } else { &texts }).iter().position(|x| !x.is_empty() && *x == t) { i }
+                else if !aggregating {
+                    if let Some((s, c)) = jcol(&srcs, e)? { let v = vidx(s, c); match proj.iter().position(|p| matches!(p, Proj::Col(x) if *x == v)) { Some(i) => i, None => { proj.push(Proj::Col(v)); proj.len() - 1 } } }
+                    else { if has_agg(e) { return Err(format!("ORDER BY {e}: an aggregate needs GROUP BY or an aggregate in the select list")); } let x = self.row_sexpr(e, &srcs, &mut vidx, &types)?; exprs.push(x); proj.push(Proj::Expr(exprs.len() - 1)); proj.len() - 1 }
+                } else { match self.post_sexpr(e, &mut items, &mut itexts, &keys, &names, &srcs, &mut vidx, &types)? { SExpr::Out(i) => i, x => { items.push(UItem::Later(x)); itexts.push(t); items.len() - 1 } } };
+            order.push((idx, format!("{}", o.options).to_uppercase().contains("DESC")));
+        } } }
+        let count = |e: &ast::Expr, what: &str| -> Result<usize, String> { match int_lit(e) { Some(n) if n >= 0 => Ok(n as usize), _ => Err(format!("{what} must be a number")) } };
+        let (limit, offset) = match &q.limit_clause { Some(LimitClause::LimitOffset { limit, offset, .. }) => (limit.as_ref().map(|e| count(e, "LIMIT")).transpose()?, offset.as_ref().map(|o| count(&o.value, "OFFSET")).transpose()?.unwrap_or(0)), _ => (None, 0) };
+        let distinct = matches!(sel.distinct, Some(ast::Distinct::Distinct));
+        if distinct && order.iter().any(|(i, _)| *i >= visible) { return Err("with SELECT DISTINCT, ORDER BY items must be in the select list".into()); }
+        // aggregation: the scan's own path takes one GROUP BY column and plain aggregates over columns; the rest is grouped in the post step
+        let mut grouping = None; let mut post_exprs: Vec<(usize, SExpr)> = vec![]; let mut generic = false;
+        let mut out_types: Vec<Option<ColType>> = vec![];
+        let col_type = |v: usize, types: &std::cell::RefCell<HashMap<usize, ColType>>| types.borrow().get(&v).cloned();
+        let mut group_by = None;
+        if aggregating {
+            let numeric = |a: &AggSpec| match (&a.f, &a.arg) { (GenFn::Min | GenFn::Max, AggArg::Col(v)) => matches!(col_type(*v, &types), Some(ColType::Int | ColType::Float | ColType::Timestamp)), _ => true };
+            let fast = keys.len() <= 1 && keys.iter().all(|k| k.col.is_some()) && items.iter().all(|it| match it { UItem::Agg(a) => !a.distinct && a.f != GenFn::Concat && matches!(a.arg, AggArg::Star | AggArg::Col(_)) && !(a.f != GenFn::Count && matches!(a.arg, AggArg::Star)) && numeric(a), _ => true });
+            generic = !fast;
+            // output types: keys and aggregates first, then the expressions over them
+            let agg_ty = |a: &AggSpec, types: &std::cell::RefCell<HashMap<usize, ColType>>| -> Option<ColType> {
+                let at = match &a.arg { AggArg::Star => None, AggArg::Col(v) => col_type(*v, types), AggArg::Expr(x) => x.ty(&|i| col_type(i, types)) };
+                match a.f { GenFn::Count => Some(ColType::Int), GenFn::Avg => Some(ColType::Float), GenFn::Concat => Some(ColType::Text(0)), GenFn::Sum => Some(if at == Some(ColType::Float) { ColType::Float } else { ColType::Int }), GenFn::Min | GenFn::Max => at }
+            };
+            out_types = items.iter().map(|it| match it { UItem::Key(k) => match &keys[*k] { GKey { col: Some(v), .. } => col_type(*v, &types), GKey { expr: Some(x), .. } => x.ty(&|i| col_type(i, &types)), _ => None }, UItem::Agg(a) => agg_ty(a, &types), _ => None }).collect();
+            for i in 0..items.len() { if let UItem::Later(x) = &items[i] { let t = x.ty(&|j| out_types.get(j).cloned().flatten()); out_types[i] = t; } }
+            for (i, it) in items.iter().enumerate() { if let UItem::Later(x) = it { post_exprs.push((i, x.clone())); } }
+            if fast {
+                group_by = keys.first().and_then(|k| k.col);
+                for it in &items { proj.push(match it {
+                    UItem::Key(k) => Proj::Col(keys[*k].col.unwrap()),
+                    UItem::Agg(a) => Proj::Agg(match (a.f, &a.arg) { (GenFn::Count, AggArg::Star) => Agg::CountStar, (GenFn::Count, AggArg::Col(c)) => Agg::CountCol(*c), (GenFn::Sum, AggArg::Col(c)) => Agg::Sum(*c), (GenFn::Avg, AggArg::Col(c)) => Agg::Avg(*c), (GenFn::Min, AggArg::Col(c)) => Agg::Min(*c), (GenFn::Max, AggArg::Col(c)) => Agg::Max(*c), _ => unreachable!() }),
+                    UItem::Later(_) => Proj::Later, UItem::Sub(i) => Proj::Sub(*i),
+                }); }
+            } else {
+                if items.iter().any(|it| matches!(it, UItem::Sub(_))) { return Err(unsup("a subquery in the select list next to several GROUP BY columns, an expression key, or an aggregate over an expression or DISTINCT values")); }
+                let mut raw: Vec<Proj> = vec![];
+                for k in &keys { raw.push(match (&k.col, &k.expr) { (Some(v), _) => Proj::Col(*v), (None, Some(x)) => { exprs.push(x.clone()); Proj::Expr(exprs.len() - 1) } _ => unreachable!() }); }
+                let mut outs = vec![];
+                for it in &items {
+                    outs.push(match it {
+                        UItem::Key(k) => GenOut::Key(*k),
+                        UItem::Agg(a) => { let arg = match &a.arg { AggArg::Star => None, AggArg::Col(c) => Some(match raw.iter().position(|r| matches!(r, Proj::Col(x) if x == c)) { Some(i) => i, None => { raw.push(Proj::Col(*c)); raw.len() - 1 } }), AggArg::Expr(x) => { exprs.push(x.clone()); raw.push(Proj::Expr(exprs.len() - 1)); Some(raw.len() - 1) } }; GenOut::Agg { f: a.f, arg, distinct: a.distinct, sep: a.sep.clone() } }
+                        UItem::Later(_) => GenOut::Null, UItem::Sub(_) => unreachable!(),
+                    });
+                }
+                grouping = Some(GenAgg { nkeys: keys.len(), outs });
+                proj = raw;
             }
         }
-        let group_by = match &sel.group_by { GroupByExpr::Expressions(v, _) if !v.is_empty() => { if v.len() > 1 { return Err("one GROUP BY column only".into()); } let (s, c) = jcol(&srcs, &v[0])?.ok_or("unknown GROUP BY column")?; Some(vidx(s, c)) }, _ => None };
-        // no "bare" columns: with an aggregate or a GROUP BY, every plain column must be the grouping column (SQLite picks an arbitrary row instead; E29)
-        if group_by.is_some() || proj.iter().any(|p| matches!(p, Proj::Agg(_))) { for p in &proj { if let Proj::Col(v) = p { if Some(*v) != group_by { return Err("every selected column must appear in GROUP BY or inside an aggregate".into()); } } } }
-        let mut order_by = None;
-        if let Some(ob) = &q.order_by { if let OrderByKind::Expressions(v) = &ob.kind { if let Some(o) = v.first() { let (s, c) = jcol(&srcs, &o.expr)?.ok_or("ORDER BY must name a column")?; let vi = vidx(s, c); let idx = proj.iter().position(|p| matches!(p, Proj::Col(x) if *x == vi)).ok_or("ORDER BY column must be selected")?; order_by = Some((idx, format!("{}", o.options).to_uppercase().contains("DESC"))); } } }
-        let limit = match &q.limit_clause { Some(LimitClause::LimitOffset { limit: Some(e), .. }) => match self.expr(e)? { Expr::Lit(Value::Int(n)) => Some(n as usize), _ => return Err("LIMIT must be a number".into()) }, _ => None };
+        // names and output types follow the items the user sees (in the general aggregation, `proj` holds its raw inputs)
+        let user_proj: Vec<Proj> = if aggregating { items.iter().map(|it| match it { UItem::Key(k) => keys[*k].col.map(Proj::Col).unwrap_or(Proj::Later), _ => Proj::Later }).collect() } else { proj.clone() };
+        let total = if aggregating { items.len() } else { proj.len() };
+        let hidden = total > visible;
+        let sorts = |i: usize| if aggregating { !generic && matches!(items[i], UItem::Key(_) | UItem::Agg(_)) } else { matches!(proj[i], Proj::Col(_)) };
+        let sink_sorts = order.len() == 1 && sorts(order[0].0);
+        let wait = generic || having.is_some() || distinct || order.len() > 1 || (order.len() == 1 && !sink_sorts);   // needs every row before ORDER BY and LIMIT
+        let post_needed = wait || offset > 0 || hidden || !post_exprs.is_empty();
+        let (order_by, limit_sink) = if !post_needed { (order.first().copied(), limit) } else if wait { (None, None) } else { (order.first().copied(), limit.map(|l| l + offset)) };
+        let mut post = if post_needed { Some(Post { grouping, exprs: post_exprs, having, distinct, order: order.clone(), offset, limit, visible, types: if aggregating { out_types[..visible].to_vec() } else { vec![] } }) } else { None };
+        let limit = limit_sink;
+        if post.is_some() && (corr_spec.is_some() || exists) { return Err(unsup("HAVING, DISTINCT, OFFSET, ORDER BY on several columns, or expressions over aggregates inside a correlated subquery")); }
         // a correlated subquery's output is shaped for its use: EXISTS -> the correlated column; one aggregate -> grouped by
         // the correlated column; one column -> that column plus the correlated column (key pairs)
         let mut group_by = group_by;
@@ -472,7 +1193,8 @@ impl<'a> Planner<'a> {
                 for &c in &step_cols[k] { schema.columns.push(Column { name: format!("{}.{}", srcs[bs].alias, bsch.columns[c].name), ty: bsch.columns[c].ty.clone(), nullable: bsch.columns[c].nullable, default: Value::Null, generated: None }); schema.offsets.push(off); off += bsch.columns[c].ty.width(); }
                 let mut build_preds = std::mem::take(&mut side_preds[bs]);
                 let build_access = access_path(&srcs[bs].table, &mut build_preds);
-                steps.push(JoinStep { build: srcs[bs].table.clone(), build_key: bcol, key_vidx: key_vidx[k], build_preds, build_cols: step_cols[k].clone(), base, vbase, build_access });
+                let outer = outer_of[bs]; let multi = bcol != srcs[bs].table.schema.pk;
+                steps.push(JoinStep { build: srcs[bs].table.clone(), build_key: bcol, key_vidx: key_vidx[k], build_preds, build_cols: step_cols[k].clone(), base, vbase, build_access, outer, multi });
                 vbase += step_cols[k].len();
             }
             schema.row_size = off; schema.unique = None; schema.name = srcs.iter().map(|s| s.alias.clone()).collect::<Vec<_>>().join("*");
@@ -480,24 +1202,34 @@ impl<'a> Planner<'a> {
             let probe_access = access_path(&srcs[probe].table, &mut probe_preds);
             // index nested loop when the first step's table is selective and the probe key is indexed
             let index_first = None; // decided adaptively at execution from the filtered build sizes
-            let join = JoinPlan { probe: srcs[probe].table.clone(), probe_access, probe_preds, steps, index_first };
+            let general = steps.iter().any(|st| st.outer || st.multi);
+            let join = JoinPlan { probe: srcs[probe].table.clone(), probe_access, probe_preds, steps, index_first, general };
             self.cur = saved_cur;
-            finish_names(&mut names, &proj, &schema); return Ok(Plan::Select(SelectPlan { table: srcs[probe].table.clone(), schema, access: Access::Scan, preds: vec![], proj, names, group_by, order: order_by, limit, join: Some(join), corr, subs }));
+            finish_names(&mut names, &user_proj, &schema); names.truncate(visible); if let Some(p) = post.as_mut() { if !aggregating { p.types = user_proj[..visible].iter().map(|pr| match pr { Proj::Expr(k) => exprs[*k].ty(&|v| schema.columns.get(v).map(|c| c.ty.clone())), pr => proj_type(pr, &schema) }).collect(); } }
+            return Ok(Plan::Select(SelectPlan { table: srcs[probe].table.clone(), schema, access: Access::Scan, preds: vec![], proj, names, group_by, order: order_by, limit, join: Some(join), corr, subs, post: post.map(Arc::new), exprs, filters }));
         }
         let mut preds = std::mem::take(&mut side_preds[0]);
         let access = access_path(&srcs[0].table, &mut preds);
         self.cur = saved_cur;
-        finish_names(&mut names, &proj, &schema);
-        Ok(Plan::Select(SelectPlan { table: srcs[0].table.clone(), schema, access, preds, proj, names, group_by, order: order_by, limit, join: None, corr, subs }))
+        finish_names(&mut names, &user_proj, &schema); names.truncate(visible); if let Some(p) = post.as_mut() { if !aggregating { p.types = user_proj[..visible].iter().map(|pr| match pr { Proj::Expr(k) => exprs[*k].ty(&|v| schema.columns.get(v).map(|c| c.ty.clone())), pr => proj_type(pr, &schema) }).collect(); } }
+        Ok(Plan::Select(SelectPlan { table: srcs[0].table.clone(), schema, access, preds, proj, names, group_by, order: order_by, limit, join: None, corr, subs, post: post.map(Arc::new), exprs, filters }))
     }
     fn plan_delete(&mut self, d: &ast::Delete) -> Result<Plan, String> {
-        let twj = match &d.from { ast::FromTable::WithFromKeyword(v) | ast::FromTable::WithoutKeyword(v) => v.first().ok_or("DELETE needs FROM")? };
+        if d.returning.is_some() { return Err(unsup("DELETE … RETURNING")); }
+        if d.limit.is_some() || !d.order_by.is_empty() { return Err(unsup("DELETE … ORDER BY / LIMIT")); }
+        if !d.tables.is_empty() || d.using.is_some() || d.output.is_some() { return Err(unsup("DELETE from several tables, USING or OUTPUT")); }
+        let twj = match &d.from { ast::FromTable::WithFromKeyword(v) | ast::FromTable::WithoutKeyword(v) => { if v.len() > 1 || v.first().map(|t| !t.joins.is_empty()).unwrap_or(false) { return Err(unsup("DELETE from several tables")); } v.first().ok_or("DELETE needs FROM")? } };
+        check_table(&twj.relation)?;
         let src = self.table_src(&twj.relation)?; let table = src.table.clone(); let srcs = vec![src];
-        let mut preds = vec![vec![]];
-        if let Some(w) = &d.selection { let mut cj = vec![]; conjuncts(w, &mut cj); for c in cj { self.classify(&srcs, c, &mut preds, &mut vec![])?; } }
+        let mut preds = vec![vec![]]; let mut filters = vec![];
+        let types: std::cell::RefCell<HashMap<usize, ColType>> = Default::default();
+        if let Some(w) = &d.selection { let mut cj = vec![]; conjuncts(w, &mut cj); for c in cj {
+            let mut p2 = preds.clone();
+            match self.classify(&srcs, c, &mut p2, &mut vec![]) { Ok(()) => preds = p2, Err(e1) => match self.row_sexpr(c, &srcs, &mut |_, c| c, &types) { Ok(x) => filters.push(x), Err(e2) => return Err(if e1.contains("correlat") || e1.contains("outer") { e1 } else { e2 }) } }
+        } }
         let mut preds = preds.pop().unwrap();
         let access = access_path(&table, &mut preds);
-        Ok(Plan::Delete { table, access, preds })
+        Ok(Plan::Delete { table, access, preds, filters })
     }
 }
 /// Pick the single-table access path and remove the predicates it absorbs.
@@ -508,7 +1240,7 @@ fn access_path(table: &Arc<Table>, preds: &mut Vec<Pred>) -> Access {
     if let Some((i, ix)) = preds.iter().enumerate().find_map(|(i, p)| if p.cmp == Cmp::Eq { table.index_on(p.col).map(|ix| (i, ix)) } else { None }) { return Access::Index(ix, preds.remove(i).rhs); }
     let lo = preds.iter().position(|p| p.col == schema.pk && matches!(p.cmp, Cmp::Ge | Cmp::Gt));
     let hi = preds.iter().position(|p| p.col == schema.pk && matches!(p.cmp, Cmp::Le | Cmp::Lt));
-    if let (Some(a), Some(b), false) = (lo, hi, schema.key_is_uuid()) {
+    if let (Some(a), Some(b), false) = (lo, hi, schema.key16) {
         let (pa, pb) = (preds[a].clone(), preds[b].clone());
         let mut rm = vec![a, b]; rm.sort_unstable(); for i in rm.into_iter().rev() { preds.remove(i); }
         return Access::Range { lo: pa.rhs, lo_excl: pa.cmp == Cmp::Gt, hi: pb.rhs, hi_excl: pb.cmp == Cmp::Lt };
@@ -518,7 +1250,8 @@ fn access_path(table: &Arc<Table>, preds: &mut Vec<Pred>) -> Access {
 
 // ---------- execution ----------
 
-#[derive(Clone, Copy, Default)] struct AggState { n: u64, sum_f: f64, sum_i: i64, min: f64, max: f64, seen: bool }
+/// One aggregate's running state in the scan's aggregator. `best`: min or max so far, an integer or a double's bits.
+#[derive(Clone, Copy, Default)] struct AggState { n: u64, sum_f: f64, sum_i: i64, best: i64 }
 /// A set of integer keys: bitmap when the range is reasonable, hash map otherwise.
 pub enum KeySet { Bits { min: i64, max: i64, bits: Vec<u64> }, Hash(FastMap<()>), Wide(crate::util::WideSet), Empty }
 impl KeySet {
@@ -548,7 +1281,8 @@ impl CPred {
             Cmp::In | Cmp::NotIn => {
                 if null { return false; }
                 let set = self.set.as_ref().unwrap();
-                let hit = if self.kind == 4 { set.contains_wide(key_from_uuid(&row[self.off..self.off + 16])) } else {
+                let hit = if self.kind == 4 { set.contains_wide(key_from_uuid(&row[self.off..self.off + 16])) }
+                    else if self.kind == 6 { let n = u16::from_le_bytes([row[self.off], row[self.off + 1]]) as usize; set.contains_wide(crate::table::text_key(&row[self.off + 2..self.off + 2 + n])) } else {
                     let mut k = read_i64(row, self.off);
                     if let Some((po, pnb, pnm)) = self.pair { if row[pnb] & pnm != 0 { return false; } k = mix_pair(k, read_i64(row, po)); }
                     set.contains(k)
@@ -603,7 +1337,7 @@ impl<'a> SubVal<'a> {
 /// Order of decoded values of one column type (group keys, sorted results); NULL first.
 fn value_order(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
-    match (a, b) { (Value::Null, Value::Null) => Equal, (Value::Null, _) => Less, (_, Value::Null) => Greater, (Value::Int(x), Value::Int(y)) => x.cmp(y), (Value::Float(x), Value::Float(y)) => x.total_cmp(y), (Value::Bool(x), Value::Bool(y)) => x.cmp(y), (Value::Text(x), Value::Text(y)) => x.cmp(y), (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y), _ => Equal }
+    match (a, b) { (Value::Null, Value::Null) => Equal, (Value::Null, _) => Less, (_, Value::Null) => Greater, (Value::Int(x), Value::Int(y)) => x.cmp(y), (Value::Float(x), Value::Float(y)) => x.total_cmp(y), (Value::Int(x), Value::Float(y)) => (*x as f64).total_cmp(y), (Value::Float(x), Value::Int(y)) => x.total_cmp(&(*y as f64)), (Value::Bool(x), Value::Bool(y)) => x.cmp(y), (Value::Text(x), Value::Text(y)) => x.cmp(y), (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y), _ => Equal }
 }
 /// The bytes that identify a non-integer GROUP BY value (text by its content, not its padded cell; -0.0 as 0.0).
 #[inline] fn group_key_into(schema: &Schema, row: &[u8], c: usize, buf: &mut Vec<u8>) {
@@ -620,14 +1354,32 @@ struct Sink<'a> { schema: &'a Schema, proj: &'a [Proj], subs: Vec<SubVal<'a>>, a
     /// ORDER BY: the column, its offset, 0 INT/TIMESTAMP, 1 DOUBLE, 2 BOOL, 3 bytes (TEXT, BYTES, UUID: `topk_b`, NULL as None)
     sort_col: usize, sort_off: usize, sort_kind: u8, topk_b: Vec<(Option<Vec<u8>>, Vec<Value>)>,
     /// GROUP BY a column that is not INT/TIMESTAMP: groups keyed by the value's bytes, `bvals[i]` is group i's value
-    wide_group: bool, bgroups: HashMap<Box<[u8]>, u32>, bvals: Vec<Value>, kbuf: Vec<u8> }
+    wide_group: bool, bgroups: HashMap<Box<[u8]>, u32>, bvals: Vec<Value>, kbuf: Vec<u8>,
+    /// row expressions (`Proj::Expr`) and residual WHERE conditions, bound to this execution; the first error stops the scan
+    exprs: Vec<SExpr>, filters: Vec<SExpr>, pub err: Option<String> }
 impl<'a> Sink<'a> {
-    fn new(schema: &'a Schema, proj: &'a [Proj], group_by: Option<usize>, order: Option<(usize, bool)>, limit: Option<usize>, subs: Vec<SubVal<'a>>) -> Sink<'a> {
+    fn new(schema: &'a Schema, proj: &'a [Proj], group_by: Option<usize>, order: Option<(usize, bool)>, limit: Option<usize>, subs: Vec<SubVal<'a>>, exprs: Vec<SExpr>, filters: Vec<SExpr>) -> Sink<'a> {
         let aggs: Vec<&Agg> = proj.iter().filter_map(|p| if let Proj::Agg(a) = p { Some(a) } else { None }).collect();
         let sort_col = match order.map(|(oi, _)| &proj[oi]) { Some(Proj::Col(c)) => *c, _ => 0 };
         Sink { schema, proj, subs, has_agg: !aggs.is_empty(), single: vec![AggState::default(); aggs.len()], aggs, group_by, group_off: group_by.filter(|&g| matches!(schema.columns[g].ty, ColType::Int | ColType::Timestamp)).map(|g| schema.offsets[g]), order, limit: limit.unwrap_or(usize::MAX), groups: FastMap::default(), gstates: vec![], dense: vec![], dense_seen: vec![], null_group: None, topk: vec![], out: vec![],
             wide_group: group_by.is_some_and(|g| !matches!(schema.columns[g].ty, ColType::Int | ColType::Timestamp)), bgroups: HashMap::new(), bvals: vec![], kbuf: vec![],
-            sort_col, sort_off: schema.offsets.get(sort_col).copied().unwrap_or(0), sort_kind: match schema.columns.get(sort_col).map(|c| &c.ty) { Some(ColType::Float) => 1, Some(ColType::Bool) => 2, Some(ColType::Text(_) | ColType::Bytes(_) | ColType::Uuid) => 3, _ => 0 }, topk_b: vec![] }
+            sort_col, sort_off: schema.offsets.get(sort_col).copied().unwrap_or(0), sort_kind: match schema.columns.get(sort_col).map(|c| &c.ty) { Some(ColType::Float) => 1, Some(ColType::Bool) => 2, Some(ColType::Text(_) | ColType::Bytes(_) | ColType::Uuid) => 3, _ => 0 }, topk_b: vec![], exprs, filters, err: None }
+    }
+    /// The output values of one row.
+    #[inline] fn project(&mut self, row: &[u8]) -> Vec<Value> {
+        let schema = self.schema; let mut err = None;
+        let vals = self.proj.iter().map(|p| match p {
+            Proj::Col(c) => decode_col(schema, row, *c), Proj::Agg(_) | Proj::Later => Value::Null, Proj::Sub(i) => self.subs[*i].get(row),
+            Proj::Expr(i) => match self.exprs[*i].eval(&|c| decode_col(schema, row, c)) { Ok(v) => v, Err(e) => { err.get_or_insert(e); Value::Null } },
+        }).collect();
+        if let Some(e) = err { self.err.get_or_insert(e); }
+        vals
+    }
+    /// The residual WHERE conditions for one row: all must be true (NULL is not).
+    #[inline(never)] fn pass(&mut self, row: &[u8]) -> Option<bool> {
+        let schema = self.schema;
+        for f in &self.filters { match f.eval(&|c| decode_col(schema, row, c)).and_then(|v| crate::expr::truth(&v)) { Ok(Some(true)) => {} Ok(_) => return Some(false), Err(e) => { self.err.get_or_insert(e); return None; } } }
+        Some(true)
     }
     /// The group index for a row grouped by a column that is not INT/TIMESTAMP (kept out of line: the integer path is hot).
     #[inline(never)] fn wide_index(&mut self, row: &[u8], n: usize) -> usize {
@@ -643,7 +1395,7 @@ impl<'a> Sink<'a> {
         let key: Option<&[u8]> = if is_null(row, c) { None } else if self.sort_kind == 3 && self.schema.columns[c].ty == ColType::Uuid { Some(&row[off..off + 16]) } else { Some(read_bytes(row, off)) };
         let ord = |a: Option<&[u8]>, b: Option<&[u8]>| { let o = a.cmp(&b); if desc { o.reverse() } else { o } };
         if self.topk_b.len() >= self.limit && ord(key, self.topk_b[self.limit - 1].0.as_deref()) != std::cmp::Ordering::Less { return; }
-        let vals: Vec<Value> = self.proj.iter().map(|p| match p { Proj::Col(c) => decode_col(self.schema, row, *c), Proj::Agg(_) => Value::Null, Proj::Sub(i) => self.subs[*i].get(row) }).collect();
+        let vals = self.project(row);
         let pos = self.topk_b.partition_point(|x| ord(x.0.as_deref(), key) != std::cmp::Ordering::Greater); self.topk_b.insert(pos, (key.map(|k| k.to_vec()), vals));
         if self.topk_b.len() > self.limit { self.topk_b.pop(); }
     }
@@ -664,14 +1416,23 @@ impl<'a> Sink<'a> {
                 if is_null(row, self.group_by.unwrap()) { self.null_group.get_or_insert_with(|| vec![AggState::default(); n]) }
                 else { let i = self.wide_index(row, n); &mut self.gstates[i * n..(i + 1) * n] }
             } else { &mut self.single };
+            let mut ovf = false;
             for (k, a) in self.aggs.iter().enumerate() {
                 let st = &mut st[k];
-                match a { Agg::CountStar => st.n += 1, Agg::CountCol(c) => if !is_null(row, *c) { st.n += 1 }, Agg::Sum(c) | Agg::Avg(c) | Agg::Min(c) | Agg::Max(c) => {
-                    if is_null(row, *c) { continue; }
-                    let off = self.schema.offsets[*c];
-                    let (fi, ff) = match self.schema.columns[*c].ty { ColType::Int | ColType::Timestamp => { let i = read_i64(row, off); (i, i as f64) }, ColType::Float => { let f = read_f64(row, off); (0, f) }, _ => (0, 0.0) };
-                    st.n += 1; st.sum_i += fi; st.sum_f += ff; if !st.seen || ff < st.min { st.min = ff; } if !st.seen || ff > st.max { st.max = ff; } st.seen = true; } }
+                // the planner sends only numbers here (and booleans to sum and avg); other types take the general aggregator.
+                // Each aggregate does its own work only: sum keeps an exact integer, avg a double, min and max one value.
+                match a { Agg::CountStar => st.n += 1, Agg::CountCol(c) => if !is_null(row, *c) { st.n += 1 },
+                    Agg::Sum(c) => { if is_null(row, *c) { continue; } let off = self.schema.offsets[*c]; st.n += 1; match self.schema.columns[*c].ty {
+                        ColType::Float => st.sum_f += read_f64(row, off),
+                        ColType::Bool => st.sum_i += (row[off] != 0) as i64,
+                        _ => { let (t, o) = st.sum_i.overflowing_add(read_i64(row, off)); st.sum_i = t; ovf |= o; } } }
+                    Agg::Avg(c) => { if is_null(row, *c) { continue; } let off = self.schema.offsets[*c]; st.n += 1; st.sum_f += match self.schema.columns[*c].ty { ColType::Float => read_f64(row, off), ColType::Bool => (row[off] != 0) as i64 as f64, _ => read_i64(row, off) as f64 }; }
+                    Agg::Min(c) | Agg::Max(c) => { if is_null(row, *c) { continue; } let off = self.schema.offsets[*c]; let max = matches!(a, Agg::Max(_));
+                        if self.schema.columns[*c].ty == ColType::Float { let f = read_f64(row, off); if st.n == 0 || (if max { f > f64::from_bits(st.best as u64) } else { f < f64::from_bits(st.best as u64) }) { st.best = f.to_bits() as i64; } }
+                        else { let i = read_i64(row, off); if st.n == 0 || (if max { i > st.best } else { i < st.best }) { st.best = i; } }
+                        st.n += 1; } }
             }
+            if ovf { self.err.get_or_insert(SUM_OVERFLOW.to_string()); return false; }
             return true;
         }
         if let Some((_, desc)) = self.order {
@@ -679,17 +1440,17 @@ impl<'a> Sink<'a> {
             if self.sort_kind == 3 { self.push_sorted_bytes(row, desc); return true; }
             let key = num_sort_key(self.sort_kind, row, self.sort_off, is_null(row, self.sort_col), desc);
             if self.topk.len() >= self.limit && key >= self.topk[self.limit - 1].0 { return true; }
-            let vals: Vec<Value> = self.proj.iter().map(|p| match p { Proj::Col(c) => decode_col(self.schema, row, *c), Proj::Agg(_) => Value::Null, Proj::Sub(i) => self.subs[*i].get(row) }).collect();
+            let vals = self.project(row);
             let pos = self.topk.partition_point(|x| x.0 <= key); self.topk.insert(pos, (key, vals));
             if self.topk.len() > self.limit { self.topk.pop(); }
             return true;
         }
-        let vals: Vec<Value> = self.proj.iter().map(|p| match p { Proj::Col(c) => decode_col(self.schema, row, *c), Proj::Agg(_) => Value::Null, Proj::Sub(i) => self.subs[*i].get(row) }).collect();
+        let vals = self.project(row);
         self.out.push(vals);
-        self.out.len() < self.limit
+        self.err.is_none() && self.out.len() < self.limit
     }
     /// Only count(*) aggregates, so a row count can be pushed without the rows.
-    fn count_only(&self) -> bool { self.has_agg && self.aggs.iter().all(|a| matches!(a, Agg::CountStar)) }
+    fn count_only(&self) -> bool { self.has_agg && self.filters.is_empty() && self.aggs.iter().all(|a| matches!(a, Agg::CountStar)) }
     fn group_at_or_after(&self, min_col: usize) -> bool { self.group_by.map(|g| g >= min_col).unwrap_or(true) }
     #[inline] fn push_count(&mut self, row: &[u8], n: u64) -> bool {
         let na = self.aggs.len();
@@ -710,13 +1471,12 @@ impl<'a> Sink<'a> {
                 let mut k = 0;
                 proj.iter().map(|p| match p {
                     Proj::Col(c) => if Some(*c) == group_by { key.clone().unwrap_or(Value::Null) } else { Value::Null },
-                    Proj::Sub(_) => Value::Null,
+                    Proj::Sub(_) | Proj::Expr(_) | Proj::Later => Value::Null,
                     Proj::Agg(a) => { let x = st[k]; k += 1; match a {
                         Agg::CountStar | Agg::CountCol(_) => Value::Int(x.n as i64),
-                        Agg::Sum(c) => if x.n == 0 { Value::Null } else if matches!(schema.columns[*c].ty, ColType::Int | ColType::Timestamp) { Value::Int(x.sum_i) } else { Value::Float(x.sum_f) },
+                        Agg::Sum(c) => if x.n == 0 { Value::Null } else if schema.columns[*c].ty == ColType::Float { Value::Float(x.sum_f) } else { Value::Int(x.sum_i) },
                         Agg::Avg(_) => if x.n == 0 { Value::Null } else { Value::Float(x.sum_f / x.n as f64) },
-                        Agg::Min(c) => if x.n == 0 { Value::Null } else if matches!(schema.columns[*c].ty, ColType::Int | ColType::Timestamp) { Value::Int(x.min as i64) } else { Value::Float(x.min) },
-                        Agg::Max(c) => if x.n == 0 { Value::Null } else if matches!(schema.columns[*c].ty, ColType::Int | ColType::Timestamp) { Value::Int(x.max as i64) } else { Value::Float(x.max) } } }
+                        Agg::Min(c) | Agg::Max(c) => if x.n == 0 { Value::Null } else if schema.columns[*c].ty == ColType::Float { Value::Float(f64::from_bits(x.best as u64)) } else { Value::Int(x.best) } } }
                 }).collect()
             };
             if self.wide_group {
@@ -801,7 +1561,7 @@ impl Feed {
     }
     fn decode_owned(&self, seq: u64, t: &Arc<Table>, op: u8, payload: &[u8], out: &mut Vec<Change>) {
         match op {
-            OP_DELETE => { let pk = t.schema.key_value(if payload.len() == t.schema.key_width() { t.schema.key_from_bytes(payload) } else { t.pk_of(payload) }); let row = if payload.len() == t.schema.row_size { Some((0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect()) } else { None }; out.push(Change { seq, table: t.schema.name.clone(), op: ChangeOp::Delete, pk, row }); }
+            OP_DELETE => { let pk = t.schema.delete_pk_value(payload); let row = if payload.len() == t.schema.row_size { Some((0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect()) } else { None }; out.push(Change { seq, table: t.schema.name.clone(), op: ChangeOp::Delete, pk, row }); }
             OP_INSERT | OP_UPDATE => { if payload.len() != t.schema.row_size { return; } let row: Vec<Value> = (0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect(); out.push(Change { seq, table: t.schema.name.clone(), op: if op == OP_INSERT { ChangeOp::Insert } else { ChangeOp::Update }, pk: t.schema.key_value(t.pk_of(payload)), row: Some(row) }); }
             _ => {}
         }
@@ -916,6 +1676,7 @@ impl Sql {
         crate::table::write_meta_if_missing(dir).map_err(|e| format!("{}: cannot write {}: {e}", dir.display(), crate::table::META_FILE))?;
         let mut sql = Sql::new(db.clone()); sql.cfg = cfg.clone();
         db.recover(cfg.recover_threads, &mut |text| sql.apply_meta(text))?;
+        db.log.st.lock().unwrap().sync_delay = cfg.log.sync_delay;
         match cfg.log.threads_idle_after { Some(d) => db.start_idle(d), None => db.start() }
         let sql = Arc::new(sql);
         for (name, _) in sql.db.tables_with_shadow() { sql.resume_copy(name); }   // resume an interrupted ALTER
@@ -953,7 +1714,7 @@ impl Sql {
         let sv = self.services.lock().unwrap().take();
         if let Some(mut sv) = sv {
             sv.listeners.clear();
-            if let Some((stop, h)) = sv.snapshotter.take() { stop.store(true, std::sync::atomic::Ordering::Relaxed); if h.thread().id() != std::thread::current().id() { h.join().ok(); } }
+            if let Some((stop, h)) = sv.snapshotter.take() { stop.store(true, std::sync::atomic::Ordering::Relaxed); h.thread().unpark(); if h.thread().id() != std::thread::current().id() { h.join().ok(); } }
             self.db.log.set_cloud_wait(false, None);
             sv.uploader.take(); sv.puller.take(); sv.follower.take();
         }
@@ -972,16 +1733,11 @@ impl Sql {
     /// Output columns of a prepared statement: (name, type when known). Empty for statements that return no rows.
     pub fn columns(&self, p: &Prepared) -> Vec<(String, Option<ColType>)> {
         match &p.plan {
+            Plan::Select(s) if s.post.is_some() => s.post.as_ref().unwrap().types.iter().enumerate().map(|(i, t)| (s.names.get(i).cloned().unwrap_or_else(|| format!("col{i}")), t.clone())).collect(),
+            Plan::Const { exprs, names } => names.iter().cloned().zip(exprs.iter().map(|x| x.ty(&|_| None))).collect(),
             Plan::Select(s) => s.proj.iter().enumerate().map(|(i, pr)| {
                 let name = s.names.get(i).cloned().unwrap_or_else(|| format!("col{i}"));
-                let ty = match pr {
-                    Proj::Col(v) => s.schema.columns.get(*v).map(|c| c.ty.clone()),
-                    Proj::Agg(Agg::Min(c)) | Proj::Agg(Agg::Max(c)) => s.schema.columns.get(*c).map(|c| c.ty.clone()),
-                    Proj::Agg(Agg::Sum(c)) => s.schema.columns.get(*c).map(|c| if c.ty == ColType::Float { ColType::Float } else { ColType::Int }),
-                    Proj::Agg(Agg::CountStar) | Proj::Agg(Agg::CountCol(_)) => Some(ColType::Int),
-                    Proj::Agg(Agg::Avg(_)) => Some(ColType::Float),
-                    Proj::Sub(_) => None,
-                };
+                let ty = match pr { Proj::Expr(k) => s.exprs[*k].ty(&|v| s.schema.columns.get(v).map(|c| c.ty.clone())), pr => proj_type(pr, &s.schema) };
                 (name, ty)
             }).collect(),
             Plan::Delete { .. } => vec![("changes".to_string(), Some(ColType::Int))],
@@ -1037,9 +1793,9 @@ impl Sql {
         let u = text.trim().to_uppercase();
         if u.starts_with("ALTER TABLE ") && (u.ends_with(" DONE") || u.ends_with(" ABORT")) { let name = text.trim().split_whitespace().nth(2).unwrap_or(""); return if u.ends_with(" DONE") { self.db.alter_finish(name).map(|old| old.clear()) } else { self.db.alter_abort(name) }; }
         let stmts = Parser::parse_sql(&GenericDialect {}, text).map_err(|e| e.to_string())?;
-        let mut pl = Planner { db: &self.db, nparams: 0, outer: vec![], cur: vec![], corr: None, exists_mode: false };
+        let mut pl = Planner { db: &self.db, nparams: 0, outer: vec![], cur: vec![], corr: None, exists_mode: false, params_at: vec![] };
         match pl.plan(&stmts[0])? {
-            Plan::CreateTable(s) => { self.db.create_table(s)?; Ok(()) }
+            Plan::CreateTable(s, _) => { self.db.create_table(s)?; Ok(()) }
             Plan::Alter { table, ops } => { let old = self.db.table(&table).ok_or(format!("no such table {table}"))?; let (schema, convert) = Self::alter_schema(&old.schema, &ops)?; self.db.alter_start(&table, schema, convert)?; Ok(()) }  // the copy resumes in open_arc
             _ => Err(format!("not a catalog statement: {text}")) }
     }
@@ -1153,10 +1909,11 @@ impl Sql {
         if let Some(p) = self.cache.lock().unwrap().get(sql) { return Ok(p.clone()); }
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| e.to_string())?;
         if stmts.len() != 1 { return Err("one statement at a time".into()); }
-        let mut pl = Planner { db: &self.db, nparams: 0, outer: vec![], cur: vec![], corr: None, exists_mode: false };
+        let params_at = placeholder_positions(sql);
+        let mut pl = Planner { db: &self.db, nparams: params_at.len(), outer: vec![], cur: vec![], corr: None, exists_mode: false, params_at };
         let plan = pl.plan(&stmts[0])?;
         let p = Arc::new(Prepared { plan, nparams: pl.nparams, text: sql.to_string(), epoch: self.epoch.load(std::sync::atomic::Ordering::Acquire) });
-        if !matches!(p.plan, Plan::CreateTable(_) | Plan::Begin | Plan::Commit | Plan::Rollback | Plan::Alter { .. }) { self.cache.lock().unwrap().insert(sql.to_string(), p.clone()); }
+        if !matches!(p.plan, Plan::CreateTable(..) | Plan::Begin | Plan::Commit | Plan::Rollback | Plan::Alter { .. }) { self.cache.lock().unwrap().insert(sql.to_string(), p.clone()); }
         Ok(p)
     }
     pub fn exec(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { let p = self.prepare(sql)?; self.execute(&p, params) }
@@ -1185,16 +1942,18 @@ impl Sql {
         } }
         if matches!(p.cmp, Cmp::IsNull | Cmp::IsNotNull) { return Ok(base); }
         if matches!(p.cmp, Cmp::In | Cmp::NotIn) {
-            if c.ty == ColType::Uuid {
+            if matches!(c.ty, ColType::Uuid | ColType::Text(_) | ColType::Bytes(_)) {
+                let what = if c.ty == ColType::Uuid { "a UUID" } else { "a value of this type" };
                 let keys: Vec<Key> = match &p.rhs {
-                    Expr::List(items) => { let mut ks = Vec::with_capacity(items.len()); for e in items { match self.resolve(sess, e, params)? { Value::Null => {}, v => ks.push(uuid_key(&v).ok_or_else(|| format!("column {}: not a UUID: {v:?}", c.name))?) } } ks }
+                    Expr::List(items) => { let mut ks = Vec::with_capacity(items.len()); for e in items { match self.resolve(sess, e, params)? { Value::Null => {}, v => ks.push(crate::table::value_key128(&c.ty, &v).ok_or_else(|| format!("column {} ({}): not {what}: {v:?}", c.name, c.ty.name()))?) } } ks }
                     Expr::Set(sp) => {
-                        if sp.corr.is_some() && sp.proj.len() != 1 { return Err(format!("column {}: a correlated IN on a UUID column is not supported yet; use EXISTS or a JOIN", c.name)); }
-                        self.run_select(sess, sp, params)?.iter().filter_map(|r| r.first().and_then(uuid_key)).collect()
+                        if sp.corr.is_some() && sp.proj.len() != 1 { return Err(format!("column {}: a correlated IN on a {} column is not supported yet; use EXISTS or a JOIN", c.name, c.ty.name())); }
+                        if sp.corr.is_some() && c.ty != ColType::Uuid { return Err(unsup(format!("a correlated subquery on a {} column", c.ty.name()))); }
+                        self.run_select(sess, sp, params)?.iter().filter_map(|r| r.first().and_then(|v| crate::table::value_key128(&c.ty, v))).collect()
                     }
                     _ => return Err("IN needs a list or a subquery".into()),
                 };
-                return Ok(CPred { kind: 4, set: Some(Arc::new(KeySet::build_wide(&keys))), ..base });
+                return Ok(CPred { kind: if c.ty == ColType::Uuid { 4 } else { 6 }, set: Some(Arc::new(KeySet::build_wide(&keys))), ..base });
             }
             if !matches!(c.ty, ColType::Int | ColType::Timestamp) { return Err(format!("column {}: IN is supported on INT columns (for now)", c.name)); }
             let mut pair = None;
@@ -1209,8 +1968,13 @@ impl Sql {
             };
             return Ok(CPred { set: Some(Arc::new(KeySet::build(&keys))), pair, ..base });
         }
-        let v = self.resolve(sess, &p.rhs, params)?;
+        let mut v = self.resolve(sess, &p.rhs, params)?;
         if v == Value::Null { return Ok(CPred { kind: 9, ..base }); } // comparison with NULL is never true
+        // an INT or TIMESTAMP column against a number with a fraction (an average, say): the same rows as an integer bound
+        if let (ColType::Int | ColType::Timestamp, Value::Float(f)) = (&c.ty, &v) { if f.is_finite() && f.abs() < 9.0e18 {
+            if f.fract() == 0.0 { v = Value::Int(*f as i64); }
+            else { return Ok(match p.cmp { Cmp::Gt | Cmp::Le => CPred { i: f.floor() as i64, ..base }, Cmp::Ge | Cmp::Lt => CPred { i: f.ceil() as i64, ..base }, Cmp::Eq => CPred { kind: 9, ..base }, _ => CPred { cmp: Cmp::IsNotNull, ..base } }); }
+        } }
         Ok(match &c.ty {
             ColType::Int => CPred { kind: 0, i: v.as_i64().map_err(|e| format!("column {}: {e}", c.name))?, ..base },
             ColType::Timestamp => CPred { kind: 0, i: match &v { Value::Text(s) => crate::table::parse_timestamp(s).ok_or_else(|| format!("column {}: not a timestamp {s:?}", c.name))?, other => other.as_i64().map_err(|e| format!("column {}: {e}", c.name))? }, ..base },
@@ -1232,46 +1996,94 @@ impl Sql {
         if p.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire) { let p2 = self.prepare(&p.text)?; return self.execute_s(sess, &p2, params); }  // a schema change swapped the table under this plan
         match &p.plan {
             Plan::Alter { table, ops } => { if sess.user.is_some() { return Err("permission denied: only the application session can alter tables".into()); } self.alter(&p.text, table, ops, true)?; Ok(vec![]) }
-            Plan::CreateTable(s) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
+            Plan::CreateTable(s, if_not_exists) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } if *if_not_exists && self.db.table(&s.name).is_some() { return Ok(vec![]); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
+            Plan::Const { exprs, .. } => { let xs = self.bind(sess, exprs, params)?; Ok(vec![xs.iter().map(|x| x.eval(&|_| Value::Null)).collect::<Result<Vec<_>, _>>()?]) }
             Plan::Begin => { if sess.txn.is_some() { return Err("already in a transaction".into()); } sess.txn = Some(Txn::new()); Ok(vec![]) }
             Plan::Rollback => { sess.txn = None; Ok(vec![]) }
             Plan::Commit => { let t = sess.txn.take().ok_or("not in a transaction")?; sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; Ok(vec![]) }
-            Plan::Insert { table, rows, returning } => {
+            Plan::Insert { table, rows, returning, from, conflict } => {
                 let policy = self.guard(sess, table, P_INSERT)?;
-                let schema = &table.schema; let mut encoded = Vec::with_capacity(rows.len()); let mut last_id = 0; let mut last_key = None;
-                for exprs in rows {
-                    let mut vals = Vec::with_capacity(exprs.len());
-                    for e in exprs { vals.push(match e { Expr::AutoId => Value::Int(table.alloc_id()), Expr::Gen(g) => crate::table::gen_value(g), e => self.resolve(sess, e, params)? }); }
+                let schema = &table.schema; let mut encoded = Vec::with_capacity(rows.len()); let mut last_id = 0; let mut last_key: Option<Value> = None;
+                // the values of every row to insert: from VALUES, or from the SELECT's rows plus the other columns' fill
+                let plain = from.is_none() && matches!(conflict, Conflict::None);
+                if plain {   // INSERT … VALUES: the hot path, one loop
+                    for exprs in rows {
+                        let mut vals = Vec::with_capacity(exprs.len());
+                        for e in exprs { vals.push(match e { Expr::AutoId => Value::Int(table.alloc_id()), Expr::Gen(g) => crate::table::gen_value(g), e => self.resolve(sess, e, params)? }); }
+                        if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
+                        let row = encode_row(schema, &vals)?;
+                        for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
+                        last_key = Some(decode_col(schema, &row, schema.pk));
+                        encoded.push(row);
+                    }
+                }
+                let mut all: Vec<Vec<Value>> = Vec::new();
+                let fill_value = |e: &Expr| -> Result<Value, String> { Ok(match e { Expr::AutoId => Value::Int(table.alloc_id()), Expr::Gen(g) => crate::table::gen_value(g), e => self.resolve(sess, e, params)? }) };
+                if !plain { for exprs in rows { all.push(exprs.iter().map(|e| fill_value(e)).collect::<Result<Vec<_>, _>>()?); } }
+                if let Some(f) = from {
+                    let src = match &*f.plan {
+                        Plan::Select(sp) => { if let Some(t) = &sess.txn { if let Some(n) = written_and_read(t, sp) { return Err(own_writes(&n)); } } self.run_select(sess, sp, params)? }
+                        Plan::Const { exprs, .. } => { let xs = self.bind(sess, exprs, params)?; vec![xs.iter().map(|x| x.eval(&|_| Value::Null)).collect::<Result<Vec<_>, _>>()?] }
+                        _ => unreachable!(),
+                    };
+                    for r in src {
+                        let mut vals = Vec::with_capacity(f.fill.len());
+                        for (i, e) in f.fill.iter().enumerate() { vals.push(match e { Some(e) => fill_value(e)?, None => r[f.targets.iter().position(|&t| t == i).unwrap()].clone() }); }
+                        // a NULL key from the SELECT takes the automatic id, as in VALUES
+                        if vals[schema.pk] == Value::Null && schema.auto { vals[schema.pk] = Value::Int(table.alloc_id()); }
+                        all.push(vals);
+                    }
+                }
+                for vals in all.iter().filter(|_| !plain) {
                     if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
-                    let row = encode_row(schema, &vals)?;
+                    let row = encode_row(schema, vals)?;
                     for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
-                    last_key = Some(schema.key_of(&row));
+                    last_key = Some(decode_col(schema, &row, schema.pk));
                     encoded.push(row);
+                }
+                if !matches!(conflict, Conflict::None) {
+                    let out = self.upsert(sess, table, conflict, &all, &encoded, params)?;
+                    sess.last_insert_id = last_id; if let Some(k) = last_key { sess.last_insert_key = Some(k); }
+                    return Ok(match returning { None => vec![], Some(cols) => out.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() });
                 }
                 match &mut sess.txn {
                     Some(t) => { for row in &encoded { table.txn_insert(t, row).map_err(|a| a.to_string())?; } }
                     None if encoded.len() == 1 => { sess.last_seq = table.insert(&encoded[0]).map_err(|a| a.to_string())?; }
                     None => { let mut t = Txn::new(); for row in &encoded { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; }   // several rows: all or none
                 }
-                sess.last_insert_id = last_id; if let Some(k) = last_key { sess.last_insert_key = Some(schema.key_value(k)); }
+                sess.last_insert_id = last_id; if let Some(k) = last_key { sess.last_insert_key = Some(k); }
                 Ok(match returning { None => vec![], Some(cols) => encoded.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() })
             }
             Plan::Update { table, sets, pk } => {
+                if let Some(t) = &sess.txn { let mut read = vec![]; for (_, v) in sets { match v { SetVal::Value(e) => expr_tables(e, &mut read), SetVal::Row(x) => sexpr_tables(x, &mut read) } } expr_tables(pk, &mut read); if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); } }
                 let policy = self.guard(sess, table, P_UPDATE)?;
                 let pk = table.schema.key_from_value(&self.resolve(sess, pk, params)?)?;
                 let schema = &table.schema;
-                let vals = sets.iter().map(|(c, e)| self.resolve(sess, e, params).map(|v| (*c, v))).collect::<Result<Vec<_>, _>>()?;
-                let f = |row: &[u8]| -> Result<Vec<u8>, Abort> { for p in &policy { if !p.eval(row) { return Err(Abort::NotFound); } } let mut new = row.to_vec(); for (c, v) in &vals { encode_col(schema, &mut new, *c, v).map_err(Abort::Type)?; } for p in &policy { if !p.eval(&new) { return Err(Abort::Type("permission denied: new row violates a policy".into())); } } Ok(new) };
+                let vals = sets.iter().filter_map(|(c, v)| if let SetVal::Value(e) = v { Some(self.resolve(sess, e, params).map(|v| (*c, v))) } else { None }).collect::<Result<Vec<_>, _>>()?;
+                let rowx: Vec<(usize, SExpr)> = if !sets.iter().any(|(_, v)| matches!(v, SetVal::Row(_))) { vec![] } else { let xs: Vec<(usize, SExpr)> = sets.iter().filter_map(|(c, v)| if let SetVal::Row(x) = v { Some((*c, x.clone())) } else { None }).collect(); let bound = self.bind(sess, &xs.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?; xs.into_iter().map(|(c, _)| c).zip(bound).collect() };
+                let f = |row: &[u8]| -> Result<Vec<u8>, Abort> { for p in &policy { if !p.eval(row) { return Err(Abort::NotFound); } } let mut new = row.to_vec(); for (c, v) in &vals { encode_col(schema, &mut new, *c, v).map_err(Abort::Type)?; }
+                    // every SET expression reads the row as it was before this UPDATE
+                    for (c, x) in &rowx { let v = x.eval(&|k| decode_col(schema, row, k)).map_err(Abort::Type)?; encode_col(schema, &mut new, *c, &v).map_err(Abort::Type)?; } for p in &policy { if !p.eval(&new) { return Err(Abort::Type("permission denied: new row violates a policy".into())); } } Ok(new) };
                 match &mut sess.txn { Some(t) => { table.txn_update(t, pk, f).map_err(|a| a.to_string())?; } None => { sess.last_seq = table.update_by_pk(pk, f).map_err(|a| a.to_string())?; } }
                 Ok(vec![])
             }
-            Plan::Delete { table, access, preds } => {
+            Plan::Delete { table, access, preds, filters } => {
+                if let Some(t) = &sess.txn {
+                    // by primary key a delete finds the transaction's own rows; any other condition reads committed rows only
+                    let mut read = vec![]; if !matches!(access, Access::Pk(_)) { read.push(table.clone()); } for p in preds { expr_tables(&p.rhs, &mut read); } for x in filters { sexpr_tables(x, &mut read); }
+                    if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); }
+                }
                 let mut policy = self.guard(sess, table, P_DELETE)?;
                 let schema = &table.schema;
                 let mut cp = preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?; cp.append(&mut policy);
                 let pk_off = schema.offsets[schema.pk];
                 let mut pks: Vec<crate::table::Key> = vec![]; let _ = pk_off;
-                let mut collect = |row: &[u8]| -> bool { for p in &cp { if !p.eval(row) { return true; } } pks.push(schema.key_of(row)); true };
+                let filters = self.bind(sess, filters, params)?; let mut ferr: Option<String> = None;
+                let mut collect = |row: &[u8]| -> bool {
+                    for p in &cp { if !p.eval(row) { return true; } }
+                    for f in &filters { match f.eval(&|c| decode_col(schema, row, c)).and_then(|v| crate::expr::truth(&v)) { Ok(Some(true)) => {} Ok(_) => return true, Err(e) => { ferr.get_or_insert(e); return false; } } }
+                    pks.push(schema.key_of(row)); true
+                };
                 match access {
                     Access::Pk(e) => { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; match &mut sess.txn { Some(t) => { if let Some(r) = table.txn_get(t, pk) { collect(&r); } } None => { table.with_pk(pk, |r| collect(r)); } } }
                     Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; table.with_unique(&key, |r| collect(r)); }
@@ -1279,6 +2091,7 @@ impl Sql {
                     Access::Index(ix, e) => { let k = index_key(schema, ix.col, &self.resolve(sess, e, params)?)?; table.index_lookup(ix, k, &mut collect); }
                     Access::Scan => table.scan(&mut collect),
                 }
+                if let Some(e) = ferr { return Err(e); }
                 let n = pks.len();
                 match &mut sess.txn {
                     Some(t) => { for pk in pks { table.txn_delete(t, pk).map_err(|a| a.to_string())?; } }
@@ -1286,11 +2099,102 @@ impl Sql {
                 }
                 Ok(vec![vec![Value::Int(n as i64)]])
             }
-            Plan::Select(s) => { let pol = match &s.join { Some(j) => { let mut v = vec![self.guard(sess, &j.probe, P_SELECT)?]; for st in &j.steps { v.push(self.guard(sess, &st.build, P_SELECT)?); } v }, None => vec![self.guard(sess, &s.table, P_SELECT)?] }; let (txn, sref) = (sess.txn.take(), &*sess); let r = { let mut txn = txn; let r = self.select(sref, s, params, txn.as_mut(), pol); (r, txn) }; sess.txn = r.1; r.0 }
+            Plan::Select(s) => { if let Some(t) = &sess.txn { if let Some(name) = written_and_read(t, s) { return Err(own_writes(&name)); } } let pol = match &s.join { Some(j) => { let mut v = vec![self.guard(sess, &j.probe, P_SELECT)?]; for st in &j.steps { v.push(self.guard(sess, &st.build, P_SELECT)?); } v }, None => vec![self.guard(sess, &s.table, P_SELECT)?] }; let (txn, sref) = (sess.txn.take(), &*sess); let r = { let mut txn = txn; let r = self.select(sref, s, params, txn.as_mut(), pol); (r, txn) }; sess.txn = r.1; r.0 }
         }
     }
 
-    fn select(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, mut policies: Vec<Vec<CPred>>) -> Result<Vec<Vec<Value>>, String> {
+    fn select(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, policies: Vec<Vec<CPred>>) -> Result<Vec<Vec<Value>>, String> {
+        let rows = self.select_rows(sess, s, params, txn, policies)?;
+        match &s.post { Some(p) => self.post(sess, p, rows, params), None => Ok(rows) }
+    }
+    /// INSERT with a conflict clause: per row, look the key up (the transaction's own rows included); insert, skip,
+    /// update the existing row, or replace it. All rows in one transaction; returns the rows inserted or updated.
+    fn upsert(&self, sess: &mut Session, table: &Arc<Table>, conflict: &Conflict, all: &[Vec<Value>], encoded: &[Vec<u8>], params: &[Value]) -> Result<Vec<Vec<u8>>, String> {
+        let schema = &table.schema; let n = schema.columns.len();
+        let upd_policy = if matches!(conflict, Conflict::Update { .. } | Conflict::Replace) { Some(self.guard(sess, table, if matches!(conflict, Conflict::Replace) { P_DELETE } else { P_UPDATE })?) } else { None };
+        let (sets, cond) = match conflict {
+            Conflict::Update { sets, cond, .. } => (self.bind(sess, &sets.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?, match cond { Some(c) => Some(self.bind(sess, std::slice::from_ref(c), params)?.remove(0)), None => None }),
+            _ => (vec![], None),
+        };
+        let own = sess.txn.is_none(); let mut t = sess.txn.take().unwrap_or_default();
+        let mut work = || -> Result<Vec<Vec<u8>>, String> {
+            let mut out = vec![];
+            for (vals, row) in all.iter().zip(encoded) {
+                let by_pk = table.txn_get(&mut t, schema.key_of(row));
+                let by_unique = || schema.unique.and_then(|u| crate::table::col_key(schema, row, u).map(|k| k.to_vec())).and_then(|k| table.with_unique(&k, |r| r.to_vec()));
+                let visible = |r: &[u8]| upd_policy.as_ref().map(|ps| ps.iter().all(|p| p.eval(r))).unwrap_or(true);
+                match conflict {
+                    Conflict::None => unreachable!(),
+                    Conflict::Nothing(target) => {
+                        let hit = match target { Some(c) if *c == schema.pk => by_pk.is_some(), Some(_) => by_unique().is_some(), None => by_pk.is_some() || by_unique().is_some() };
+                        if hit { continue; }
+                        table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; out.push(row.clone());
+                    }
+                    Conflict::Update { target, .. } => {
+                        let old = if *target == schema.pk { by_pk } else { by_unique() };
+                        let Some(old) = old else { table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; out.push(row.clone()); continue };
+                        if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); }
+                        let get = |i: usize| if i < n { decode_col(schema, &old, i) } else { vals[i - n].clone() };
+                        if let Some(c) = &cond { if crate::expr::truth(&c.eval(&get)?)? != Some(true) { continue; } }
+                        let mut new = old.clone();
+                        for ((c, _), x) in match conflict { Conflict::Update { sets: s, .. } => s.iter().zip(&sets), _ => unreachable!() } { let v = x.eval(&get)?; encode_col(schema, &mut new, *c, &v)?; }
+                        if !visible(&new) { return Err(format!("permission denied: new row violates a policy on {}", schema.name)); }
+                        let new2 = new.clone();
+                        table.txn_update(&mut t, schema.key_of(&old), move |_| Ok(new2)).map_err(|a| a.to_string())?; out.push(new);
+                    }
+                    Conflict::Replace => {
+                        // the rows it collides with, by primary key or UNIQUE value, go first
+                        let mut gone = vec![];
+                        if let Some(old) = by_pk { if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(schema.key_of(&old)); }
+                        if let Some(old) = by_unique() { let k = schema.key_of(&old); if !gone.contains(&k) { if !visible(&old) { return Err(format!("permission denied: the conflicting row in {} is outside your policy", schema.name)); } gone.push(k); } }
+                        for k in gone { table.txn_delete(&mut t, k).map_err(|a| a.to_string())?; }
+                        table.txn_insert(&mut t, row).map_err(|a| a.to_string())?; out.push(row.clone());
+                    }
+                }
+            }
+            Ok(out)
+        };
+        let r = work();
+        if own { match r { Ok(out) => { if !t.writes.is_empty() { sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; } Ok(out) } Err(e) => Err(e) } }
+        else { sess.txn = Some(t); r }
+    }
+    /// A statement's expressions with its parameters and scalar subqueries replaced by values for this execution.
+    fn bind(&self, sess: &Session, xs: &[SExpr], params: &[Value]) -> Result<Vec<SExpr>, String> {
+        let mut sub = |q: &Arc<SelectPlan>| -> Result<Value, String> { Ok(self.run_select(sess, q, params)?.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null)) };
+        xs.iter().map(|x| x.bind(params, &mut sub)).collect()
+    }
+    /// Feed the rows of a single-table SELECT's access path to `visit` (stops when it returns false).
+    #[inline(always)] fn drive<V: FnMut(&[u8]) -> bool>(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, visit: &mut V) -> Result<(), String> {
+        let (t, schema) = (&s.table, &s.schema);
+        match &s.access {
+            Access::Pk(e) => { let pk = t.schema.key_from_value(&self.resolve(sess, e, params)?)?; match txn { Some(tx) => { if let Some(row) = t.txn_get(tx, pk) { visit(&row); } } None => { t.with_pk(pk, |r| visit(r)); } } }
+            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; t.with_unique(&key, |r| visit(r)); }
+            Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } t.range(a, b, visit); }
+            Access::Index(ix, e) => { let k = index_key(&t.schema, ix.col, &self.resolve(sess, e, params)?)?; t.index_lookup(ix, k, visit); }
+            Access::Scan => t.scan(visit),
+        }
+        Ok(())
+    }
+    /// HAVING, DISTINCT, ORDER BY, OFFSET and LIMIT over the scan's rows (see `Post`).
+    #[inline(never)] fn post(&self, sess: &Session, p: &Post, rows: Vec<Vec<Value>>, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
+        use std::cmp::Ordering::Equal;
+        let mut rows = match &p.grouping { Some(g) => g.run(rows)?, None => rows };
+        // expressions over aggregates, in item order (one may read an earlier one), then HAVING
+        if !p.exprs.is_empty() {
+            let xs = self.bind(sess, &p.exprs.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?;
+            for r in rows.iter_mut() { for ((i, _), x) in p.exprs.iter().zip(&xs) { let v = x.eval(&|k| r[k].clone())?; r[*i] = v; } }
+        }
+        if let Some(h) = &p.having {
+            let h = self.bind(sess, std::slice::from_ref(h), params)?.remove(0);
+            let mut kept = Vec::with_capacity(rows.len());
+            for r in rows { if crate::expr::truth(&h.eval(&|k| r[k].clone())?)? == Some(true) { kept.push(r); } }
+            rows = kept;
+        }
+        if p.distinct { let mut seen = std::collections::HashSet::new(); let mut kb = vec![]; rows.retain(|r| { kb.clear(); for v in &r[..p.visible] { canon(v, &mut kb); } seen.insert(kb.clone()) }); }
+        if !p.order.is_empty() { rows.sort_by(|a, b| { for &(i, desc) in &p.order { let o = value_order(&a[i], &b[i]); let o = if desc { o.reverse() } else { o }; if o.is_ne() { return o; } } Equal }); }
+        Ok(rows.into_iter().skip(p.offset).take(p.limit.unwrap_or(usize::MAX)).map(|mut r| { r.truncate(p.visible); r }).collect())
+    }
+    #[inline(always)] fn select_rows(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, mut policies: Vec<Vec<CPred>>) -> Result<Vec<Vec<Value>>, String> {
         let schema = &s.schema;
         let mut preds = s.preds.iter().map(|p| self.compile(sess, schema, p, params)).collect::<Result<Vec<_>, _>>()?;
         let mut subs: Vec<SubVal> = Vec::with_capacity(s.subs.len());
@@ -1302,7 +2206,7 @@ impl Sql {
             if let (Some(oc), Some((cv, _)), None, false) = (oc, sp.corr, &sp.join, wide) {
                 if let (true, Some(ix), Some(Proj::Agg(agg))) = (outer_selective, sp.table.index_on(cv), sp.proj.get(1)) {
                     let pi = params.len();
-                    let lazy = Arc::new(SelectPlan { table: sp.table.clone(), schema: sp.schema.clone(), access: Access::Index(ix, Expr::Param(pi)), preds: sp.preds.clone(), proj: vec![Proj::Agg(agg.clone())], names: vec![], group_by: None, order: None, limit: None, join: None, corr: None, subs: vec![] });
+                    let lazy = Arc::new(SelectPlan { table: sp.table.clone(), schema: sp.schema.clone(), access: Access::Index(ix, Expr::Param(pi)), preds: sp.preds.clone(), proj: vec![Proj::Agg(agg.clone())], names: vec![], group_by: None, order: None, limit: None, join: None, corr: None, subs: vec![], post: None, exprs: vec![], filters: sp.filters.clone() });
                     let base: Vec<Value> = params.to_vec(); let dflt2 = dflt.clone();
                     let f = move |k: i64| -> Value { let mut p = base.clone(); p.push(Value::Int(k)); match self.run_select(sess, &lazy, &p) { Ok(rows) => rows.first().and_then(|r| r.first().cloned()).map(|v| if v == Value::Null { dflt2.clone() } else { v }).unwrap_or_else(|| dflt2.clone()), Err(_) => Value::Null } };
                     let sp2 = sp.clone(); let params2: Vec<Value> = params.to_vec();
@@ -1318,29 +2222,28 @@ impl Sql {
                 Some(oc) => { let mut map: FastMap<Value> = FastMap::default(); for r in rows { if let Value::Int(k) = r[0] { map.insert(k, r[1].clone()); } } SubVal::Map { map, off: schema.offsets[*oc], nb: oc >> 3, nm: 1u8 << (oc & 7), dflt } }
             });
         }
-        let mut sink = Sink::new(schema, &s.proj, s.group_by, s.order, s.limit, subs);
-        if let Some(j) = &s.join { self.run_joins(sess, j, params, &preds, &mut sink, policies)?; return Ok(sink.finish()); }
+        let (exprs, filters) = if s.exprs.is_empty() && s.filters.is_empty() { (vec![], vec![]) } else { (self.bind(sess, &s.exprs, params)?, self.bind(sess, &s.filters, params)?) };
+        let mut sink = Sink::new(schema, &s.proj, s.group_by, s.order, s.limit, subs, exprs, filters);
+        if let Some(j) = &s.join { self.run_joins(sess, j, params, &preds, &mut sink, policies)?; if let Some(e) = sink.err.take() { return Err(e); } return Ok(sink.finish()); }
         preds.append(&mut policies.pop().unwrap_or_default());
         let t = &s.table;
         let covering = preds.is_empty() && sink.count_only() && sink.group_by.is_none();
-        let mut visit = |row: &[u8]| -> bool { for p in &preds { if !p.eval(row) { return true; } } sink.push(row) };
-        match &s.access {
-            Access::Pk(e) => { let pk = t.schema.key_from_value(&self.resolve(sess, e, params)?)?; match txn { Some(tx) => { if let Some(row) = t.txn_get(tx, pk) { visit(&row); } } None => { t.with_pk(pk, |r| visit(r)); } } }
-            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; t.with_unique(&key, |r| visit(r)); }
-            Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } t.range(a, b, &mut visit); }
-            Access::Index(ix, e) => { let k = index_key(&t.schema, ix.col, &self.resolve(sess, e, params)?)?; if covering && t.schema.columns[ix.col].ty != ColType::Uuid { let n = ix.count(crate::table::fold_key(k)) as u64; drop(visit); sink.push_count(&[], n); return Ok(sink.finish()); } t.index_lookup(ix, k, &mut visit); }
-            Access::Scan => t.scan(&mut visit),
-        }
+        if let (true, Access::Index(ix, e)) = (covering, &s.access) { if matches!(t.schema.columns[ix.col].ty, ColType::Int | ColType::Timestamp) { let k = index_key(&t.schema, ix.col, &self.resolve(sess, e, params)?)?; let n = ix.count(crate::table::fold_key(k)) as u64; sink.push_count(&[], n); return Ok(sink.finish()); } }
+        // two loops, so a query without expression conditions pays nothing per row for them
+        if sink.filters.is_empty() { let mut visit = |row: &[u8]| -> bool { for p in &preds { if !p.eval(row) { return true; } } sink.push(row) }; self.drive(sess, s, params, txn, &mut visit)?; }
+        else { let mut visit = |row: &[u8]| -> bool { for p in &preds { if !p.eval(row) { return true; } } match sink.pass(row) { Some(true) => sink.push(row), Some(false) => true, None => false } }; self.drive(sess, s, params, txn, &mut visit)?; }
+        if let Some(e) = sink.err.take() { return Err(e); }
         Ok(sink.finish())
     }
 
     /// Filter one join step's build table; returns (keys, compact rows [flags][cols], stride).
     fn collect_build(&self, sess: &Session, st: &JoinStep, params: &[Value], bp: &[CPred]) -> Result<(BuildKeys, Vec<u8>, usize), String> {
-        let bs = &st.build.schema; let wide = bs.columns[st.build_key].ty == ColType::Uuid; let bkey_off = bs.offsets[st.build_key];
+        let bs = &st.build.schema; let bty = &bs.columns[st.build_key].ty; let wide = !matches!(bty, ColType::Int | ColType::Timestamp); let bkey_off = bs.offsets[st.build_key];
         let cols: Vec<(usize, usize, usize)> = st.build_cols.iter().map(|&c| (bs.offsets[c], bs.columns[c].ty.width(), c)).collect();
         let stride = cols.len() + cols.iter().map(|c| c.1).sum::<usize>();
         let (mut kn, mut kw): (Vec<i64>, Vec<crate::table::Key>) = (Vec::new(), Vec::new()); let mut arena: Vec<u8> = Vec::new();
-        let mut collect = |row: &[u8]| -> bool { for p in bp { if !p.eval(row) { return true; } } if wide { kw.push(crate::table::key_from_uuid(&row[bkey_off..bkey_off + 16])); } else { kn.push(read_i64(row, bkey_off)); } for (_, _, c) in &cols { arena.push(is_null(row, *c) as u8); } for (off, w, _) in &cols { arena.extend_from_slice(&row[*off..*off + *w]); } true };
+        let bkey = st.build_key;
+        let mut collect = |row: &[u8]| -> bool { for p in bp { if !p.eval(row) { return true; } } if is_null(row, bkey) { return true; } if wide { kw.push(crate::table::field_key128(bty, row, bkey_off)); } else { kn.push(read_i64(row, bkey_off)); } for (_, _, c) in &cols { arena.push(is_null(row, *c) as u8); } for (off, w, _) in &cols { arena.extend_from_slice(&row[*off..*off + *w]); } true };
         match &st.build_access {
             Access::Pk(e) => { let pk = bs.key_from_value(&self.resolve(sess, e, params)?)?; st.build.with_pk(pk, |r| collect(r)); }
             Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } st.build.range(a, b, &mut collect); }
@@ -1372,7 +2275,66 @@ impl Sql {
         Store::Hash { map, arena, stride }
     }
 
+    /// A join with LEFT JOIN or one-to-many steps: every step's table is filtered and grouped by its join column, then
+    /// each driving row is extended step by step, once per match; an outer step with no match continues with NULLs.
+    fn run_joins_general(&self, sess: &Session, j: &JoinPlan, params: &[Value], preds: &[CPred], sink: &mut Sink, mut policies: Vec<Vec<CPred>>) -> Result<(), String> {
+        let ps = &j.probe.schema; let vschema: &Schema = sink.schema; let vn = vschema.null_bytes;
+        let mut pp = j.probe_preds.iter().map(|p| self.compile(sess, ps, p, params)).collect::<Result<Vec<_>, _>>()?; pp.append(&mut policies[0]);
+        struct Group { map_n: FastMap<(u32, u32)>, map_w: crate::util::WideMap<(u32, u32)>, perm: Vec<u32>, arena: Vec<u8>, stride: usize, nf: usize, wide: bool }
+        let mut groups = vec![];
+        for (k, st) in j.steps.iter().enumerate() {
+            let mut bp = st.build_preds.iter().map(|p| self.compile(sess, &st.build.schema, p, params)).collect::<Result<Vec<_>, _>>()?; bp.append(&mut policies[k + 1]);
+            let (keys, arena, stride) = self.collect_build(sess, st, params, &bp)?;
+            let wide = matches!(keys, BuildKeys::W(_)); let n = keys.len();
+            let key = |i: usize| -> i128 { match &keys { BuildKeys::N(v) => v[i] as i128, BuildKeys::W(v) => v[i] } };
+            let mut perm: Vec<u32> = (0..n as u32).collect(); perm.sort_by_key(|&i| key(i as usize));
+            let (mut map_n, mut map_w): (FastMap<(u32, u32)>, crate::util::WideMap<(u32, u32)>) = Default::default();
+            let mut a = 0; while a < n { let k0 = key(perm[a] as usize); let mut b = a + 1; while b < n && key(perm[b] as usize) == k0 { b += 1; } if wide { map_w.insert(k0, (a as u32, (b - a) as u32)); } else { map_n.insert(k0 as i64, (a as u32, (b - a) as u32)); } a = b; }
+            groups.push(Group { map_n, map_w, perm, arena, stride, nf: st.build_cols.len(), wide });
+        }
+        let key_offs: Vec<usize> = j.steps.iter().map(|st| vschema.offsets[st.key_vidx]).collect();
+        let key_tys: Vec<ColType> = j.steps.iter().map(|st| vschema.columns[st.key_vidx].ty.clone()).collect();
+        let filtered = !sink.filters.is_empty();
+        struct Cx<'c> { j: &'c JoinPlan, groups: &'c [Group], key_offs: &'c [usize], key_tys: &'c [ColType], preds: &'c [CPred], filtered: bool }
+        fn expand(cx: &Cx, sink: &mut Sink, combined: &mut [u8], k: usize) -> bool {
+            if k == cx.j.steps.len() {
+                for p in cx.preds { if !p.eval(combined) { return true; } }
+                if cx.filtered { match sink.pass(combined) { Some(true) => {} Some(false) => return true, None => return false } }
+                return sink.push(combined);
+            }
+            let (st, g) = (&cx.j.steps[k], &cx.groups[k]);
+            let span = if is_null(combined, st.key_vidx) { None } else if g.wide { g.map_w.get(&crate::table::field_key128(&cx.key_tys[k], combined, cx.key_offs[k])).copied() } else { g.map_n.get(&read_i64(combined, cx.key_offs[k])).copied() };
+            let set_nulls = |combined: &mut [u8], flags: Option<&[u8]>| { for i in 0..g.nf { let vi = st.vbase + i; if flags.map(|f| f[i] != 0).unwrap_or(true) { combined[vi >> 3] |= 1 << (vi & 7); } else { combined[vi >> 3] &= !(1 << (vi & 7)); } } };
+            match span {
+                None => { if !st.outer { return true; } set_nulls(combined, None); for b in &mut combined[st.base..st.base + g.stride - g.nf] { *b = 0; } expand(cx, sink, combined, k + 1) }
+                Some((a, n)) => {
+                    for &i in &g.perm[a as usize..(a + n) as usize] {
+                        let entry = &g.arena[i as usize * g.stride..(i as usize + 1) * g.stride];
+                        combined[st.base..st.base + g.stride - g.nf].copy_from_slice(&entry[g.nf..]); set_nulls(combined, Some(&entry[..g.nf]));
+                        if !expand(cx, sink, combined, k + 1) { return false; }
+                    }
+                    true
+                }
+            }
+        }
+        let cx = Cx { j, groups: &groups, key_offs: &key_offs, key_tys: &key_tys, preds, filtered };
+        let mut combined = vec![0u8; vschema.row_size];
+        let mut per_probe = |prow: &[u8]| -> bool {
+            for p in &pp { if !p.eval(prow) { return true; } }
+            for b in &mut combined[..vn] { *b = 0; } combined[..ps.null_bytes].copy_from_slice(&prow[..ps.null_bytes]); combined[vn..vn + ps.row_size].copy_from_slice(prow);
+            expand(&cx, sink, &mut combined, 0)
+        };
+        match &j.probe_access {
+            Access::Pk(e) => { let pk = ps.key_from_value(&self.resolve(sess, e, params)?)?; j.probe.with_pk(pk, |r| per_probe(r)); }
+            Access::Unique(e) => { let u = ps.unique.unwrap(); let ty = &ps.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; j.probe.with_unique(&key, |r| per_probe(r)); }
+            Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } j.probe.range(a, b, &mut per_probe); }
+            Access::Index(ix, e) => { let k = index_key(ps, ix.col, &self.resolve(sess, e, params)?)?; j.probe.index_lookup(ix, k, &mut per_probe); }
+            Access::Scan => j.probe.scan(&mut per_probe),
+        }
+        Ok(())
+    }
     fn run_joins(&self, sess: &Session, j: &JoinPlan, params: &[Value], preds: &[CPred], sink: &mut Sink, mut policies: Vec<Vec<CPred>>) -> Result<(), String> {
+        if j.general { return self.run_joins_general(sess, j, params, preds, sink, policies); }
         let ps = &j.probe.schema; let vschema: &Schema = sink.schema;
         let vn = vschema.null_bytes; let pbase = vn;
         let mut pp = j.probe_preds.iter().map(|p| self.compile(sess, ps, p, params)).collect::<Result<Vec<_>, _>>()?; pp.append(&mut policies[0]);
@@ -1380,7 +2342,8 @@ impl Sql {
         for (k, st) in j.steps.iter().enumerate() { let mut v = st.build_preds.iter().map(|p| self.compile(sess, &st.build.schema, p, params)).collect::<Result<Vec<_>, _>>()?; v.append(&mut policies[k + 1]); bps.push(v); }
         let layouts: Vec<Vec<(usize, usize, usize)>> = j.steps.iter().map(|st| st.build_cols.iter().map(|&c| (st.build.schema.offsets[c], st.build.schema.columns[c].ty.width(), c)).collect()).collect();
         let key_offs: Vec<usize> = j.steps.iter().map(|st| vschema.offsets[st.key_vidx]).collect();
-        let wide: Vec<bool> = j.steps.iter().map(|st| st.build.schema.columns[st.build_key].ty == ColType::Uuid).collect();
+        let wide: Vec<bool> = j.steps.iter().map(|st| !matches!(st.build.schema.columns[st.build_key].ty, ColType::Int | ColType::Timestamp)).collect();
+        let key_tys: Vec<ColType> = j.steps.iter().map(|st| vschema.columns[st.key_vidx].ty.clone()).collect();
         let mut combined = vec![0u8; vschema.row_size];
         let fill_probe = |combined: &mut [u8], prow: &[u8]| { for b in &mut combined[..vn] { *b = 0; } combined[..ps.null_bytes].copy_from_slice(&prow[..ps.null_bytes]); combined[pbase..pbase + ps.row_size].copy_from_slice(prow); };
         let fill_build = |combined: &mut [u8], k: usize, brow: &[u8]| { let st = &j.steps[k]; let mut o = st.base; for (i, (off, w, c)) in layouts[k].iter().enumerate() { combined[o..o + w].copy_from_slice(&brow[*off..*off + *w]); if is_null(brow, *c) { let vi = st.vbase + i; combined[vi >> 3] |= 1 << (vi & 7); } o += w; } };
@@ -1418,7 +2381,7 @@ impl Sql {
         let apply_step = |combined: &mut [u8], k: usize| -> bool {
             let st = &j.steps[k];
             if is_null(combined, st.key_vidx) { return false; }
-            let key: crate::table::Key = if wide[k] { crate::table::key_from_uuid(&combined[key_offs[k]..key_offs[k] + 16]) } else { read_i64(combined, key_offs[k]) as i128 };
+            let key: crate::table::Key = if wide[k] { crate::table::field_key128(&key_tys[k], combined, key_offs[k]) } else { read_i64(combined, key_offs[k]) as i128 };
             if point_mode { return st.build.with_pk(key, |brow| { for p in &bps[k] { if !p.eval(brow) { return false; } } fill_build(combined, k, brow); true }).unwrap_or(false); }
             match &stores[k] {
                 Store::Empty => false,
@@ -1429,10 +2392,11 @@ impl Sql {
                 Store::Hash { map, arena, stride } => match map.get(&(key as i64)) { Some(&i) => { fill_entry(combined, k, &arena[i as usize * stride..(i as usize + 1) * stride]); true } None => false },
             }
         };
-        let stop = std::cell::Cell::new(false);
+        let stop = std::cell::Cell::new(false); let filtered = !sink.filters.is_empty();
         let mut finish = |combined: &mut [u8], skip: usize| -> bool {
             for k in 0..j.steps.len() { if k == skip { continue; } if !apply_step(combined, k) { return true; } }
             for p in preds { if !p.eval(combined) { return true; } }
+            if filtered { match sink.pass(combined) { Some(true) => {} Some(false) => return true, None => { stop.set(true); return false; } } }
             if !sink.push(combined) { stop.set(true); return false; }
             true
         };
@@ -1493,8 +2457,8 @@ fn spawn_snapshotter(db: &Arc<Database>, pol: crate::config::SnapshotPolicy, cou
         let tick = std::time::Duration::from_millis(200);
         let (mut seen_seq, mut seen_at) = (snap_seq, std::time::Instant::now());
         loop {
-            std::thread::sleep(tick);
-            if stop2.load(Ordering::Relaxed) { return; }
+            let until = std::time::Instant::now() + tick;   // parked, not asleep: close unparks it and joins at once
+            loop { if stop2.load(Ordering::Relaxed) { return; } let now = std::time::Instant::now(); if now >= until { break; } std::thread::park_timeout(until - now); }
             let (bytes, seq) = { let s = db.log.st.lock().unwrap(); (s.bytes, s.seq) };
             if seq != seen_seq { seen_seq = seq; seen_at = std::time::Instant::now(); }
             let by_size = pol.log_bytes.map(|n| bytes.saturating_sub(base_bytes) >= n.max(snap_bytes)).unwrap_or(false);
@@ -1531,6 +2495,40 @@ mod dir_tests {
     use crate::table::{check_dir, read_meta, DirState, DIR_FORMAT, META_FILE};
     fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqweezdb-dirtest-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); let _ = std::fs::remove_file(&p); p }
     fn files(p: &std::path::Path) -> Vec<String> { let mut v: Vec<String> = std::fs::read_dir(p).map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default(); v.sort(); v }
+    /// Closing does not wait out the snapshot policy's 200 ms tick (a host closing thousands of databases, E53).
+    #[test] fn close_does_not_wait_for_the_snapshotter_tick() {
+        for i in 0..3 {
+            let d = tmp(&format!("close{i}"));
+            let s = Sql::open_with(&d, Config::default()).unwrap();
+            s.exec_s(&mut Session::default(), "CREATE TABLE t(id INTEGER PRIMARY KEY)", &[]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let t = std::time::Instant::now(); drop(s);
+            assert!(t.elapsed() < std::time::Duration::from_millis(80), "close took {:?}", t.elapsed());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+    /// A writer that restarts after an idle exit appends to its last segment instead of starting a file per restart
+    /// (E53: an agent written now and then had a file per write). A reopen starts a new segment, after a torn tail too,
+    /// and nothing is lost either way.
+    #[test] fn restarts_append_to_a_clean_last_segment() {
+        let d = tmp("reuse");
+        let cfg = Config::from_json(r#"{"log":{"threadsIdleAfter":"30ms"},"snapshot":{"logBytes":0,"idleAfter":0}}"#).unwrap();
+        let ins = |s: &Sql, i: i64| { s.exec_s(&mut Session::default(), &format!("INSERT INTO t VALUES ({i})"), &[]).unwrap(); };
+        let count = |s: &Sql| s.exec_s(&mut Session::default(), "SELECT count(*) FROM t", &[]).unwrap()[0][0].clone();
+        let segs = || files(&d).into_iter().filter(|f| f.starts_with("log.")).count();
+        { let s = Sql::open_with(&d, cfg.clone()).unwrap(); s.exec_s(&mut Session::default(), "CREATE TABLE t(id INTEGER PRIMARY KEY)", &[]).unwrap();
+          for i in 0..5 { ins(&s, i); std::thread::sleep(std::time::Duration::from_millis(120)); }   // the log threads leave between writes
+          assert_eq!(segs(), 1, "idle restarts reuse the segment"); }
+        { let s = Sql::open_with(&d, cfg.clone()).unwrap(); assert_eq!(count(&s), Value::Int(5)); ins(&s, 5); std::thread::sleep(std::time::Duration::from_millis(120)); ins(&s, 50); }
+        assert_eq!(segs(), 2, "a reopen starts one new segment, and its idle restarts reuse it");
+        // a torn record at the end (a crash mid-write): the next writer must not append after it
+        let last = files(&d).into_iter().filter(|f| f.starts_with("log.")).max().unwrap();
+        { use std::io::Write; let mut f = std::fs::OpenOptions::new().append(true).open(d.join(&last)).unwrap(); f.write_all(&[200, 0, 0, 0, 1, 2, 3]).unwrap(); }
+        { let s = Sql::open_with(&d, cfg.clone()).unwrap(); assert_eq!(count(&s), Value::Int(7)); ins(&s, 6); }
+        assert_eq!(segs(), 3, "after a torn tail the writer starts a new segment");
+        { let s = Sql::open_with(&d, cfg).unwrap(); assert_eq!(count(&s), Value::Int(8), "every acknowledged row is back"); }
+        let _ = std::fs::remove_dir_all(&d);
+    }
     #[test] fn new_directory_gets_a_marker_and_reopens() {
         let d = tmp("new");
         { let s = Sql::open_with(&d, Config::default()).unwrap(); s.exec_s(&mut Session::default(), "CREATE TABLE t(id INTEGER PRIMARY KEY)", &[]).unwrap(); }
@@ -1643,6 +2641,10 @@ mod gen_tests {
         assert_eq!(err("INSERT INTO notes VALUES (1, 'a', 'b', 'c')"), "table notes has 3 columns (id, body, tag) but VALUES gives 4 values");
         assert_eq!(err("INSERT INTO notes (body, tag) VALUES ('a', 'b'), ('c')"), "INSERT names 2 columns (body, tag) but row 2 of VALUES gives 1 value");
         assert_eq!(error_code(&err("INSERT INTO notes (body) VALUES ('a', 'b')")), "SYNTAX");
+        for (sql, code) in [("SELECT 1 / 0", "TYPE"), ("SELECT 9223372036854775807 + 1", "TYPE"), ("SELECT sum(body) FROM notes", "TYPE"), ("SELECT upper(5)", "TYPE"), ("SELECT 'a' LIKE 5", "TYPE"),
+                            ("SELECT sqrt(-1)", "TYPE"), ("CREATE TABLE q (id INT PRIMARY KEY, true INT)", "SYNTAX"), ("UPDATE notes SET body = 'x' WHERE tag = 'a'", "SYNTAX"), ("SELECT nosuch FROM notes", "SCHEMA")] {
+            assert_eq!(error_code(&err(sql)), code, "{sql}: {}", err(sql));
+        }
         drop(s); std::fs::remove_dir_all(&d).unwrap();
     }
     #[test] fn multi_row_insert_is_all_or_nothing_and_returns_every_row() {
@@ -1697,6 +2699,7 @@ mod uuid_key_tests {
     fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn qp(s: &Sql, sql: &str, p: &[Value]) -> Result<Vec<Vec<Value>>, String> { s.exec_s(&mut Session::default(), sql, p) }
     fn text(v: &Value) -> String { match v { Value::Text(t) => t.clone(), v => panic!("not text: {v:?}") } }
+    fn q2(s: &Sql, sql: &str) -> String { s.exec_s(&mut Session::default(), sql, &[]).map(|_| String::new()).unwrap_or_else(|e| e) }
     fn int(v: &Value) -> i64 { match v { Value::Int(i) => *i, v => panic!("not an int: {v:?}") } }
     #[test] fn a_feed_reads_past_an_alter_copy() {
         let d = tmp("feedalter"); let s = Sql::open_with(&d, Config::default()).unwrap();
@@ -1726,6 +2729,42 @@ mod uuid_key_tests {
         assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE owner = ?", &[Value::Text(a)]).unwrap()[0][0]), 2000);
         assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE owner = ?", &[Value::Text(b)]).unwrap()[0][0]), 2500);
         assert!(t.elapsed() < std::time::Duration::from_millis(100));
+        drop(s); std::fs::remove_dir_all(&d).unwrap();
+    }
+    #[test] fn text_indexes_are_used_and_survive_a_restart() {
+        let d = tmp("textidx");
+        let long = "lisbon-metropolitan-area".to_string();
+        { let s = Sql::open_with(&d, Config::default()).unwrap();
+          q(&s, "CREATE TABLE t(id INT PRIMARY KEY, city VARCHAR(40), tag BYTES(8))");
+          for i in 0..5000 { qp(&s, "INSERT INTO t VALUES (?, ?, ?)", &[Value::Int(i), if i % 10 == 0 { Value::Null } else { Value::Text(match i % 3 { 0 => "porto".into(), 1 => long.clone(), _ => format!("city-{}", i % 7) }) }, Value::Bytes(vec![(i % 4) as u8; 3])]).unwrap(); }
+          q(&s, "CREATE INDEX t_city ON t(city)"); q(&s, "CREATE INDEX t_tag ON t(tag)");   // filled from existing rows
+          let p = s.prepare("SELECT count(*) FROM t WHERE city = ?").unwrap();
+          assert!(matches!(&p.plan, Plan::Select(sp) if matches!(sp.access, Access::Index(..))), "an equality on an indexed text column uses the index");
+          assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE city = ?", &[Value::Text("porto".into())]).unwrap()[0][0]), 1500);
+          assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE city = ?", &[Value::Text(long.clone())]).unwrap()[0][0]), 1500);
+          assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE tag = ?", &[Value::Bytes(vec![1, 1, 1])]).unwrap()[0][0]), 1250);
+          q(&s, "UPDATE t SET city = 'porto' WHERE id = 1");   // was the long value
+          s.snapshot();
+          q(&s, "DELETE FROM t WHERE id = 3"); }               // was 'porto'; replayed from the log on reopen
+        let s = Sql::open_with(&d, Config::default()).unwrap();   // rebuilt from the mapped snapshot and the log
+        let t = std::time::Instant::now();
+        assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE city = ?", &[Value::Text("porto".into())]).unwrap()[0][0]), 1500);
+        assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE city = ?", &[Value::Text(long)]).unwrap()[0][0]), 1499);
+        assert_eq!(int(&qp(&s, "SELECT count(*) FROM t WHERE city = ?", &[Value::Text("nowhere".into())]).unwrap()[0][0]), 0);
+        assert!(t.elapsed() < std::time::Duration::from_millis(100));
+        assert!(qp(&s, "SELECT count(*) FROM t WHERE city = ?", &[Value::Int(5)]).is_err(), "a number is not a text value");
+        drop(s); std::fs::remove_dir_all(&d).unwrap();
+    }
+    #[test] fn joins_compare_keys_of_one_kind() {
+        let d = tmp("joinkinds");
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        q(&s, "CREATE TABLE a(id INT PRIMARY KEY, name VARCHAR(20), score DOUBLE, u UUID)");
+        q(&s, "CREATE TABLE b(id INT PRIMARY KEY, name VARCHAR(30), n INT)");
+        q(&s, "INSERT INTO a VALUES (1, 'x', 1.0, NULL), (2, 'y', 2.0, NULL)"); q(&s, "INSERT INTO b VALUES (1, 'x', 1), (2, 'x', 2), (3, 'yy', 2)");
+        for bad in ["SELECT a.id FROM a JOIN b ON b.n = a.name", "SELECT a.id FROM a JOIN b ON b.n = a.score", "SELECT a.id FROM a JOIN b ON b.name = a.u", "SELECT a.id FROM a LEFT JOIN b ON b.n = a.score"] {
+            assert!(qp(&s, bad, &[]).unwrap_err().contains("not implemented"), "{bad}");
+        }
+        assert_eq!(q(&s, "SELECT a.id, b.id FROM a JOIN b ON b.name = a.name ORDER BY b.id"), vec![vec![Value::Int(1), Value::Int(1)], vec![Value::Int(1), Value::Int(2)]], "text widths may differ");
         drop(s); std::fs::remove_dir_all(&d).unwrap();
     }
     #[test] fn uuid_primary_keys_work_end_to_end() {
@@ -1786,6 +2825,81 @@ mod uuid_key_tests {
             let all: Vec<String> = q(&s, "SELECT id FROM users").into_iter().map(|r| text(&r[0])).collect();
             for k in all.iter().step_by(997) { assert_eq!(qp(&s, "SELECT id FROM users WHERE id = ?", &[Value::Text(k.clone())]).unwrap().len(), 1, "{round}: every key is found ({k})"); }
             assert_eq!(int(&q(&s, "SELECT count(*) FROM orders o JOIN users u ON o.user_id = u.id")[0][0]), orders_n, "{round}");
+            if round == "log" { s.snapshot(); }
+            drop(s);
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+    #[test] fn text_keys_mix_reversibly() {
+        use crate::table::{text_key, text_of_key};
+        for t in ["", "a", "user_000001", "abcdefghijklmno", "ab\0", "ab"] { assert_eq!(text_of_key(text_key(t.as_bytes())), Some(t.as_bytes().to_vec()), "{t:?}"); }
+        assert_eq!(text_of_key(text_key(b"abcdefghijklmnop")), None, "16 bytes and more are hashed");
+        assert_ne!(text_key(b"ab"), text_key(b"ab\0")); assert_ne!(text_key(b"lisbon-metropolitan-area"), text_key(b"lisbon-metropolitan-areb"));
+        // keys of similar short texts spread over the key shards (bits 16..26), not into one
+        let shards: std::collections::HashSet<i128> = (0..1000).map(|i| (text_key(format!("user_{i:06}").as_bytes()) as u128 >> 16 & 1023) as i128).collect();
+        assert!(shards.len() > 400, "{} shards", shards.len());
+    }
+    #[test] fn text_primary_keys_work_end_to_end() {
+        let d = tmp("textpk");
+        let long = |i: usize| format!("customer-account-{i:08}");   // 25 bytes: a hashed key
+        let (users_n, orders_n);
+        {
+            let s = Sql::open_with(&d, Config::default()).unwrap();
+            q(&s, "CREATE TABLE users(id VARCHAR(15) PRIMARY KEY, name VARCHAR(16))");
+            q(&s, "CREATE TABLE accounts(id TEXT PRIMARY KEY, owner VARCHAR(15) REFERENCES users(id) ON DELETE CASCADE, balance INT)");
+            q(&s, "CREATE TABLE notes(id INT PRIMARY KEY, user_id TEXT REFERENCES users(id), body VARCHAR(16))");   // RESTRICT; another width
+            let mut sess = Session::default();
+            s.exec_s(&mut sess, "INSERT INTO users VALUES ('ann', 'Ann')", &[]).unwrap(); assert_eq!(sess.last_insert_key, Some(Value::Text("ann".into())));
+            assert!(q2(&s, "INSERT INTO users VALUES ('ann', 'again')").contains("Duplicate"));
+            assert!(q2(&s, "INSERT INTO users VALUES (NULL, 'nobody')").to_lowercase().contains("null"), "a key is never NULL");
+            assert!(q2(&s, "INSERT INTO users VALUES ('a-much-too-long-key', 'x')").contains("exceeds"));
+            for i in 0..3000 { qp(&s, "INSERT INTO users VALUES (?, ?)", &[Value::Text(format!("u{i:05}")), Value::Text(format!("n{i}"))]).unwrap(); }
+            for i in 0..6000 { qp(&s, "INSERT INTO accounts VALUES (?, ?, ?)", &[Value::Text(long(i)), Value::Text(format!("u{:05}", i % 3000)), Value::Int(i as i64)]).unwrap(); }
+            let sess2 = &mut Session::default(); s.exec_s(sess2, "INSERT INTO accounts VALUES ('acct-x', 'ann', 1)", &[]).unwrap();
+            // lookups by key, short and hashed; text keys compare exactly (case, trailing bytes)
+            assert_eq!(text(&q(&s, "SELECT name FROM users WHERE id = 'u00042'")[0][0]), "n42");
+            assert!(q(&s, "SELECT name FROM users WHERE id = 'U00042'").is_empty() && q(&s, "SELECT name FROM users WHERE id = 'u00042 '").is_empty());
+            assert_eq!(int(&qp(&s, "SELECT balance FROM accounts WHERE id = ?", &[Value::Text(long(4321))]).unwrap()[0][0]), 4321);
+            assert!(qp(&s, "SELECT balance FROM accounts WHERE id = ?", &[Value::Int(5)]).is_err(), "a number is not a text key");
+            q(&s, "UPDATE users SET name = 'Ann2' WHERE id = 'ann'");
+            assert_eq!(text(&q(&s, "SELECT name FROM users WHERE id = 'ann'")[0][0]), "Ann2");
+            // a range over a text key is a filter, in text order
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM users WHERE id >= 'u01000' AND id < 'u02000'")[0][0]), 1000);
+            assert_eq!(text(&q(&s, "SELECT id FROM users ORDER BY id DESC LIMIT 1")[0][0]), "u02999");
+            // foreign keys: the parent must exist (the error names it); RESTRICT; joins through the key
+            let e = q2(&s, "INSERT INTO accounts VALUES ('acct-y', 'nobody', 1)"); assert!(e.contains("nobody"), "{e}");
+            assert!(q2(&s, "CREATE TABLE bad(id INT PRIMARY KEY, u INT REFERENCES users(id))").contains("must be TEXT"));
+            q(&s, "INSERT INTO notes VALUES (1, 'u00007', 'hi')");
+            assert!(q2(&s, "DELETE FROM users WHERE id = 'u00007'").contains("blocked"), "RESTRICT");
+            let r = qp(&s, "SELECT a.balance, u.name FROM accounts a JOIN users u ON a.owner = u.id WHERE a.id = ?", &[Value::Text(long(10))]).unwrap();
+            assert_eq!(r, vec![vec![Value::Int(10), Value::Text("n10".into())]]);
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM accounts a JOIN users u ON a.owner = u.id")[0][0]), 6001);
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM accounts a JOIN users u ON a.owner = u.id WHERE u.name = 'n5'")[0][0]), 2);
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM users u LEFT JOIN accounts a ON a.owner = u.id WHERE a.id IS NULL")[0][0]), 0);
+            // transactions: delete and re-insert a key, delete by a hashed key
+            let mut t = Session::default();
+            for st in ["BEGIN", "DELETE FROM users WHERE id = 'u02999'", "INSERT INTO users VALUES ('u02999', 'again')", "DELETE FROM accounts WHERE id = 'acct-x'", "COMMIT"] { s.exec_s(&mut t, st, &[]).unwrap_or_else(|e| panic!("{st}: {e}")); }
+            for st in ["BEGIN", &format!("DELETE FROM accounts WHERE id = '{}'", long(5999)), "COMMIT"] { s.exec_s(&mut t, st, &[]).unwrap_or_else(|e| panic!("{st}: {e}")); }
+            // the change feed names text keys, short and hashed
+            let s = Arc::new(s); let sub = s.reactor().subscribe(&Session::default(), "SELECT id, balance FROM accounts WHERE balance = 77", &[]).unwrap();
+            qp(&s, "DELETE FROM accounts WHERE id = ?", &[Value::Text(long(77))]).unwrap();
+            match sub.recv_timeout(std::time::Duration::from_secs(2)) { Some(crate::live::Event::Change(c)) => assert_eq!(c.pk, Value::Text(long(77))), other => panic!("no event: {:?}", other.is_some()) }
+            // cascade through a text key
+            let before = int(&q(&s, "SELECT count(*) FROM accounts")[0][0]);
+            q(&s, "DELETE FROM users WHERE id = 'u00001'");
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM accounts")[0][0]), before - 2, "accounts of u00001 cascaded");
+            users_n = int(&q(&s, "SELECT count(*) FROM users")[0][0]); orders_n = int(&q(&s, "SELECT count(*) FROM accounts")[0][0]);
+            drop(sub); s.close();
+        }
+        for round in ["log", "snapshot"] {
+            let s = Sql::open_with(&d, Config::default()).unwrap();
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM users")[0][0]), users_n, "{round}"); assert_eq!(int(&q(&s, "SELECT count(*) FROM accounts")[0][0]), orders_n, "{round}");
+            assert_eq!(text(&q(&s, "SELECT name FROM users WHERE id = 'u02999'")[0][0]), "again", "{round}");
+            assert!(q(&s, "SELECT id FROM accounts WHERE id = 'acct-x'").is_empty(), "{round}");
+            assert!(qp(&s, "SELECT id FROM accounts WHERE id = ?", &[Value::Text(long(5999))]).unwrap().is_empty(), "{round}");
+            let all: Vec<String> = q(&s, "SELECT id FROM accounts").into_iter().map(|r| text(&r[0])).collect();
+            for k in all.iter().step_by(97) { assert_eq!(qp(&s, "SELECT id FROM accounts WHERE id = ?", &[Value::Text(k.clone())]).unwrap().len(), 1, "{round}: every key is found ({k})"); }
+            assert_eq!(int(&q(&s, "SELECT count(*) FROM accounts a JOIN users u ON a.owner = u.id")[0][0]), orders_n, "{round}");
             if round == "log" { s.snapshot(); }
             drop(s);
         }
@@ -1892,5 +3006,244 @@ mod identity_tests {
         let mut bad = Session::default(); s.assume(&mut bad, &["member".into()], attrs(&[("user_id", Value::Text("nope".into()))])).unwrap();
         assert!(s.exec_s(&mut bad, "SELECT body FROM notes", &[]).unwrap_err().contains("not a UUID"));
         drop(s); std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+#[cfg(test)]
+mod unsupported_tests {
+    use super::*;
+    use crate::config::Config;
+    fn db(name: &str) -> (Arc<Sql>, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("sqweezdb-unsup-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        for q in ["CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40), age INT, grp INT)", "INSERT INTO users VALUES (1, 'alice', 30, 1), (2, 'bob', 25, 1), (3, 'carol', 35, 2)", "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INT, amount INT)", "INSERT INTO orders VALUES (1, 1, 10), (2, 1, 20)"] { s.exec_s(&mut Session::default(), q, &[]).unwrap(); }
+        (s, d)
+    }
+    /// E54: each of these used to be parsed and then skipped, giving a wrong answer without an error.
+    #[test] fn what_is_not_implemented_is_an_error_not_a_wrong_answer() {
+        let (s, d) = db("reject");
+        for q in [
+            "SELECT sum(age) OVER (ORDER BY id) FROM users", "SELECT count(id) FILTER (WHERE age > 1) FROM users", "SELECT DISTINCT ON (grp) grp FROM users",
+            "SELECT name, age FROM users ORDER BY age NULLS FIRST", "SELECT id FROM users LIMIT 1, 2", "WITH x AS (SELECT id FROM users) SELECT id FROM users", "SELECT id FROM users FETCH FIRST 1 ROWS ONLY",
+            "SELECT id FROM users FOR UPDATE", "SELECT id FROM users UNION SELECT user_id FROM orders",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, age INT CHECK (age >= 0))", "CREATE TABLE c (id INTEGER PRIMARY KEY, age INT, CHECK (age >= 0))",
+            "CREATE TABLE g (id INTEGER PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)", "CREATE TABLE b (id INTEGER PRIMARY KEY, s VARCHAR(100000))",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, a VARCHAR(10) UNIQUE, b VARCHAR(10) UNIQUE)", "CREATE TABLE u (id INTEGER PRIMARY KEY, a INT, b INT, UNIQUE (a, b))",
+            "CREATE TABLE cp (a INT, b INT, PRIMARY KEY (a, b))", "CREATE TABLE n (id INTEGER PRIMARY KEY, s VARCHAR(10) COLLATE NOCASE)", "CREATE TEMPORARY TABLE tt (id INTEGER PRIMARY KEY)",
+            "UPDATE users SET age = 31 WHERE id = 1 RETURNING age", "DELETE FROM users WHERE grp = 1 LIMIT 1", "DELETE FROM users WHERE id = 1 RETURNING id",
+            "INSERT INTO users VALUES (1, 'x', 1, 1) ON DUPLICATE KEY UPDATE age = 1", "INSERT INTO users (id, name) VALUES (9, 'x') ON CONFLICT (name, age) DO NOTHING",
+        ] {
+            let e = s.exec_s(&mut Session::default(), q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}"));
+            assert!(e.starts_with("unsupported"), "{q}: {e}"); assert_eq!(error_code(&e), "SYNTAX", "{q}");
+        }
+        let one = |q: &str| s.exec_s(&mut Session::default(), q, &[]).unwrap();
+        assert_eq!(one("SELECT count(*) FROM users")[0][0], Value::Int(3), "the rejected writes changed nothing");
+        assert_eq!(one("SELECT age FROM users WHERE id = 1")[0][0], Value::Int(30));
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn what_is_implemented_still_works() {
+        let (s, d) = db("keep");
+        let one = |q: &str| s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(one("SELECT name, age FROM users ORDER BY age LIMIT 1 OFFSET 0")[0][0], Value::Text("bob".into()), "OFFSET 0 changes nothing");
+        // E55: the everyday clauses that used to be refused (and, before that, ignored)
+        assert_eq!(one("SELECT grp FROM users GROUP BY grp HAVING avg(age) > 30"), vec![vec![Value::Int(2)]]);
+        assert_eq!(one("SELECT name FROM users ORDER BY grp DESC, age").iter().map(|r| r[0].clone()).collect::<Vec<_>>(), vec![Value::Text("carol".into()), Value::Text("bob".into()), Value::Text("alice".into())]);
+        assert_eq!(one("SELECT name, age FROM users ORDER BY age LIMIT 1 OFFSET 1")[0][0], Value::Text("alice".into()));
+        assert_eq!(one("SELECT DISTINCT grp FROM users ORDER BY grp").len(), 2);
+        assert_eq!(one("SELECT count(DISTINCT grp) FROM users")[0][0], Value::Int(2));
+        assert_eq!(one("SELECT grp, count(*) FROM users GROUP BY grp ORDER BY count(*) DESC, grp LIMIT 1")[0], vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(one("SELECT name, age FROM users ORDER BY age DESC LIMIT 1")[0][0], Value::Text("carol".into()));
+        one("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)"); assert_eq!(one("SELECT count(*) FROM users")[0][0], Value::Int(3), "IF NOT EXISTS leaves the table alone");
+        one("CREATE TABLE tp (id INT, v VARCHAR(10), PRIMARY KEY (id), UNIQUE (v))"); one("INSERT INTO tp VALUES (1, 'a')");
+        assert!(s.exec_s(&mut Session::default(), "INSERT INTO tp VALUES (1, 'b')", &[]).is_err(), "a table-level PRIMARY KEY is enforced");
+        assert!(s.exec_s(&mut Session::default(), "INSERT INTO tp VALUES (2, 'a')", &[]).is_err(), "a table-level UNIQUE is enforced");
+        one("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, v INT NULL COMMENT 'x')"); one("INSERT INTO ai (v) VALUES (1)");
+        assert_eq!(one("SELECT count(*) FROM orders WHERE user_id IN (SELECT id FROM users WHERE grp = 1)")[0][0], Value::Int(2));
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    /// A read inside a transaction sees committed rows only, so reading a table the transaction wrote is refused; a
+    /// delete by primary key finds the transaction's own rows and stays allowed.
+    #[test] fn a_transaction_does_not_silently_miss_its_own_writes() {
+        let (s, d) = db("txn");
+        let mut se = Session::default();
+        s.exec_s(&mut se, "BEGIN", &[]).unwrap();
+        assert_eq!(s.exec_s(&mut se, "SELECT count(*) FROM users", &[]).unwrap()[0][0], Value::Int(3), "reads before writing are fine");
+        s.exec_s(&mut se, "INSERT INTO users VALUES (5, 'eve', 20, 1)", &[]).unwrap();
+        for q in ["SELECT count(*) FROM users", "SELECT count(*) FROM orders WHERE user_id IN (SELECT id FROM users)", "DELETE FROM users WHERE age < 22", "SELECT o.amount FROM orders o JOIN users u ON u.id = o.user_id"] {
+            let e = s.exec_s(&mut se, q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}")); assert_eq!(error_code(&e), "TRANSACTION", "{q}: {e}");
+        }
+        assert_eq!(s.exec_s(&mut se, "SELECT count(*) FROM orders", &[]).unwrap()[0][0], Value::Int(2), "a table it did not write is fine");
+        assert_eq!(s.exec_s(&mut se, "SELECT name FROM users WHERE id = 5", &[]).unwrap()[0][0], Value::Text("eve".into()), "a lookup by primary key sees the transaction's own row");
+        s.exec_s(&mut se, "UPDATE users SET age = 21 WHERE id = 5", &[]).unwrap();
+        s.exec_s(&mut se, "DELETE FROM users WHERE id = 2", &[]).unwrap();
+        s.exec_s(&mut se, "COMMIT", &[]).unwrap();
+        let rows = s.exec_s(&mut Session::default(), "SELECT id FROM users ORDER BY id", &[]).unwrap();
+        assert_eq!(rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), vec![Value::Int(1), Value::Int(3), Value::Int(5)]);
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+}
+#[cfg(test)]
+mod expression_tests {
+    use super::*;
+    use crate::config::Config;
+    fn db(name: &str) -> (Arc<Sql>, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("sqweezdb-expr-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        for q in ["CREATE TABLE t (id UUID PRIMARY KEY DEFAULT uuid(), n INT, name VARCHAR(20), nick VARCHAR(20), at TIMESTAMP, doc VARCHAR(200))",
+                  "INSERT INTO t (id, n, name, nick, at, doc) VALUES ('0190d3c8-7c4b-7a3e-9f00-000000000001', 1, 'Alice', NULL, '2026-10-01', '{\"tags\":[\"a\",\"b\"],\"n\":5}'), ('0190d3c8-7c4b-7a3e-9f00-000000000002', 2, 'bob', 'bobby', '2026-10-20 08:00:00', '{\"n\":1}')"] {
+            s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        (s, d)
+    }
+    #[test] fn aggregates_keep_their_types() {
+        let (s, d) = db("aggtypes");
+        let q = |sql: &str| s.exec_s(&mut Session::default(), sql, &[]);
+        q("CREATE TABLE big (id INTEGER PRIMARY KEY, g INT, v INT, done BOOL)").unwrap();
+        // 2^53 + 1 and its neighbours: a double cannot hold them, so min and max must stay integers
+        q("INSERT INTO big (id, g, v, done) VALUES (1, 1, 9007199254740993, true), (2, 1, 9007199254740995, false), (3, 2, -9007199254740993, true)").unwrap();
+        assert_eq!(q("SELECT min(v), max(v) FROM big WHERE g = 1").unwrap(), vec![vec![Value::Int(9007199254740993), Value::Int(9007199254740995)]]);
+        assert_eq!(q("SELECT g, max(v) FROM big GROUP BY g ORDER BY g").unwrap(), vec![vec![Value::Int(1), Value::Int(9007199254740995)], vec![Value::Int(2), Value::Int(-9007199254740993)]]);
+        // text min and max compare as text (the scan's aggregator held numbers only)
+        assert_eq!(q("SELECT min(name), max(name) FROM t").unwrap()[0], vec![Value::Text("Alice".into()), Value::Text("bob".into())]);
+        assert_eq!(q("SELECT max(done), min(done) FROM big").unwrap()[0], vec![Value::Bool(true), Value::Bool(false)]);
+        // booleans add up as 0 and 1; text does not add up
+        assert_eq!(q("SELECT sum(done) FROM big").unwrap()[0][0], Value::Int(2));
+        assert!(q("SELECT sum(name) FROM t").unwrap_err().contains("takes numbers"));
+        assert!(q("SELECT avg(at) FROM t").unwrap_err().contains("takes numbers"));
+        // an integer total that does not fit is an error, in both aggregators
+        q("INSERT INTO big (id, g, v) VALUES (4, 3, 9223372036854775807), (5, 3, 1)").unwrap();
+        assert!(q("SELECT sum(v) FROM big WHERE g = 3").unwrap_err().contains("64-bit"));
+        assert!(q("SELECT sum(v + 0) FROM big WHERE g = 3").unwrap_err().contains("64-bit"));
+        assert!(q("SELECT avg(v) FROM big WHERE g = 3").is_ok(), "an average is a double; it does not overflow");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn parameters_are_numbered_by_their_place_in_the_text() {
+        let (s, d) = db("params");
+        // the select list's ? comes first in the text, though the planner reads WHERE first
+        let r = s.exec_s(&mut Session::default(), "SELECT coalesce(nick, ?) FROM t WHERE n = ?", &[Value::Text("none".into()), Value::Int(1)]).unwrap();
+        assert_eq!(r, vec![vec![Value::Text("none".into())]]);
+        let r = s.exec_s(&mut Session::default(), "SELECT n + $2 FROM t WHERE n = $1", &[Value::Int(2), Value::Int(10)]).unwrap();
+        assert_eq!(r, vec![vec![Value::Int(12)]]);
+        let r = s.exec_s(&mut Session::default(), "SELECT '?', n FROM t WHERE name = ? -- what?\n AND n > ?", &[Value::Text("bob".into()), Value::Int(0)]).unwrap();
+        assert_eq!(r, vec![vec![Value::Text("?".into()), Value::Int(2)]], "a ? inside quotes or a comment is not a parameter");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn sqweezdb_semantics_that_differ_from_sqlite() {
+        let (s, d) = db("strict");
+        let one = |q: &str| s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let err = |q: &str| s.exec_s(&mut Session::default(), q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}"));
+        assert_eq!(one("SELECT count(*) FROM t WHERE name LIKE 'a%'")[0][0], Value::Int(0), "LIKE is case-sensitive");
+        assert_eq!(one("SELECT count(*) FROM t WHERE name ILIKE 'a%'")[0][0], Value::Int(1), "ILIKE is not");
+        assert!(err("SELECT n / 0 FROM t").contains("division by zero"));
+        assert!(err("SELECT count(*) FROM t WHERE name > 3 OR n = 1").contains("cannot compare"));
+        assert!(err("SELECT name + 1 FROM t").contains("cannot apply"));
+        assert!(err("SELECT 9223372036854775807 + n FROM t").contains("overflow"));
+        // a TIMESTAMP or a UUID compares with text as that type, inside expressions too
+        assert_eq!(one("SELECT count(*) FROM t WHERE at > '2026-10-10' OR n = 99")[0][0], Value::Int(1));
+        assert_eq!(one("SELECT count(*) FROM t WHERE id = '0190D3C87C4B7A3E9F00000000000002' OR n = 99")[0][0], Value::Int(1));
+        assert_eq!(one("SELECT CAST(at AS TEXT) FROM t WHERE n = 1")[0][0], Value::Text("2026-10-01T00:00:00Z".into()));
+        assert_eq!(one("SELECT EXTRACT(MONTH FROM at), date(at, '+1 day') FROM t WHERE n = 2")[0], vec![Value::Int(10), Value::Text("2026-10-21".into())]);
+        assert_eq!(one("SELECT doc ->> '$.n', doc -> 'tags', json_array_length(doc, '$.tags') FROM t WHERE n = 1")[0], vec![Value::Int(5), Value::Text("[\"a\",\"b\"]".into()), Value::Int(2)]);
+        let now = one("SELECT now()")[0][0].clone(); assert!(matches!(now, Value::Int(us) if us > 1_700_000_000_000_000), "now() is a TIMESTAMP in microseconds");
+        let types = |q: &str| s.columns(&s.prepare(q).unwrap()).iter().map(|c| c.1.clone()).collect::<Vec<_>>();
+        assert_eq!(types("SELECT now(), n + 1, name || 'x' FROM t"), vec![Some(ColType::Timestamp), Some(ColType::Int), Some(ColType::Text(0))]);
+        assert_eq!(types("SELECT avg(n), count(*) * 2, max(at) FROM t"), vec![Some(ColType::Float), Some(ColType::Int), Some(ColType::Timestamp)]);
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn writes_with_expressions() {
+        let (s, d) = db("writes");
+        let one = |q: &str| s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        one("UPDATE t SET n = n * 10 + 1, nick = coalesce(nick, lower(name)) WHERE id = '0190d3c8-7c4b-7a3e-9f00-000000000001'");
+        assert_eq!(one("SELECT n, nick FROM t WHERE id = '0190d3c8-7c4b-7a3e-9f00-000000000001'")[0], vec![Value::Int(11), Value::Text("alice".into())]);
+        one("UPDATE t SET at = '2027-01-01' WHERE id = '0190d3c8-7c4b-7a3e-9f00-000000000001'");
+        assert!(s.exec_s(&mut Session::default(), "UPDATE t SET n = n / 0 WHERE id = '0190d3c8-7c4b-7a3e-9f00-000000000002'", &[]).is_err(), "an error in SET changes nothing");
+        assert_eq!(one("SELECT n FROM t WHERE n = 2")[0][0], Value::Int(2));
+        one("DELETE FROM t WHERE name LIKE 'b%' OR n > 100");
+        assert_eq!(one("SELECT count(*) FROM t")[0][0], Value::Int(1));
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+}
+#[cfg(test)]
+mod insert_tests {
+    use super::*;
+    use crate::config::Config;
+    fn db(name: &str) -> (Arc<Sql>, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("sqweezdb-ins-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        for q in ["CREATE TABLE kv (k INTEGER PRIMARY KEY, email VARCHAR(40) UNIQUE, n INT DEFAULT 0, at TIMESTAMP)", "INSERT INTO kv (k, email, n) VALUES (1, 'a@x', 1), (2, 'b@x', 2)",
+                  "CREATE TABLE logins (id SERIAL PRIMARY KEY, who VARCHAR(40), at TIMESTAMP DEFAULT now())"] { s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
+        (s, d)
+    }
+    fn rows(s: &Sql, q: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")) }
+    #[test] fn insert_from_a_select() {
+        let (s, d) = db("select");
+        rows(&s, "INSERT INTO logins (who) SELECT email FROM kv WHERE n >= 1 ORDER BY k");
+        let r = rows(&s, "SELECT id, who FROM logins ORDER BY id");
+        assert_eq!(r.iter().map(|x| x[1].clone()).collect::<Vec<_>>(), vec![Value::Text("a@x".into()), Value::Text("b@x".into())]);
+        assert!(r.iter().all(|x| matches!(x[0], Value::Int(_))), "automatic ids are filled");
+        assert_eq!(rows(&s, "SELECT count(*) FROM logins WHERE at IS NOT NULL")[0][0], Value::Int(2), "defaults are filled");
+        rows(&s, "INSERT INTO kv (k, email, n) SELECT k + 10, upper(email), n * 100 FROM kv");
+        assert_eq!(rows(&s, "SELECT email, n FROM kv WHERE k = 12")[0], vec![Value::Text("B@X".into()), Value::Int(200)]);
+        assert!(s.exec_s(&mut Session::default(), "INSERT INTO kv (k, email) SELECT k FROM kv", &[]).unwrap_err().contains("gives 1 column for 2"));
+        assert!(s.exec_s(&mut Session::default(), "INSERT INTO kv (k, email) SELECT k, email FROM kv", &[]).is_err(), "duplicate keys: all or none");
+        assert_eq!(rows(&s, "SELECT count(*) FROM kv")[0][0], Value::Int(4));
+        let r = rows(&s, "INSERT INTO kv (k, email) SELECT 100, 'c@x' RETURNING k, n");
+        assert_eq!(r, vec![vec![Value::Int(100), Value::Int(0)]], "SELECT without FROM as the source; RETURNING sees the default");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn upserts() {
+        let (s, d) = db("upsert");
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (1, 'a@x', 5) ON CONFLICT (k) DO UPDATE SET n = kv.n + excluded.n");
+        assert_eq!(rows(&s, "SELECT n FROM kv WHERE k = 1")[0][0], Value::Int(6));
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (3, 'c@x', 7) ON CONFLICT (k) DO UPDATE SET n = excluded.n");
+        assert_eq!(rows(&s, "SELECT n FROM kv WHERE k = 3")[0][0], Value::Int(7), "no conflict: inserted");
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (9, 'b@x', 50) ON CONFLICT (email) DO UPDATE SET n = n + 1 WHERE kv.n < 3");
+        assert_eq!(rows(&s, "SELECT k, n FROM kv WHERE email = 'b@x'")[0], vec![Value::Int(2), Value::Int(3)], "conflict on the UNIQUE column updates that row");
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (9, 'b@x', 50) ON CONFLICT (email) DO UPDATE SET n = n + 1 WHERE kv.n < 3");
+        assert_eq!(rows(&s, "SELECT n FROM kv WHERE email = 'b@x'")[0][0], Value::Int(3), "the WHERE of DO UPDATE skips");
+        rows(&s, "INSERT INTO kv (k, email, n) VALUES (1, 'zz@x', 0), (4, 'd@x', 4) ON CONFLICT DO NOTHING");
+        assert_eq!(rows(&s, "SELECT count(*) FROM kv")[0][0], Value::Int(4));
+        rows(&s, "INSERT OR IGNORE INTO kv (k, email) VALUES (4, 'other@x')");
+        assert_eq!(rows(&s, "SELECT email FROM kv WHERE k = 4")[0][0], Value::Text("d@x".into()));
+        rows(&s, "INSERT OR REPLACE INTO kv (k, email, n) VALUES (4, 'a@x', 44)");
+        assert_eq!(rows(&s, "SELECT k, email, n FROM kv WHERE email = 'a@x'"), vec![vec![Value::Int(4), Value::Text("a@x".into()), Value::Int(44)]], "REPLACE removes both rows it collides with");
+        assert_eq!(rows(&s, "SELECT count(*) FROM kv")[0][0], Value::Int(3));
+        let r = rows(&s, "INSERT INTO kv (k, email, n) VALUES (2, 'b@x', 1) ON CONFLICT (k) DO UPDATE SET n = 100 RETURNING k, n");
+        assert_eq!(r, vec![vec![Value::Int(2), Value::Int(100)]], "RETURNING gives the updated row");
+        // inside a transaction, the conflict check sees the transaction's own rows
+        let mut se = Session::default();
+        for q in ["BEGIN", "INSERT INTO kv (k, email, n) VALUES (50, 'e@x', 1)", "INSERT INTO kv (k, email, n) VALUES (50, 'e@x', 1) ON CONFLICT (k) DO UPDATE SET n = kv.n + 1", "COMMIT"] { s.exec_s(&mut se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
+        assert_eq!(rows(&s, "SELECT n FROM kv WHERE k = 50")[0][0], Value::Int(2));
+        assert!(s.exec_s(&mut Session::default(), "INSERT INTO kv (k, email) VALUES (60, 'f@x') ON CONFLICT DO UPDATE SET n = 1", &[]).is_err(), "DO UPDATE needs a target");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn deletes_in_a_transaction_survive_a_restart() {
+        let (s, d) = db("txndel");
+        let mut se = Session::default();
+        for q in ["INSERT INTO kv (k, email, n) VALUES (3, 'c@x', 3), (300, 'big@x', 300)", "BEGIN", "DELETE FROM kv WHERE k = 1", "DELETE FROM kv WHERE k = 300", "COMMIT"] { s.exec_s(&mut se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
+        assert_eq!(rows(&s, "SELECT k FROM kv ORDER BY k"), vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+        drop(s);
+        let s = Sql::open_with(&d, Config::default()).unwrap();   // replayed from the log
+        assert_eq!(rows(&s, "SELECT k FROM kv ORDER BY k"), vec![vec![Value::Int(2)], vec![Value::Int(3)]], "the transaction's deletes are replayed");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test] fn unique_values_freed_in_a_transaction() {
+        let (s, d) = db("freed");
+        let run = |qs: &[&str]| { let mut se = Session::default(); for q in qs { s.exec_s(&mut se, q, &[]).map_err(|e| { let _ = s.exec_s(&mut se, "ROLLBACK", &[]); format!("{q}: {e}") })?; } Ok::<_, String>(()) };
+        // delete a row, give its UNIQUE value to a new row
+        run(&["BEGIN", "DELETE FROM kv WHERE k = 1", "INSERT INTO kv (k, email) VALUES (3, 'a@x')", "COMMIT"]).unwrap();
+        assert_eq!(rows(&s, "SELECT k FROM kv WHERE email = 'a@x'"), vec![vec![Value::Int(3)]]);
+        // swap two rows' UNIQUE values
+        run(&["BEGIN", "UPDATE kv SET email = 'b@x' WHERE k = 3", "UPDATE kv SET email = 'a@x' WHERE k = 2", "COMMIT"]).unwrap();
+        assert_eq!(rows(&s, "SELECT k, email FROM kv ORDER BY k"), vec![vec![Value::Int(2), Value::Text("a@x".into())], vec![Value::Int(3), Value::Text("b@x".into())]]);
+        // a value still held, or taken twice in one transaction, is a duplicate; nothing is written
+        assert!(run(&["BEGIN", "INSERT INTO kv (k, email) VALUES (4, 'a@x')", "COMMIT"]).is_err());
+        assert!(run(&["BEGIN", "DELETE FROM kv WHERE k = 2", "INSERT INTO kv (k, email) VALUES (4, 'a@x')", "INSERT INTO kv (k, email) VALUES (5, 'a@x')", "COMMIT"]).is_err());
+        assert_eq!(rows(&s, "SELECT k FROM kv ORDER BY k"), vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+        // the index stays right after the swap: each value finds one row, and survives a reopen
+        drop(s);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        assert_eq!(rows(&s, "SELECT k FROM kv WHERE email = 'b@x'"), vec![vec![Value::Int(3)]]);
+        assert!(s.exec_s(&mut Session::default(), "INSERT INTO kv (k, email) VALUES (6, 'b@x')", &[]).is_err());
+        drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 }

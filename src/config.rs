@@ -92,7 +92,10 @@ pub struct LivePolicy { pub debounce: Duration, pub queue: usize }
 impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Duration::from_millis(5), queue: 65536 } } }
 #[derive(Clone, Debug, Default)]
 pub struct LogPolicy { /// Log threads leave after this long without writes and return on the next one (many idle databases per process).
-    pub threads_idle_after: Option<Duration> }
+    pub threads_idle_after: Option<Duration>,
+    /// With durable off: hold the background fsync up to this long so one sync covers more writes (many small databases
+    /// per disk). A crash of the machine can lose up to this much; anything waiting for durability still syncs at once.
+    pub sync_delay: Option<Duration> }
 
 // ---------- the file / JSON form: every field optional, overlaid in precedence order ----------
 
@@ -132,7 +135,7 @@ pub struct ListenFile { pub socket: Option<String>, pub tcp: Option<String>, pub
 pub struct LiveFile { pub debounce: Option<Dur>, pub queue: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct LogFile { #[serde(alias = "threads_idle_after")] pub threads_idle_after: Option<Dur> }
+pub struct LogFile { #[serde(alias = "threads_idle_after")] pub threads_idle_after: Option<Dur>, #[serde(alias = "sync_delay")] pub sync_delay: Option<Dur> }
 
 fn pick<T>(base: Option<T>, over: Option<T>) -> Option<T> { over.or(base) }
 fn nest<T>(base: Option<T>, over: Option<T>, f: impl Fn(T, T) -> T) -> Option<T> { match (base, over) { (Some(a), Some(b)) => Some(f(a, b)), (a, b) => b.or(a) } }
@@ -147,7 +150,7 @@ impl ConfigFile {
             snapshot: nest(self.snapshot, o.snapshot, |a, b| SnapshotFile { log_bytes: pick(a.log_bytes, b.log_bytes), idle_after: pick(a.idle_after, b.idle_after) }),
             listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
-            log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after) }),
+            log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
         }
     }
     /// Defaults, validation, and typed values. Errors name the key.
@@ -179,7 +182,10 @@ impl ConfigFile {
             if c.listen.http.is_some() && c.listen.token.is_none() { return Err("listen.http needs listen.token (the web console asks for it)".into()); }
         }
         if let Some(l) = self.live { if let Some(d) = l.debounce { c.live.debounce = dur_of(d, "live.debounce")?; } if let Some(q) = l.queue { c.live.queue = q.max(16); } }
-        if let Some(l) = self.log { if let Some(d) = l.threads_idle_after { let d = dur_of(d, "log.threadsIdleAfter")?; c.log.threads_idle_after = if d.is_zero() { None } else { Some(d) }; } }
+        if let Some(l) = self.log {
+            if let Some(d) = l.threads_idle_after { let d = dur_of(d, "log.threadsIdleAfter")?; c.log.threads_idle_after = if d.is_zero() { None } else { Some(d) }; }
+            if let Some(d) = l.sync_delay { let d = dur_of(d, "log.syncDelay")?; if d > Duration::from_secs(60) { return Err("log.syncDelay: at most 60s".into()); } c.log.sync_delay = if d.is_zero() { None } else { Some(d) }; }
+        }
         Ok(c)
     }
 }
@@ -248,6 +254,9 @@ mod tests {
         assert!(Config::from_json(r#"{"listen":{"tcp":"0.0.0.0:1"}}"#).is_err(), "tcp needs a token");
         assert!(Config::from_json(r#"{"backup":{"bucket":"b"}}"#).unwrap_err().contains("endpoint"));
         assert!(Config::from_json(r#"{"snapsot":{}}"#).unwrap_err().contains("snapsot"), "typos are errors");
+        assert_eq!(c.log.sync_delay, None, "fsync right away unless asked");
+        assert_eq!(Config::from_json(r#"{"log":{"syncDelay":"200ms","threadsIdleAfter":"1s"}}"#).unwrap().log.sync_delay, Some(Duration::from_millis(200)));
+        assert!(Config::from_json(r#"{"log":{"syncDelay":"5m"}}"#).unwrap_err().contains("syncDelay"));
     }
     #[test] fn file_then_code_then_env() {
         let dir = std::env::temp_dir().join(format!("sqweezdb-config-test-{}", std::process::id())); std::fs::create_dir_all(&dir).unwrap();

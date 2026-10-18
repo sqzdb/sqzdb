@@ -2,7 +2,7 @@
 //! live queries kept fresh by invalidation. One reactor thread per database reads the in-process change ring, evaluates
 //! compiled predicates on the raw row bytes, and pushes events into bounded per-subscriber queues. Writers never wait.
 use crate::sql::{Access, Change, ChangeOp, Cmp, CPred, Expr, Plan, Pred, Prepared, Proj, SelectPlan, Session, Sql, P_SELECT};
-use crate::table::{decode_col, read_key, Value, OP_DELETE, OP_INSERT, OP_UPDATE};
+use crate::table::{decode_col, read_key, ColType, Value, OP_DELETE, OP_INSERT, OP_UPDATE};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,7 +32,7 @@ impl Drop for Subscription { fn drop(&mut self) { self.q.closed.store(true, Orde
 
 /// `since`: the log position when the subscription was made; it receives exactly the changes committed after it.
 struct Sub { table: u16, preds: Vec<CPred>, policies: Vec<CPred>, q: Arc<Queue>, key: Option<(usize, i64)>, since: u64 }
-struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<usize>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, q: Arc<Queue> }
+struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<(usize, ColType)>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, q: Arc<Queue> }
 /// Subscriptions whose filter is `col = constant` on an INT column are indexed by (table, column, value): a record
 /// reaches them through one hash lookup per indexed column instead of a scan over every subscriber.
 #[derive(Default)] struct State { subs: Vec<Sub>, lives: Vec<Live>, keyed: HashMap<(u16, usize, i64), Vec<usize>>, key_cols: HashMap<u16, Vec<usize>>, general: HashMap<u16, Vec<usize>> }
@@ -61,9 +61,11 @@ fn tables_of(sp: &SelectPlan, out: &mut Vec<u16>) {
     if let Some(j) = &sp.join { out.push(j.probe.id); for st in &j.steps { out.push(st.build.id); } }
     for (s, _) in &sp.subs { tables_of(s, out); }
     for p in &sp.preds { if let Expr::Set(s) | Expr::Scalar(s) = &p.rhs { tables_of(s, out); } }
+    for x in sp.exprs.iter().chain(&sp.filters) { x.walk(&mut |n| if let crate::expr::SExpr::Sub(s) = n { tables_of(s, out); }); }
     out.sort_unstable(); out.dedup();
 }
-fn key_of(row: &[Value], key_col: Option<usize>) -> Option<crate::table::Key> { match (key_col, row) { (Some(c), r) => match r.get(c) { Some(Value::Int(i)) => Some(*i as i128), Some(Value::Text(t)) => crate::table::parse_uuid(t).map(|b| crate::table::key_from_uuid(&b)), _ => None }, _ => None } }
+/// A result row's key, for telling added rows from removed ones: `key_col` is the key column and its type.
+fn key_of(row: &[Value], key_col: &Option<(usize, ColType)>) -> Option<crate::table::Key> { let (c, ty) = key_col.as_ref()?; crate::table::value_key128(ty, row.get(*c)?) }
 
 impl Reactor {
     pub fn start(sql: Arc<Sql>) -> Arc<Reactor> {
@@ -101,9 +103,8 @@ impl Reactor {
                     else if *op == OP_DELETE { for ((tid, _, _), ix) in st.keyed.iter() { if *tid == t.id { cands.extend_from_slice(ix); } } }  // a key-only delete cannot be filtered: deliver to all
                     if let Some(g) = st.general.get(&t.id) { cands.extend_from_slice(g); }
                     if !cands.is_empty() {
-                        let pk = if is_row { t.pk_of(payload) } else { t.schema.key_from_bytes(&payload[..t.schema.key_width()]) };
                         let row = if is_row { Some((0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect()) } else { None };
-                        let ch = Arc::new(Change { seq: *seq, table: t.schema.name.clone(), op: match *op { OP_INSERT => ChangeOp::Insert, OP_UPDATE => ChangeOp::Update, _ => ChangeOp::Delete }, pk: t.schema.key_value(pk), row });
+                        let ch = Arc::new(Change { seq: *seq, table: t.schema.name.clone(), op: match *op { OP_INSERT => ChangeOp::Insert, OP_UPDATE => ChangeOp::Update, _ => ChangeOp::Delete }, pk: t.schema.delete_pk_value(payload), row });
                         for &i in &cands {
                             let sub = &st.subs[i]; if *seq <= sub.since { continue; }
                             let pass = if is_row { sub.preds.iter().all(|p| p.eval(payload)) && sub.policies.iter().all(|p| p.eval(payload)) } else { *op == OP_DELETE };
@@ -115,7 +116,7 @@ impl Reactor {
                     for live in st.lives.iter_mut() {
                         if live.dirty_since.is_some() || !live.tables.contains(&t.id) { continue; }
                         let dirty = match &live.single {
-                            Some((tid, preds, pols)) if *tid == t.id => { let pk = if is_row { t.pk_of(payload) } else { t.schema.key_from_bytes(&payload[..t.schema.key_width()]) }; (is_row && preds.iter().all(|p| p.eval(payload)) && pols.iter().all(|p| p.eval(payload))) || (live.key_col.is_some() && live.keys.contains(&pk)) || (!is_row && live.key_col.is_none()) }
+                            Some((tid, preds, pols)) if *tid == t.id => { let pk = if is_row { t.pk_of(payload) } else { t.schema.delete_key(payload) }; (is_row && preds.iter().all(|p| p.eval(payload)) && pols.iter().all(|p| p.eval(payload))) || (live.key_col.is_some() && live.keys.contains(&pk)) || (!is_row && live.key_col.is_none()) }
                             _ => true,
                         };
                         if dirty { live.dirty_since = Some(now); }
@@ -132,8 +133,8 @@ impl Reactor {
                 self.reruns.fetch_add(1, Ordering::Relaxed); self.rerun_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 live.dirty_since = None;
                 if rows != live.result {
-                    let (added, removed) = match live.key_col { Some(c) => { let old: HashSet<crate::table::Key> = live.keys.clone(); let new: HashSet<crate::table::Key> = rows.iter().filter_map(|r| key_of(r, Some(c))).collect(); (rows.iter().filter(|r| key_of(r, Some(c)).map(|k| !old.contains(&k)).unwrap_or(true)).cloned().collect(), live.result.iter().filter(|r| key_of(r, Some(c)).map(|k| !new.contains(&k)).unwrap_or(true)).cloned().collect()) } None => (rows.clone(), live.result.clone()) };
-                    live.keys = rows.iter().filter_map(|r| key_of(r, live.key_col)).collect();
+                    let (added, removed) = match live.key_col.clone() { Some(kc) => { let kc = Some(kc); let old: HashSet<crate::table::Key> = live.keys.clone(); let new: HashSet<crate::table::Key> = rows.iter().filter_map(|r| key_of(r, &kc)).collect(); (rows.iter().filter(|r| key_of(r, &kc).map(|k| !old.contains(&k)).unwrap_or(true)).cloned().collect(), live.result.iter().filter(|r| key_of(r, &kc).map(|k| !new.contains(&k)).unwrap_or(true)).cloned().collect()) } None => (rows.clone(), live.result.clone()) };
+                    live.keys = rows.iter().filter_map(|r| key_of(r, &live.key_col)).collect();
                     live.result = rows.clone();
                     if !live.q.push(Event::Live { seq: self.last_seq.load(Ordering::Relaxed), rows, added, removed }) { live.q.closed.store(true, Ordering::Relaxed); }
                     self.events.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +147,7 @@ impl Reactor {
         let sql = self.sql.upgrade().ok_or("database is closed")?; let p = sql.prepare(text)?;
         let Plan::Select(sp) = &p.plan else { return Err("subscribe needs a SELECT".into()) };
         if sp.join.is_some() || !sp.subs.is_empty() { return Err("subscribe needs a single-table SELECT (watch handles joins)".into()); }
+        if !sp.filters.is_empty() { return Err("subscribe filters by columns compared with values (=, <, IN, IS NULL …); use watch for other conditions".into()); }
         let preds = plan_preds(&sql, sess, sp, params)?; let policies = sql.guard(sess, &sp.table, P_SELECT)?;
         // an equality on an INT column with a constant makes the subscription indexable
         let key = { let mut all: Vec<Pred> = sp.preds.clone(); match &sp.access { Access::Pk(e) => all.push(Pred { col: sp.table.schema.pk, cmp: Cmp::Eq, rhs: e.clone() }), Access::Index(ix, e) => all.push(Pred { col: ix.col, cmp: Cmp::Eq, rhs: e.clone() }), _ => {} }
@@ -160,10 +162,10 @@ impl Reactor {
         let Plan::Select(sp) = &p.plan else { return Err("watch needs a SELECT".into()) };
         let mut tables = vec![]; tables_of(sp, &mut tables);
         let single = if sp.join.is_none() && sp.subs.is_empty() { Some((sp.table.id, plan_preds(&sql, sess, sp, params)?, sql.guard(sess, &sp.table, P_SELECT)?)) } else { None };
-        let key_col = if sp.join.is_none() { sp.proj.iter().position(|pr| matches!(pr, Proj::Col(c) if *c == sp.table.schema.pk)) } else { None };
+        let key_col = if sp.join.is_none() && sp.post.is_none() { sp.proj.iter().position(|pr| matches!(pr, Proj::Col(c) if *c == sp.table.schema.pk)).map(|i| (i, sp.table.schema.columns[sp.table.schema.pk].ty.clone())) } else { None };
         let mut s = session_like(sess); let result = sql.execute_s(&mut s, &p, params)?;
         let q = Arc::new(Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), cap: 4096, closed: AtomicBool::new(false), delivered: AtomicU64::new(0) });
-        let keys = result.iter().filter_map(|r| key_of(r, key_col)).collect();
+        let keys = result.iter().filter_map(|r| key_of(r, &key_col)).collect();
         self.state.lock().unwrap().lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables, single, key_col, result: result.clone(), keys, dirty_since: None, q: q.clone() });
         Ok((Subscription { q }, result))
     }

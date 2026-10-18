@@ -78,6 +78,7 @@ type Live struct {
 }
 type Log struct {
 	ThreadsIdleAfter string `json:"threadsIdleAfter,omitempty"`
+	SyncDelay        string `json:"syncDelay,omitempty"` // with durable off: hold the background fsync this long so it covers more writes
 }
 
 // Open opens or creates the database directory; durable waits for the disk on every commit.

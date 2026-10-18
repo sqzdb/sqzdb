@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents · sqweezdb demo</title>
+<style>
+:root { --bg:#141518; --panel:#1b1d21; --raised:#212429; --hover:#272a30; --line:#2b2e34; --line-2:#383c43; --text:#e8eaed; --text-2:#b0b5bd; --text-3:#858b94;
+  --ok:#5cc98f; --ok-bg:rgba(92,201,143,.12); --warn:#e8b55c; --warn-bg:rgba(232,181,92,.12); --bad:#ff7070; --bad-bg:rgba(255,112,112,.10); --info:#8fb3ff; --info-bg:rgba(143,179,255,.12);
+  --sans:system-ui,-apple-system,"Segoe UI","Helvetica Neue",sans-serif; --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace; color-scheme:dark }
+* { box-sizing:border-box } html, body { height:100% }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 var(--sans); -webkit-font-smoothing:antialiased }
+button, input, textarea { font:inherit; color:inherit }
+:focus-visible { outline:2px solid #9aa4b2; outline-offset:2px }
+.hidden { display:none !important }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; height:32px; padding:0 12px; border-radius:7px; border:1px solid var(--line-2); background:var(--raised); cursor:pointer; white-space:nowrap }
+.btn:hover { background:var(--hover) } .btn:disabled { opacity:.5; cursor:default }
+.btn-primary { background:var(--text); color:var(--bg); border-color:var(--text); font-weight:600 } .btn-primary:hover { background:#fff }
+.btn-ghost { background:transparent; border-color:transparent; color:var(--text-2) } .btn-ghost:hover { color:var(--text); background:var(--hover) }
+.btn-danger { color:var(--bad); border-color:rgba(255,112,112,.35); background:transparent } .btn-danger:hover { background:var(--bad-bg) }
+.btn-danger.armed { background:var(--bad); color:#141518; border-color:var(--bad); font-weight:600 }
+.input { height:34px; padding:0 11px; border-radius:7px; border:1px solid var(--line-2); background:var(--bg); color:var(--text); min-width:0; width:100% }
+.input:focus, textarea:focus { outline:none; border-color:#5b616b; box-shadow:0 0 0 3px rgba(154,164,178,.18) }
+.mono { font-family:var(--mono) }
+/* layout */
+.app { display:grid; grid-template-rows:auto 1fr; height:100% }
+.top { display:flex; align-items:center; gap:18px; padding:10px 20px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap }
+.brand { font-weight:800; letter-spacing:-.02em; white-space:nowrap } .brand span { color:var(--text-3); font-weight:600 }
+.stats { display:flex; gap:6px; flex-wrap:wrap; margin-left:auto }
+.stat { display:flex; flex-direction:column; padding:4px 12px; border-radius:8px; background:var(--raised); border:1px solid var(--line); min-width:96px }
+.stat b { font-size:15px; font-variant-numeric:tabular-nums; font-weight:650 } .stat small { color:var(--text-3); font-size:11px; letter-spacing:.02em; white-space:nowrap }
+.stat.live b { color:var(--ok) }
+.body { display:grid; grid-template-columns:300px minmax(0,1fr); min-height:0 }
+aside { border-right:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0 }
+.side-head { padding:14px 14px 10px; display:flex; flex-direction:column; gap:10px }
+.side-head .row { display:flex; gap:8px }
+.count { color:var(--text-3); font-size:12px; padding:0 14px 6px; display:flex; justify-content:space-between }
+.agents { flex:1; overflow:auto; padding:0 8px 8px }
+.agent { display:flex; align-items:center; gap:10px; width:100%; padding:7px 8px; border:0; border-radius:7px; background:transparent; cursor:pointer; text-align:left; font-family:var(--mono); font-size:13px; color:var(--text-2) }
+.agent:hover { background:var(--hover); color:var(--text) } .agent.sel { background:var(--raised); color:var(--text); box-shadow:inset 0 0 0 1px var(--line-2) }
+.dot { width:7px; height:7px; border-radius:50%; background:var(--line-2); flex:none } .dot.on { background:var(--ok); box-shadow:0 0 0 3px var(--ok-bg) }
+.fleet { border-top:1px solid var(--line); padding:12px 14px 14px; display:flex; flex-direction:column; gap:8px }
+.fleet h3 { margin:0; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-3) }
+.fleet .row { display:flex; gap:8px } .fleet .row .btn { flex:1 }
+.fleet .note { color:var(--text-3); font-size:12px; min-height:18px }
+main { min-height:0; overflow:auto }
+.wrap { max-width:860px; margin:0 auto; padding:24px 24px 48px; display:flex; flex-direction:column; gap:18px }
+/* intro */
+.intro h1 { margin:0 0 6px; font-size:22px; letter-spacing:-.01em } .intro p { margin:0; color:var(--text-2); max-width:640px }
+.facts { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:12px; margin-top:18px }
+.fact { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px }
+.fact b { display:block; font-size:20px; letter-spacing:-.01em } .fact span { color:var(--text-3); font-size:13px }
+.steps { margin:18px 0 0; padding:0; list-style:none; display:flex; flex-direction:column; gap:8px; color:var(--text-2) }
+.steps li { display:flex; gap:10px } .steps li i { font-style:normal; width:22px; height:22px; flex:none; display:grid; place-items:center; border-radius:50%; background:var(--raised); border:1px solid var(--line-2); font-size:12px; color:var(--text) }
+/* agent */
+.head { display:flex; align-items:flex-start; gap:14px; flex-wrap:wrap }
+.head h1 { margin:0; font:650 20px/1.3 var(--mono); word-break:break-all }
+.chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px }
+.chip { font-size:12px; padding:2px 9px; border-radius:999px; background:var(--raised); border:1px solid var(--line); color:var(--text-2); white-space:nowrap }
+.chip.ok { color:var(--ok); background:var(--ok-bg); border-color:transparent } .chip.info { color:var(--info); background:var(--info-bg); border-color:transparent }
+.head .spacer { flex:1 }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px }
+.compose { display:flex; flex-direction:column; gap:10px }
+.kinds { display:flex; gap:4px } .kind { height:28px; padding:0 10px; border-radius:6px; border:1px solid transparent; background:transparent; color:var(--text-3); cursor:pointer; font-size:13px }
+.kind:hover { color:var(--text) } .kind.on { background:var(--raised); border-color:var(--line-2); color:var(--text) }
+textarea { width:100%; min-height:64px; resize:vertical; padding:9px 11px; border-radius:7px; border:1px solid var(--line-2); background:var(--bg); color:var(--text) }
+.compose .row { display:flex; align-items:center; gap:10px } .compose .hint { color:var(--text-3); font-size:12px; margin-right:auto }
+.recall { display:flex; gap:8px; align-items:center }
+.list { display:flex; flex-direction:column }
+.mem { display:grid; grid-template-columns:52px minmax(0,1fr) auto; gap:12px; align-items:baseline; padding:10px 4px; border-bottom:1px solid var(--line) }
+.mem:last-child { border-bottom:0 }
+.badge { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; text-align:center; padding:1px 0; border-radius:5px; background:var(--raised); color:var(--text-2) }
+.badge.fact { color:var(--info); background:var(--info-bg) } .badge.task { color:var(--warn); background:var(--warn-bg) } .badge.step { color:var(--text-3) }
+.mem .txt { word-break:break-word } .mem time { color:var(--text-3); font-size:12px; white-space:nowrap; font-variant-numeric:tabular-nums }
+.mem.flash { animation:flash 1.4s ease-out } @keyframes flash { 0% { background:rgba(92,201,143,.14) } 100% {} }
+.empty { color:var(--text-3); padding:22px 4px; text-align:center }
+.err { color:var(--bad); font-size:13px }
+.sec-title { display:flex; align-items:center; gap:10px; margin:0 0 6px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-3) }
+@media (max-width: 760px) {
+  .body { grid-template-columns:1fr; grid-template-rows:auto 1fr } aside { border-right:0; border-bottom:1px solid var(--line); max-height:42vh }
+  .facts { grid-template-columns:1fr } .stats { margin-left:0 } .wrap { padding:16px }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">Agents <span>· a database per agent on sqweezdb</span></div>
+    <div class="stats" id="stats">
+      <div class="stat"><b id="s-agents">–</b><small>agents on disk</small></div>
+      <div class="stat"><b id="s-open">–</b><small>open right now</small></div>
+      <div class="stat live"><b id="s-rate">0</b><small>memories / s</small></div>
+      <div class="stat"><b id="s-reopen">–</b><small>avg open from disk</small></div>
+      <div class="stat"><b id="s-mem">–</b><small>server memory</small></div>
+    </div>
+  </header>
+  <div class="body">
+    <aside>
+      <div class="side-head">
+        <div class="row"><input class="input" id="filter" placeholder="Find an agent" autocomplete="off" spellcheck="false"><button class="btn btn-primary" id="new" title="Create an agent: a new database directory">New</button></div>
+      </div>
+      <div class="count"><span id="listcount"></span><span id="opencount"></span></div>
+      <div class="agents" id="agents" role="listbox" aria-label="Agents"></div>
+      <div class="fleet">
+        <h3>Fleet</h3>
+        <div class="row"><button class="btn" id="spawn">Spawn 1,000</button><button class="btn" id="swarm">Run swarm 15 s</button></div>
+        <div class="note" id="fleetnote"></div>
+      </div>
+    </aside>
+    <main><div class="wrap" id="view"></div></main>
+  </div>
+</div>
+<template id="intro">
+  <section class="intro">
+    <h1>Every agent gets its own database.</h1>
+    <p>Each agent here is a directory with its own sqweezdb database: created in a fraction of a millisecond, closed when idle, opened again from disk when the agent wakes up. Forgetting an agent deletes its directory, so nothing about it is left in a shared table.</p>
+    <div class="facts">
+      <div class="fact"><b id="f-create">–</b><span>to create an agent</span></div>
+      <div class="fact"><b id="f-open">–</b><span>to open a sleeping one</span></div>
+      <div class="fact"><b id="f-open-max">–</b><span>kept open at once, the rest sleep</span></div>
+    </div>
+    <ol class="steps">
+      <li><i>1</i><span>Press <b>New</b> or pick an agent on the left, then give it a few memories.</span></li>
+      <li><i>2</i><span><b>Spawn 1,000</b> creates a thousand agents with five memories each.</span></li>
+      <li><i>3</i><span><b>Run swarm</b> sets random agents working for 15 seconds, 2,000 memories a second between them. Watch the open count and the server's memory. Idle agents close after <span id="f-idle">two minutes</span>.</span></li>
+    </ol>
+  </section>
+</template>
+<template id="agentview">
+  <section class="head">
+    <div>
+      <h1 id="a-name"></h1>
+      <div class="chips" id="a-chips"></div>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn btn-danger" id="forget">Forget agent</button>
+  </section>
+  <section class="card compose">
+    <div class="kinds" role="radiogroup" aria-label="Kind of memory">
+      <button class="kind on" data-kind="note" role="radio" aria-checked="true">Note</button>
+      <button class="kind" data-kind="fact" role="radio" aria-checked="false">Fact</button>
+      <button class="kind" data-kind="task" role="radio" aria-checked="false">Task</button>
+    </div>
+    <textarea id="body" placeholder="Something this agent should remember" maxlength="2000" spellcheck="false" data-gramm="false" data-gramm_editor="false" data-enable-grammarly="false"></textarea>
+    <div class="row"><span class="hint">Enter to save · Shift+Enter for a new line</span><span class="err" id="a-err"></span><button class="btn btn-primary" id="remember">Remember</button></div>
+  </section>
+  <section>
+    <div class="sec-title">Memory <span id="a-count"></span></div>
+    <div class="recall"><input class="input" id="q" placeholder="Recall memories that mention…" autocomplete="off" spellcheck="false" data-gramm="false"><button class="btn btn-ghost" id="clearq" title="Clear">Clear</button></div>
+    <div class="list" id="mems"></div>
+  </section>
+</template>
+<script>
+(() => {
+  const $ = (s, el = document) => el.querySelector(s);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const api = async (method, path, body) => {
+    const r = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    return j;
+  };
+  const fmtN = (n) => n == null ? '–' : n.toLocaleString('en-US');
+  const fmtMs = (ms) => ms == null ? '–' : ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : ms < 100 ? `${ms.toFixed(1)} ms` : `${Math.round(ms)} ms`;
+  const fmtBytes = (b) => b < 1024 ? `${b} B` : b < 1 << 20 ? `${(b / 1024).toFixed(1)} KB` : `${(b / (1 << 20)).toFixed(1)} MB`;
+  const ago = (us) => { const s = Math.max(0, (Date.now() - us / 1000) / 1000); return s < 5 ? 'just now' : s < 60 ? `${Math.floor(s)} s ago` : s < 3600 ? `${Math.floor(s / 60)} min ago` : new Date(us / 1000).toLocaleString(); };
+
+  let sel = null, kind = 'note', lastSteps = null, lastT = 0, createMs = null, seen = new Set(), coldMs = null;
+  const view = $('#view');
+
+  // ---- stats strip
+  async function stats() {
+    try {
+      const s = await api('GET', '/api/stats');
+      $('#s-agents').textContent = fmtN(s.agents);
+      $('#s-open').textContent = `${fmtN(s.open)}`;
+      $('#s-mem').textContent = `${Math.round(s.rssMB)} MB`;
+      $('#s-reopen').textContent = s.opens ? fmtMs(s.openMsAvg) : '–';
+      const now = performance.now();
+      if (lastSteps != null) { const r = (s.steps - lastSteps) / ((now - lastT) / 1000); $('#s-rate').textContent = fmtN(Math.max(0, Math.round(r))); }
+      lastSteps = s.steps; lastT = now;
+      $('#swarm').disabled = s.swarm; if (s.swarm) $('#fleetnote').textContent = 'Swarm running: random agents write and recall…';
+      else if ($('#fleetnote').dataset.swarm) { delete $('#fleetnote').dataset.swarm; $('#fleetnote').textContent = 'Swarm finished. Idle agents close on their own.'; }
+      if (s.swarm) $('#fleetnote').dataset.swarm = '1';
+      $('#opencount').textContent = `${fmtN(s.open)} open · max ${fmtN(s.maxOpen)}`;
+      const fo = $('#f-open-max'); if (fo) fo.textContent = fmtN(s.maxOpen);
+      const fi = $('#f-idle'); if (fi) fi.textContent = s.idleSecs >= 60 ? `${+(s.idleSecs / 60).toFixed(1)} min` : `${s.idleSecs} s`;
+      const fopen = $('#f-open'); if (fopen) fopen.textContent = s.opens ? fmtMs(s.openMsAvg) : '≈ 0.2 ms';
+      const fc = $('#f-create'); if (fc) fc.textContent = createMs != null ? fmtMs(createMs) : '≈ 0.3 ms';
+    } catch { /* server restarting */ }
+  }
+
+  // ---- agent list
+  async function list() {
+    const q = $('#filter').value.trim().toLowerCase();
+    const r = await api('GET', `/api/agents?limit=300${q ? `&q=${encodeURIComponent(q)}` : ''}`);
+    const box = $('#agents');
+    const frag = document.createDocumentFragment();
+    for (const a of r.agents) {
+      const b = el('button', 'agent' + (a.name === sel ? ' sel' : ''));
+      b.setAttribute('role', 'option'); b.setAttribute('aria-selected', a.name === sel);
+      b.append(el('span', 'dot' + (a.open ? ' on' : '')), el('span', null, a.name));
+      b.title = a.open ? 'Open: in memory now' : 'Asleep: only its files on disk';
+      b.addEventListener('click', () => select(a.name));
+      frag.append(b);
+    }
+    if (!r.agents.length) frag.append(el('div', 'empty', q ? 'No agent matches.' : 'No agents yet. Press New.'));
+    box.replaceChildren(frag);
+    $('#listcount').textContent = r.total > r.agents.length ? `newest ${fmtN(r.agents.length)} of ${fmtN(r.total)}` : `${fmtN(r.total)} agents`;
+  }
+
+  // ---- one agent
+  async function select(name) {
+    sel = name; seen = new Set(); coldMs = null;
+    history.replaceState(null, '', `#${name}`);
+    view.replaceChildren($('#agentview').content.cloneNode(true));
+    $('#a-name').textContent = name;
+    for (const k of view.querySelectorAll('.kind')) k.addEventListener('click', () => { kind = k.dataset.kind; for (const x of view.querySelectorAll('.kind')) { x.classList.toggle('on', x === k); x.setAttribute('aria-checked', x === k); } });
+    $('#remember').addEventListener('click', remember);
+    $('#body').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); remember(); } });
+    let t; $('#q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => memories(), 150); });
+    $('#clearq').addEventListener('click', () => { $('#q').value = ''; memories(); });
+    const fg = $('#forget'); let armed = null;
+    fg.addEventListener('click', async () => {
+      if (!armed) { fg.classList.add('armed'); fg.textContent = 'Click again to delete its database'; armed = setTimeout(() => { armed = null; fg.classList.remove('armed'); fg.textContent = 'Forget agent'; }, 3500); return; }
+      clearTimeout(armed);
+      try { const r = await api('DELETE', `/api/agents/${name}`); sel = null; history.replaceState(null, '', location.pathname); intro(`${name} forgotten: its directory was deleted in ${fmtMs(r.ms)}.`); list(); }
+      catch (e) { $('#a-err').textContent = e.message; }
+    });
+    list();
+    await detail(true);
+    await memories();
+    $('#body').focus();
+  }
+
+  async function detail(first) {
+    if (!sel) return;
+    const d = await api('GET', `/api/agents/${sel}`);
+    const chips = $('#a-chips'); if (!chips) return;
+    const c = [el('span', 'chip', `${fmtN(d.memories)} ${d.memories === 1 ? 'memory' : 'memories'}`), el('span', 'chip', `${fmtBytes(d.bytes)} on disk`)];
+    if (first && d.open.cold) coldMs = d.open.ms;
+    c.push(el('span', 'chip ok', 'open'));
+    if (coldMs != null) c.push(el('span', 'chip info', `was asleep: opened from disk in ${fmtMs(coldMs)}`));
+    chips.replaceChildren(...c);
+    $('#a-count').textContent = `· ${fmtN(d.memories)}`;
+  }
+
+  async function memories() {
+    if (!sel) return;
+    const q = $('#q')?.value.trim() || '';
+    const name = sel;
+    const r = await api('GET', `/api/agents/${name}/memories?limit=50${q ? `&q=${encodeURIComponent(q)}` : ''}`);
+    if (name !== sel) return;
+    const box = $('#mems'); if (!box) return;
+    const first = seen.size === 0;
+    const frag = document.createDocumentFragment();
+    for (const m of r.memories) {
+      const row = el('div', 'mem' + (!first && !seen.has(m.id) ? ' flash' : ''));
+      row.append(el('span', `badge ${m.kind}`, m.kind), el('span', 'txt', m.body), el('time', null, ago(m.at)));
+      row.querySelector('time').title = new Date(m.at / 1000).toLocaleString();
+      frag.append(row); seen.add(m.id);
+    }
+    if (!r.memories.length) frag.append(el('div', 'empty', q ? `Nothing mentions “${q}”.` : 'No memories yet.'));
+    box.replaceChildren(frag);
+  }
+
+  async function remember() {
+    const body = $('#body').value.trim(); if (!body || !sel) return;
+    $('#a-err').textContent = '';
+    try { await api('POST', `/api/agents/${sel}/memories`, { kind, body }); $('#body').value = ''; await memories(); detail(false); }
+    catch (e) { $('#a-err').textContent = e.message; }
+  }
+
+  function intro(msg) {
+    view.replaceChildren($('#intro').content.cloneNode(true));
+    if (msg) { const n = el('div', 'card', msg); n.style.color = 'var(--text-2)'; view.prepend(n); }
+    stats();
+  }
+
+  // ---- fleet actions
+  $('#new').addEventListener('click', async () => {
+    try { const r = await api('POST', '/api/agents', {}); createMs = r.ms; await list(); select(r.name); } catch (e) { $('#fleetnote').textContent = e.message; }
+  });
+  $('#spawn').addEventListener('click', async () => {
+    const b = $('#spawn'); b.disabled = true; $('#fleetnote').textContent = 'Creating 1,000 agents…';
+    try { const r = await api('POST', '/api/swarm/spawn', { n: 1000 }); $('#fleetnote').textContent = `${fmtN(r.spawned)} agents with 5 memories each in ${(r.ms / 1000).toFixed(2)} s`; list(); }
+    catch (e) { $('#fleetnote').textContent = e.message; } finally { b.disabled = false; }
+  });
+  $('#swarm').addEventListener('click', async () => {
+    try { await api('POST', '/api/swarm/run', { secs: 15, workers: 8, rate: 2000 }); $('#fleetnote').dataset.swarm = '1'; $('#fleetnote').textContent = 'Swarm running: random agents write and recall…'; stats(); }
+    catch (e) { $('#fleetnote').textContent = e.message; }
+  });
+  let ft; $('#filter').addEventListener('input', () => { clearTimeout(ft); ft = setTimeout(list, 120); });
+
+  // ---- start
+  const start = decodeURIComponent(location.hash.slice(1));
+  if (start) select(start).catch(() => intro()); else intro();
+  list(); stats();
+  setInterval(stats, 1000);
+  setInterval(() => { list().catch(() => {}); if (sel && !$('#q')?.value) { memories().catch(() => {}); detail(false).catch(() => {}); } }, 2000);
+})();
+</script>
+</body>
+</html>

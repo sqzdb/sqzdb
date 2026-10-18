@@ -1,6 +1,6 @@
 [package]
 name = "sqweezdb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
@@ -210,6 +210,21 @@ required-features = ["lab"]
 [[bin]]
 name = "e40_tcp"
 path = "src/bin/e40_tcp.rs"
+required-features = ["lab"]
+
+[[bin]]
+name = "e53_agents"
+path = "src/bin/e53_agents.rs"
+required-features = ["lab"]
+
+[[bin]]
+name = "e54_features"
+path = "src/bin/e54_features.rs"
+required-features = ["lab"]
+
+[[bin]]
+name = "e55_sql_diff"
+path = "src/bin/e55_sql_diff.rs"
 required-features = ["lab"]
 
 [profile.release]

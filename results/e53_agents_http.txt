@@ -1,0 +1,116 @@
+E53 over HTTP: demos/agents (a database per agent, Go) vs PocketBase 0.40.5 with one shared memories collection (agent field + index), 2026-10-17
+Load tool: demos/agents/bench. 2,000 agents x 20 memories spawned from 16 clients; then random agents write one memory and recall the newest 10;
+then 100 agents forgotten (sqweezdb: delete the directory; PocketBase: list the agent's records and delete each). No fsync per commit on either side;
+the demo opens each agent with log.syncDelay 1s and log.threadsIdleAfter 300ms.
+
+#### final engine (the 'at most 200 open' rows in this block were measured on a build that also reused segments after a reopen, which was rejected; see the A/B and the final-build block at the end)
+--- run 1
+== sqweezdb, at most 2000 agents open, body VARCHAR(2000)
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.54 s (3670 agents/s, 73404 writes/s), errors 0, server CPU 523%, memory 369 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:  21452 steps/s  p50   0.34 ms  p99   0.95 ms  errors 0  other agents' memories 0  server CPU 385%, memory 1068 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:  30478 steps/s  p50   1.90 ms  p99   5.99 ms  errors 0  other agents' memories 0  server CPU 533%, memory 1948 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.32 ms  p99 5.11 ms per agent, errors 0, agents with memories left 0, disk 859M
+   files per agent: 1 log segments in bench-00001
+== sqweezdb, at most 200 agents open, body VARCHAR(2000)
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.58 s (3423 agents/s, 68465 writes/s), errors 0, server CPU 464%, memory 70 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:   4772 steps/s  p50   1.70 ms  p99   2.82 ms  errors 0  other agents' memories 0  server CPU 328%, memory 106 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   3376 steps/s  p50  18.34 ms  p99  44.65 ms  errors 0  other agents' memories 0  server CPU 296%, memory 138 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.09 ms  p99 0.74 ms per agent, errors 0, agents with memories left 0, disk 209M
+   files per agent: 1 log segments in bench-00001
+== sqweezdb, at most 2000 agents open, body VARCHAR(256)
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.50 s (3986 agents/s, 79722 writes/s), errors 0, server CPU 484%, memory 197 MB, disk 24M
+sqweezdb    agent steps (write + recall 10),  8 clients:  24601 steps/s  p50   0.27 ms  p99   0.94 ms  errors 0  other agents' memories 0  server CPU 394%, memory 266 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:  38506 steps/s  p50   1.46 ms  p99   5.13 ms  errors 0  other agents' memories 0  server CPU 524%, memory 375 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.19 ms  p99 3.88 ms per agent, errors 0, agents with memories left 0, disk 165M
+   files per agent: 1 log segments in bench-00001
+--- run 2
+== sqweezdb, at most 2000 agents open, body VARCHAR(2000)
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.55 s (3657 agents/s, 73131 writes/s), errors 0, server CPU 486%, memory 385 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:  21087 steps/s  p50   0.33 ms  p99   1.11 ms  errors 0  other agents' memories 0  server CPU 370%, memory 1046 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:  25744 steps/s  p50   1.77 ms  p99   8.04 ms  errors 0  other agents' memories 0  server CPU 652%, memory 1844 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.75 ms  p99 24.86 ms per agent, errors 0, agents with memories left 0, disk 782M
+   files per agent: 1 log segments in bench-00001
+== sqweezdb, at most 200 agents open, body VARCHAR(2000)
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.58 s (3477 agents/s, 69530 writes/s), errors 0, server CPU 448%, memory 61 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:   4128 steps/s  p50   1.74 ms  p99   6.36 ms  errors 0  other agents' memories 0  server CPU 287%, memory 99 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   3843 steps/s  p50  15.99 ms  p99  39.38 ms  errors 0  other agents' memories 0  server CPU 322%, memory 136 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.09 ms  p99 0.76 ms per agent, errors 0, agents with memories left 0, disk 207M
+   files per agent: 1 log segments in bench-00001
+== sqweezdb, at most 2000 agents open, body VARCHAR(256)
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.51 s (3903 agents/s, 78058 writes/s), errors 0, server CPU 464%, memory 195 MB, disk 24M
+sqweezdb    agent steps (write + recall 10),  8 clients:  24527 steps/s  p50   0.28 ms  p99   0.96 ms  errors 0  other agents' memories 0  server CPU 359%, memory 263 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:  33182 steps/s  p50   1.52 ms  p99   7.18 ms  errors 0  other agents' memories 0  server CPU 545%, memory 359 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.66 ms  p99 0.94 ms per agent, errors 0, agents with memories left 0, disk 154M
+   files per agent: 1 log segments in bench-00001
+
+#### PocketBase, and sqweezdb before the segment-reuse fix (same server code otherwise)
+--- run 1
+== sqweezdb, at most 2000 agents open
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.53 s (3768 agents/s, 75366 writes/s), errors 0, server CPU 522%, memory 368 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:  21799 steps/s  p50   0.33 ms  p99   0.90 ms  errors 0  other agents' memories 0  server CPU 393%, memory 1053 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:  31654 steps/s  p50   1.83 ms  p99   5.73 ms  errors 0  other agents' memories 0  server CPU 567%, memory 1994 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.36 ms  p99 8.07 ms per agent, errors 0, agents with memories left 0, disk 908M
+== sqweezdb, at most 200 agents open
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.58 s (3467 agents/s, 69337 writes/s), errors 0, server CPU 478%, memory 63 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:   5172 steps/s  p50   1.56 ms  p99   3.06 ms  errors 0  other agents' memories 0  server CPU 377%, memory 104 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   7099 steps/s  p50   8.53 ms  p99  21.94 ms  errors 0  other agents' memories 0  server CPU 690%, memory 139 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.61 ms  p99 5.50 ms per agent, errors 0, agents with memories left 0, disk 450M
+== pocketbase defaults
+pocketbase  spawn 2000 agents x 20 memories, 16 clients: 2.68 s (748 agents/s, 14953 writes/s), errors 0, server CPU 241%, memory 91 MB, disk 35M
+pocketbase  agent steps (write + recall 10),  8 clients:   6978 steps/s  p50   0.78 ms  p99  12.00 ms  errors 0  other agents' memories 0  server CPU 413%, memory 146 MB
+pocketbase  agent steps (write + recall 10), 64 clients:   7078 steps/s  p50   4.97 ms  p99  39.85 ms  errors 0  other agents' memories 0  server CPU 397%, memory 206 MB
+pocketbase  forget 100 agents (each with its memories), 1 client: p50 10.62 ms  p99 28.26 ms per agent, errors 0, agents with memories left 0, disk 184M
+== pocketbase -no-request-log
+pocketbase  spawn 2000 agents x 20 memories, 16 clients: 2.31 s (868 agents/s, 17351 writes/s), errors 0, server CPU 198%, memory 56 MB, disk 14M
+pocketbase  agent steps (write + recall 10),  8 clients:   6981 steps/s  p50   0.68 ms  p99  11.19 ms  errors 0  other agents' memories 0  server CPU 307%, memory 84 MB
+pocketbase  agent steps (write + recall 10), 64 clients:   8590 steps/s  p50   4.17 ms  p99  32.24 ms  errors 0  other agents' memories 0  server CPU 362%, memory 111 MB
+pocketbase  forget 100 agents (each with its memories), 1 client: p50 8.54 ms  p99 20.46 ms per agent, errors 0, agents with memories left 0, disk 42M
+--- run 2
+== sqweezdb, at most 2000 agents open
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.54 s (3731 agents/s, 74626 writes/s), errors 0, server CPU 502%, memory 372 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:  22308 steps/s  p50   0.31 ms  p99   0.97 ms  errors 0  other agents' memories 0  server CPU 404%, memory 1091 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:  31516 steps/s  p50   1.64 ms  p99   6.02 ms  errors 0  other agents' memories 0  server CPU 603%, memory 2053 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.33 ms  p99 1.89 ms per agent, errors 0, agents with memories left 0, disk 915M
+== sqweezdb, at most 200 agents open
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.56 s (3574 agents/s, 71484 writes/s), errors 0, server CPU 456%, memory 61 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:   3385 steps/s  p50   1.60 ms  p99  10.44 ms  errors 0  other agents' memories 0  server CPU 233%, memory 92 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   6242 steps/s  p50   9.07 ms  p99  30.04 ms  errors 0  other agents' memories 0  server CPU 541%, memory 133 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.48 ms  p99 65.48 ms per agent, errors 0, agents with memories left 0, disk 373M
+== pocketbase defaults
+pocketbase  spawn 2000 agents x 20 memories, 16 clients: 3.49 s (574 agents/s, 11477 writes/s), errors 0, server CPU 184%, memory 92 MB, disk 35M
+pocketbase  agent steps (write + recall 10),  8 clients:   6828 steps/s  p50   0.77 ms  p99  13.13 ms  errors 0  other agents' memories 0  server CPU 403%, memory 147 MB
+pocketbase  agent steps (write + recall 10), 64 clients:   3772 steps/s  p50   5.22 ms  p99 228.48 ms  errors 0  other agents' memories 0  server CPU 220%, memory 174 MB
+pocketbase  forget 100 agents (each with its memories), 1 client: p50 7.40 ms  p99 193.19 ms per agent, errors 0, agents with memories left 0, disk 148M
+== pocketbase -no-request-log
+pocketbase  spawn 2000 agents x 20 memories, 16 clients: 2.33 s (857 agents/s, 17145 writes/s), errors 0, server CPU 195%, memory 56 MB, disk 14M
+pocketbase  agent steps (write + recall 10),  8 clients:   8415 steps/s  p50   0.68 ms  p99   9.96 ms  errors 0  other agents' memories 0  server CPU 369%, memory 89 MB
+pocketbase  agent steps (write + recall 10), 64 clients:   8580 steps/s  p50   4.15 ms  p99  32.00 ms  errors 0  other agents' memories 0  server CPU 360%, memory 113 MB
+pocketbase  forget 100 agents (each with its memories), 1 client: p50 9.02 ms  p99 101.27 ms per agent, errors 0, agents with memories left 0, disk 45M
+
+#### A/B, at most 200 agents open: appending to the last segment after a reopen too (rejected) vs only after idle restarts (kept)
+== no reuse after reopen, run 1
+sqweezdb    agent steps (write + recall 10),  8 clients:   4811 steps/s  p50   1.54 ms  p99   6.69 ms  errors 0  other agents' memories 0  server CPU 341%, memory 103 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   6899 steps/s  p50   8.80 ms  p99  21.95 ms  errors 0  other agents' memories 0  server CPU 650%, memory 136 MB
+== reuse after reopen, run 1
+sqweezdb    agent steps (write + recall 10),  8 clients:   4801 steps/s  p50   1.69 ms  p99   2.72 ms  errors 0  other agents' memories 0  server CPU 332%, memory 113 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   6558 steps/s  p50   9.34 ms  p99  25.14 ms  errors 0  other agents' memories 0  server CPU 581%, memory 140 MB
+== no reuse after reopen, run 2
+sqweezdb    agent steps (write + recall 10),  8 clients:   5317 steps/s  p50   1.54 ms  p99   2.52 ms  errors 0  other agents' memories 0  server CPU 382%, memory 101 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   6732 steps/s  p50   9.10 ms  p99  22.39 ms  errors 0  other agents' memories 0  server CPU 638%, memory 148 MB
+== reuse after reopen, run 2
+sqweezdb    agent steps (write + recall 10),  8 clients:   4735 steps/s  p50   1.71 ms  p99   2.84 ms  errors 0  other agents' memories 0  server CPU 327%, memory 109 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   4483 steps/s  p50  13.76 ms  p99  39.69 ms  errors 0  other agents' memories 0  server CPU 383%, memory 127 MB
+
+#### final build, at most 200 agents open (every reopen starts one log segment; reuse only after idle restarts)
+== sqweezdb, at most 200 agents open, body VARCHAR(2000), final build, run 1
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.59 s (3411 agents/s, 68225 writes/s), errors 0, server CPU 472%, memory 63 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:   5417 steps/s  p50   1.52 ms  p99   2.38 ms  errors 0  other agents' memories 0  server CPU 390%, memory 104 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   7178 steps/s  p50   8.57 ms  p99  20.14 ms  errors 0  other agents' memories 0  server CPU 700%, memory 126 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.65 ms  p99 6.86 ms per agent, errors 0, agents with memories left 0, disk 460M
+   files per agent: 53 log segments in bench-00001
+== sqweezdb, at most 200 agents open, body VARCHAR(2000), final build, run 2
+sqweezdb    spawn 2000 agents x 20 memories, 16 clients: 0.57 s (3512 agents/s, 70239 writes/s), errors 0, server CPU 467%, memory 69 MB, disk 94M
+sqweezdb    agent steps (write + recall 10),  8 clients:   5323 steps/s  p50   1.53 ms  p99   2.62 ms  errors 0  other agents' memories 0  server CPU 383%, memory 98 MB
+sqweezdb    agent steps (write + recall 10), 64 clients:   6628 steps/s  p50   8.93 ms  p99  25.54 ms  errors 0  other agents' memories 0  server CPU 629%, memory 139 MB
+sqweezdb    forget 100 agents (each with its memories), 1 client: p50 0.55 ms  p99 2.68 ms per agent, errors 0, agents with memories left 0, disk 441M
+   files per agent: 46 log segments in bench-00001

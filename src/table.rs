@@ -29,28 +29,46 @@ impl ColType {
 /// A foreign key: `col` references the primary key of table `parent`. Enforced always (no pragma); `on_delete` says what a parent delete does.
 #[derive(Clone, Debug)] pub struct FkDef { pub col: usize, pub parent: String, pub on_delete: FkAction }
 #[derive(Clone, Debug)] pub struct Schema { pub name: String, pub columns: Vec<Column>, pub offsets: Vec<usize>, pub row_size: usize, pub pk: usize, pub unique: Option<usize>, pub null_bytes: usize, pub fks: Vec<FkDef>, /// the primary key is assigned automatically when an INSERT leaves it out
-    pub auto: bool, /// the key is a 16-byte UUID (decided once: every key read checks it)
+    pub auto: bool, /// the key is 128-bit: a UUID, TEXT or BYTES key (decided once: every key read checks it)
     pub key16: bool }
 impl Schema {
-    #[inline] pub fn key_is_uuid(&self) -> bool { self.key16 }
-    /// Bytes a key takes in log records and snapshot fences.
-    #[inline] pub fn key_width(&self) -> usize { if self.key_is_uuid() { 16 } else { 8 } }
-    #[inline] pub fn key_of(&self, row: &[u8]) -> Key { let off = self.offsets[self.pk]; if self.key16 { key_from_uuid(&row[off..off + 16]) } else { read_i64(row, off) as i128 } }
-    pub fn key_bytes(&self, k: Key) -> Vec<u8> { if self.key_is_uuid() { k.to_le_bytes().to_vec() } else { (k as i64).to_le_bytes().to_vec() } }
-    pub fn key_from_bytes(&self, b: &[u8]) -> Key { if b.len() == 16 { i128::from_le_bytes(b.try_into().unwrap()) } else { i64::from_le_bytes(b[..8].try_into().unwrap()) as i128 } }
-    pub fn key_value(&self, k: Key) -> Value { if self.key_is_uuid() { Value::Text(format_uuid(&uuid_of_key(k))) } else { Value::Int(k as i64) } }
-    pub fn key_text(&self, k: Key) -> String { if self.key_is_uuid() { format_uuid(&uuid_of_key(k)) } else { (k as i64).to_string() } }
+    #[inline] pub fn key_is_uuid(&self) -> bool { self.key16 && self.columns[self.pk].ty == ColType::Uuid }
+    /// A TEXT or BYTES key, keyed by `text_key` (a key past 15 bytes cannot be turned back into its value: rows and
+    /// delete records hold the value itself).
+    #[inline] pub fn key_is_text(&self) -> bool { self.key16 && self.columns[self.pk].ty != ColType::Uuid }
+    #[inline] pub fn key_of(&self, row: &[u8]) -> Key { let off = self.offsets[self.pk]; if !self.key16 { read_i64(row, off) as i128 } else { field_key128(&self.columns[self.pk].ty, row, off) } }
+    /// What a delete record names: the key (8 bytes for INT, 16 for UUID), or for a text key the key column itself.
+    pub fn key_record(&self, row: &[u8]) -> Vec<u8> {
+        if self.key_is_text() { let off = self.offsets[self.pk]; row[off..off + self.columns[self.pk].ty.width()].to_vec() }
+        else if self.key16 { self.key_of(row).to_le_bytes().to_vec() } else { (self.key_of(row) as i64).to_le_bytes().to_vec() }
+    }
+    /// The key of a delete record (`key_record`), or of a whole row. Versions up to 0.2.0 wrote INT keys inside
+    /// transactions as 16 bytes; those read as the 128-bit key they are.
+    pub fn delete_key(&self, p: &[u8]) -> Key {
+        if self.key_is_text() { if p.len() == self.columns[self.pk].ty.width() { return field_key128(&self.columns[self.pk].ty, p, 0); } return self.key_of(p); }
+        match p.len() { 16 => i128::from_le_bytes(p.try_into().unwrap()), 8 if !self.key16 => i64::from_le_bytes(p.try_into().unwrap()) as i128, _ => self.key_of(p) }
+    }
+    /// The primary key value a delete record (or a whole row) names.
+    pub fn delete_pk_value(&self, p: &[u8]) -> Value {
+        if p.len() == self.row_size { return decode_col(self, p, self.pk); }
+        if self.key_is_text() && p.len() == self.columns[self.pk].ty.width() { let n = u16::from_le_bytes([p[0], p[1]]) as usize; return text_value(&self.columns[self.pk].ty, &p[2..2 + n]); }
+        self.key_value(self.delete_key(p))
+    }
+    /// A key as a value; NULL for a text key past 15 bytes (see `key_is_text`).
+    pub fn key_value(&self, k: Key) -> Value { if self.key_is_uuid() { Value::Text(format_uuid(&uuid_of_key(k))) } else if self.key16 { text_of_key(k).map(|b| text_value(&self.columns[self.pk].ty, &b)).unwrap_or(Value::Null) } else { Value::Int(k as i64) } }
+    pub fn key_text(&self, k: Key) -> String { match self.key_value(k) { Value::Text(t) => t, Value::Null => "(a long text key)".into(), v => crate::expr::num_text(&v) } }
     pub fn key_from_value(&self, v: &Value) -> Result<Key, String> {
         if self.key_is_uuid() { match v { Value::Text(s) => parse_uuid(s).map(|b| key_from_uuid(&b)).ok_or_else(|| format!("not a UUID: {s:?}")), Value::Bytes(b) if b.len() == 16 => Ok(key_from_uuid(b)), v => Err(format!("expected a UUID, got {v:?}")) } }
+        else if self.key16 { let t = &self.columns[self.pk].ty; value_key128(t, v).ok_or_else(|| format!("expected {}, got {v:?}", if matches!(t, ColType::Text(_)) { "a text value" } else { "a bytes value" })) }
         else { v.as_i64().map(|i| i as i128) }
     }
     pub fn new(name: &str, columns: Vec<Column>, pk: usize, unique: Option<usize>) -> Result<Schema, String> {
-        if !matches!(columns.get(pk).map(|c| &c.ty), Some(ColType::Int) | Some(ColType::Uuid)) { return Err("primary key must be an INT or UUID column".into()); }
+        if !matches!(columns.get(pk).map(|c| &c.ty), Some(ColType::Int | ColType::Uuid | ColType::Text(_) | ColType::Bytes(_))) { return Err("primary key must be an INT, UUID, TEXT or BYTES column".into()); }
         let mut columns = columns; columns[pk].nullable = false;
         let null_bytes = (columns.len() + 7) / 8;
         let mut offsets = vec![]; let mut off = null_bytes;
         for c in &columns { offsets.push(off); off += c.ty.width(); }
-        let key16 = columns[pk].ty == ColType::Uuid;
+        let key16 = columns[pk].ty != ColType::Int;
         Ok(Schema { name: name.to_string(), columns, offsets, row_size: off, pk, unique, null_bytes, fks: vec![], auto: false, key16 })
     }
     pub fn col(&self, name: &str) -> Option<usize> { self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)) }
@@ -180,10 +198,49 @@ pub fn decode_col(schema: &Schema, row: &[u8], i: usize) -> Value {
 pub type Key = i128;
 #[inline] pub fn key_from_uuid(b: &[u8]) -> Key { (u128::from_be_bytes(b[..16].try_into().unwrap()) ^ (1u128 << 127)) as i128 }
 #[inline] pub fn uuid_of_key(k: Key) -> [u8; 16] { ((k as u128) ^ (1u128 << 127)).to_be_bytes() }
-/// Key of column `i` (INT, TIMESTAMP or UUID), or None for NULL.
-#[inline] pub fn col_key128(schema: &Schema, row: &[u8], i: usize) -> Option<Key> { if is_null(row, i) { return None; } let off = schema.offsets[i]; Some(if schema.columns[i].ty == ColType::Uuid { key_from_uuid(&row[off..off + 16]) } else { read_i64(row, off) as i128 }) }
-/// 64-bit form of a key for the hash-based secondary indexes: exact for INT keys; for UUIDs a fold, and every
-/// lookup re-checks the full key.
+/// Key of a TEXT or BYTES value in joins, IN sets and indexes. Up to 15 bytes are packed exactly (the bytes, zero
+/// padding, the length in the last byte); a longer value takes 15 bytes of its SHA-256 and 0xFF as the last byte. Two
+/// short values never share a key; two long ones would need a SHA-256 collision on 120 bits.
+/// The packed or hashed form goes through `tk_mix`, a bijection, so key bits vary everywhere (key shards read bits
+/// 16 to 26) and short keys can be turned back into their value (`text_of_key`).
+pub fn text_key(b: &[u8]) -> Key {
+    let mut k = [0u8; 16];
+    if b.len() <= 15 { k[..b.len()].copy_from_slice(b); k[15] = b.len() as u8; }
+    else { use sha2::Digest; k[..15].copy_from_slice(&sha2::Sha256::digest(b)[..15]); k[15] = 0xFF; }
+    tk_mix(u128::from_be_bytes(k)) as i128
+}
+/// The value of a text key of at most 15 bytes; None for a hashed (longer) one.
+pub fn text_of_key(k: Key) -> Option<Vec<u8>> { let b = tk_unmix(k as u128).to_be_bytes(); let n = b[15] as usize; if n <= 15 { Some(b[..n].to_vec()) } else { None } }
+const TK_MUL: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835;   // odd: invertible modulo 2^128
+const TK_INV: u128 = { let mut i = TK_MUL; let mut n = 0; while n < 7 { i = i.wrapping_mul(2u128.wrapping_sub(TK_MUL.wrapping_mul(i))); n += 1; } i };
+#[inline] fn tk_mix(x: u128) -> u128 { let x = x ^ (x >> 64); let x = x.wrapping_mul(TK_MUL); x ^ (x >> 64) }
+#[inline] fn tk_unmix(x: u128) -> u128 { let x = x ^ (x >> 64); let x = x.wrapping_mul(TK_INV); x ^ (x >> 64) }
+fn text_value(ty: &ColType, b: &[u8]) -> Value { if matches!(ty, ColType::Bytes(_)) { Value::Bytes(b.to_vec()) } else { Value::Text(String::from_utf8_lossy(b).into_owned()) } }
+/// Key of a field of type `ty` at `off` (not NULL): INT and TIMESTAMP are themselves; UUID, TEXT and BYTES 128-bit keys.
+#[inline] pub fn field_key128(ty: &ColType, row: &[u8], off: usize) -> Key {
+    match ty {
+        ColType::Uuid => key_from_uuid(&row[off..off + 16]),
+        ColType::Text(_) | ColType::Bytes(_) => { let n = u16::from_le_bytes([row[off], row[off + 1]]) as usize; text_key(&row[off + 2..off + 2 + n]) }
+        _ => read_i64(row, off) as i128,
+    }
+}
+/// Columns whose keys compare with each other: 0 integers (INT, TIMESTAMP), 1 UUID, 2 TEXT, 3 BYTES; None for DOUBLE and BOOL.
+pub fn key_kind(t: &ColType) -> Option<u8> { match t { ColType::Int | ColType::Timestamp => Some(0), ColType::Uuid => Some(1), ColType::Text(_) => Some(2), ColType::Bytes(_) => Some(3), _ => None } }
+/// Key of a value for a column of type `ty`; None for NULL or a value that cannot be of that type.
+pub fn value_key128(ty: &ColType, v: &Value) -> Option<Key> {
+    match (ty, v) {
+        (ColType::Int | ColType::Timestamp, Value::Int(i)) => Some(*i as i128),
+        (ColType::Uuid, Value::Text(s)) => parse_uuid(s).map(|b| key_from_uuid(&b)),
+        (ColType::Uuid, Value::Bytes(b)) if b.len() == 16 => Some(key_from_uuid(b)),
+        (ColType::Text(_), Value::Text(s)) => Some(text_key(s.as_bytes())),
+        (ColType::Bytes(_), Value::Bytes(b)) => Some(text_key(b)),
+        _ => None,
+    }
+}
+/// Key of column `i` (see `field_key128`), or None for NULL.
+#[inline] pub fn col_key128(schema: &Schema, row: &[u8], i: usize) -> Option<Key> { if is_null(row, i) { return None; } Some(field_key128(&schema.columns[i].ty, row, schema.offsets[i])) }
+/// 64-bit form of a key for the hash-based secondary indexes: exact for INT keys; for UUID and text keys a fold, and
+/// every lookup re-checks the full key.
 #[inline] pub fn fold_key(k: Key) -> i64 { if k >= i64::MIN as i128 && k <= i64::MAX as i128 { k as i64 } else { ((k >> 64) as i64) ^ (k as i64) } }
 #[inline] pub fn read_key(schema: &Schema, row: &[u8], i: usize) -> Option<i64> { if is_null(row, i) { None } else { Some(read_i64(row, schema.offsets[i])) } }
 
@@ -197,7 +254,13 @@ pub const LOG_BUF_CAP: usize = 32 << 20;
 /// Recent records kept in memory for in-process change feeds (they see a commit the moment it happens).
 pub const RECENT_CAP: usize = 32 << 20;
 pub struct LogState { pub buf: Vec<u8>, pub seq: u64, pub written: u64, pub durable: u64, pub stop: bool, pub batches: u64, pub bytes: u64, pub rotate: bool, pub segments: Vec<u64>, pub catalog: Vec<String>, pub sync_fd: Option<File>, pub writer_done: bool, pub recent: VecDeque<(u64, u8, u16, Arc<[u8]>)>, pub recent_bytes: usize, pub cloud: u64, pub cloud_wait: bool, pub cloud_kick: Option<Arc<(Mutex<bool>, Condvar)>>, /// log threads are running (they exit after `idle_exit` of silence and restart on the next append)
-    pub running: bool, pub idle_exit: Option<std::time::Duration>, pub started: bool, pub threads: u8 }
+    pub running: bool, pub idle_exit: Option<std::time::Duration>, pub started: bool, pub threads: u8,
+    /// With durable off, how long the syncer may hold an fsync so it covers more writes (`log.syncDelay`); anyone waiting
+    /// for durability ends the wait at once. `durable_waiters` counts them.
+    pub sync_delay: Option<std::time::Duration>, pub durable_waiters: u32,
+    /// The last segment, when its writer left it cleanly on an idle exit: the restarted writer appends to it instead of
+    /// starting a file per restart. (After a reopen the writer still starts a new segment: E53 measured no gain.)
+    pub reuse_tail: Option<u64> }
 /// Writing and syncing are two threads: records reach the segment file (and so followers and change feeds) as soon as
 /// they are appended, independent of how long the current fsync takes; durability still comes from one fsync per batch.
 pub struct GLog { pub st: Mutex<LogState>, pub cv_batch: Condvar, pub cv_durable: Condvar, pub cv_sync: Condvar, /// appenders waiting for room in a full buffer (kept apart from the many commits waiting on `cv_durable`)
@@ -205,7 +268,7 @@ pub struct GLog { pub st: Mutex<LogState>, pub cv_batch: Condvar, pub cv_durable
     pub feeds: std::sync::atomic::AtomicUsize, /// signalled on an append while a reactor is waiting (never costs the writer otherwise)
     pub cv_feed: Condvar, pub feed_wake: std::sync::atomic::AtomicBool }
 impl GLog {
-    pub fn new(dir: &Path) -> GLog { GLog { st: Mutex::new(LogState { buf: Vec::with_capacity(1 << 16), seq: 0, written: 0, durable: 0, stop: false, batches: 0, bytes: 0, rotate: false, segments: vec![], catalog: vec![], sync_fd: None, writer_done: false, recent: VecDeque::new(), recent_bytes: 0, cloud: 0, cloud_wait: false, cloud_kick: None, running: false, idle_exit: None, started: false, threads: 0 }), cv_batch: Condvar::new(), cv_durable: Condvar::new(), cv_sync: Condvar::new(), cv_space: Condvar::new(), dir: dir.to_path_buf(), feeds: std::sync::atomic::AtomicUsize::new(0), cv_feed: Condvar::new(), feed_wake: std::sync::atomic::AtomicBool::new(false) } }
+    pub fn new(dir: &Path) -> GLog { GLog { st: Mutex::new(LogState { buf: Vec::with_capacity(1 << 16), seq: 0, written: 0, durable: 0, stop: false, batches: 0, bytes: 0, rotate: false, segments: vec![], catalog: vec![], sync_fd: None, writer_done: false, recent: VecDeque::new(), recent_bytes: 0, cloud: 0, cloud_wait: false, cloud_kick: None, running: false, idle_exit: None, started: false, threads: 0, sync_delay: None, durable_waiters: 0, reuse_tail: None }), cv_batch: Condvar::new(), cv_durable: Condvar::new(), cv_sync: Condvar::new(), cv_space: Condvar::new(), dir: dir.to_path_buf(), feeds: std::sync::atomic::AtomicUsize::new(0), cv_feed: Condvar::new(), feed_wake: std::sync::atomic::AtomicBool::new(false) } }
     pub fn seg_path(&self, first: u64) -> PathBuf { Self::seg_path_in(&self.dir, first) }
     pub fn seg_path_in(dir: &Path, first: u64) -> PathBuf { dir.join(format!("log.{first:020}")) }
     pub fn list_segments(dir: &Path) -> Vec<u64> {
@@ -247,7 +310,12 @@ impl GLog {
         (out, true)
     }
     pub fn snapshot_point(&self) -> (u64, Vec<String>) { let mut s = self.st.lock().unwrap(); s.rotate = true; self.cv_batch.notify_one(); (s.seq, s.catalog.clone()) }
-    pub fn wait_durable(&self, seq: u64) { let mut s = self.st.lock().unwrap(); while s.durable < seq { s = self.cv_durable.wait(s).unwrap(); } }
+    pub fn wait_durable(&self, seq: u64) { let s = self.st.lock().unwrap(); drop(self.await_durable(s, seq)); }
+    /// Wait under the lock until everything up to `target` is fsynced; a waiter makes a delayed sync happen now.
+    fn await_durable<'a>(&self, mut s: std::sync::MutexGuard<'a, LogState>, target: u64) -> std::sync::MutexGuard<'a, LogState> {
+        if s.durable < target { s.durable_waiters += 1; self.cv_sync.notify_all(); while s.durable < target { s = self.cv_durable.wait(s).unwrap(); } s.durable_waiters -= 1; }
+        s
+    }
     /// Cloud-durable commit mode (E33): a write is acknowledged only once its record is in the bucket.
     pub fn set_cloud_wait(&self, on: bool, kick: Option<Arc<(Mutex<bool>, Condvar)>>) { let mut s = self.st.lock().unwrap(); s.cloud_wait = on; s.cloud_kick = kick; }
     /// Wait (bounded) until the writer thread has put everything appended so far into the segment file.
@@ -259,7 +327,9 @@ impl GLog {
     fn open_segment(&self, first: u64) -> File { OpenOptions::new().create(true).write(true).append(true).open(self.seg_path(first)).unwrap() }
     /// The writer thread: appends batches to the current segment and publishes `written`; the syncer makes them durable.
     pub fn committer(&self) {
-        let first = { let mut s = self.st.lock().unwrap(); s.threads += 1; let f = s.seq + 1; if s.segments.last() != Some(&f) { s.segments.push(f); } f };
+        let first = { let mut s = self.st.lock().unwrap(); s.threads += 1;
+            match s.reuse_tail.take() { Some(r) if s.segments.last() == Some(&r) && self.seg_path(r).exists() => r,
+                _ => { let f = s.seq + 1; if s.segments.last() != Some(&f) { s.segments.push(f); } f } } };
         let mut f = self.open_segment(first); { let mut s = self.st.lock().unwrap(); s.sync_fd = Some(f.try_clone().unwrap()); self.cv_sync.notify_all(); }
         let mut local: Vec<u8> = Vec::new();
         loop {
@@ -267,12 +337,12 @@ impl GLog {
             { let mut s = self.st.lock().unwrap();
               let idle = s.idle_exit;
               while s.buf.is_empty() && !s.stop && !s.rotate { match idle { Some(d) => { let (g, to) = self.cv_batch.wait_timeout(s, d).unwrap(); s = g; if to.timed_out() && s.buf.is_empty() && !s.stop && !s.rotate { break; } } None => { s = self.cv_batch.wait(s).unwrap(); } } }
-              if s.buf.is_empty() && (s.stop || idle.is_some()) && !s.rotate { while s.durable < s.written { s = self.cv_durable.wait(s).unwrap(); } s.writer_done = true; s.running = false; s.threads -= 1; self.cv_sync.notify_all(); return; }  // the syncer exits only after this
-              if s.buf.is_empty() { while s.durable < s.written { s = self.cv_durable.wait(s).unwrap(); } s.rotate = false; let nf = s.seq + 1; if s.segments.last() != Some(&nf) { s.segments.push(nf); } drop(s); f = self.open_segment(nf); let mut s = self.st.lock().unwrap(); s.sync_fd = Some(f.try_clone().unwrap()); continue; }
+              if s.buf.is_empty() && (s.stop || idle.is_some()) && !s.rotate { while s.durable < s.written { s = self.cv_durable.wait(s).unwrap(); } s.reuse_tail = s.segments.last().copied(); s.writer_done = true; s.running = false; s.threads -= 1; self.cv_sync.notify_all(); return; }  // the syncer exits only after this; an idle exit waits out a sync delay rather than cutting it short
+              if s.buf.is_empty() { let w = s.written; s = self.await_durable(s, w); s.rotate = false; let nf = s.seq + 1; if s.segments.last() != Some(&nf) { s.segments.push(nf); } drop(s); f = self.open_segment(nf); let mut s = self.st.lock().unwrap(); s.sync_fd = Some(f.try_clone().unwrap()); continue; }
               std::mem::swap(&mut local, &mut s.buf); seq_end = s.seq; s.batches += 1; s.bytes += local.len() as u64; self.cv_space.notify_all(); }  // appenders waiting on back-pressure may continue (not the commits waiting for durability)
             f.write_all(&local).unwrap(); local.clear(); if local.capacity() > 2 * LOG_BUF_CAP { local = Vec::with_capacity(1 << 22); }
             let mut s = self.st.lock().unwrap(); s.written = seq_end; self.cv_sync.notify_all();
-            if s.rotate { while s.durable < s.written { s = self.cv_durable.wait(s).unwrap(); } s.rotate = false; s.segments.push(seq_end + 1); drop(s); f = self.open_segment(seq_end + 1); let mut s = self.st.lock().unwrap(); s.sync_fd = Some(f.try_clone().unwrap()); }
+            if s.rotate { let w = s.written; s = self.await_durable(s, w); s.rotate = false; s.segments.push(seq_end + 1); drop(s); f = self.open_segment(seq_end + 1); let mut s = self.st.lock().unwrap(); s.sync_fd = Some(f.try_clone().unwrap()); }
         }
     }
     /// The syncer thread: one fsync per batch of written records, then `durable` advances.
@@ -282,12 +352,19 @@ impl GLog {
             let (target, fd) = { let mut s = self.st.lock().unwrap();
                 while (s.written <= s.durable || s.sync_fd.is_none()) && !(s.writer_done && s.written <= s.durable) { s = self.cv_sync.wait(s).unwrap(); }
                 if s.writer_done && s.written <= s.durable { s.writer_done = false; s.threads -= 1; self.cv_sync.notify_all(); return; }
+                if let Some(d) = s.sync_delay {   // let more writes reach the file first, unless someone needs them on disk now
+                    let until = Instant::now() + d;
+                    while s.durable_waiters == 0 && !s.stop { let now = Instant::now(); if now >= until { break; } s = self.cv_sync.wait_timeout(s, until - now).unwrap().0; }
+                }
                 (s.written, s.sync_fd.as_ref().unwrap().try_clone().unwrap()) };
             fd.sync_data().unwrap();
             let mut s = self.st.lock().unwrap(); if target > s.durable { s.durable = target; } self.cv_durable.notify_all();
         }
     }
-    pub fn stop(&self) { let mut s = self.st.lock().unwrap(); s.stop = true; self.cv_batch.notify_all(); self.cv_sync.notify_all(); let deadline = Instant::now() + std::time::Duration::from_secs(5); while s.threads > 0 && Instant::now() < deadline { let (g, _) = self.cv_sync.wait_timeout(s, std::time::Duration::from_millis(20)).unwrap(); s = g; } }
+    /// Stop the log threads once everything appended is written and synced. Also waits for threads that were spawned but
+    /// have not started yet (`running` is set when they are spawned): a write that restarted idle threads right before a
+    /// close used to be left in the buffer.
+    pub fn stop(&self) { let mut s = self.st.lock().unwrap(); s.stop = true; self.cv_batch.notify_all(); self.cv_sync.notify_all(); let deadline = Instant::now() + std::time::Duration::from_secs(5); while (s.threads > 0 || s.running) && Instant::now() < deadline { let (g, _) = self.cv_sync.wait_timeout(s, std::time::Duration::from_millis(20)).unwrap(); s = g; } }
 }
 /// Parse a log segment: (seq, op, table, payload). Stops at the first short or corrupt record.
 pub fn parse_glog(data: &[u8]) -> (Vec<(u64, u8, u16, Vec<u8>)>, usize) {
@@ -394,11 +471,11 @@ pub struct Chunk { pub data: Option<ChunkBuf> }
 /// private mapping (row bytes, copy-on-write per page) or in the heap overlays (indexes for rows added since).
 /// `fence[p]` is the key of the first row that starts in page p of the rows region (read eagerly: 8 bytes per 4 KB
 /// page of data). A point lookup is one fence search in memory, then one page of rows.
-pub struct MappedBase { pub n: usize, rows: *const u8, rows_off: usize, stride: usize, pk_off: usize, fence: Fence, uniq: *const u64, ucap: usize, kmin: Key, kmax: Key, kw: usize }
+pub struct MappedBase { pub n: usize, rows: *const u8, rows_off: usize, stride: usize, pk_off: usize, fence: Fence, uniq: *const u64, ucap: usize, kmin: Key, kmax: Key, kty: ColType }
 unsafe impl Send for MappedBase {} unsafe impl Sync for MappedBase {}
 impl MappedBase {
     /// Primary key of mapped slot i, read straight from the mapping (a slot's key never changes).
-    #[inline] fn key_at(&self, i: usize) -> Key { unsafe { let p = self.rows.add(i * self.stride + 16 + self.pk_off); if self.kw == 16 { key_from_uuid(std::slice::from_raw_parts(p, 16)) } else { std::ptr::read_unaligned(p as *const i64) as i128 } } }
+    #[inline] fn key_at(&self, i: usize) -> Key { unsafe { let p = self.rows.add(i * self.stride + 16 + self.pk_off); match &self.kty { ColType::Int => std::ptr::read_unaligned(p as *const i64) as i128, ColType::Uuid => key_from_uuid(std::slice::from_raw_parts(p, 16)), t => field_key128(t, std::slice::from_raw_parts(p, t.width()), 0) } } }
     #[inline] fn slot_lo(&self, page: usize) -> usize { ((page * SNAP_ALIGN + self.stride - 1) / self.stride).min(self.n) }
     /// First mapped slot whose key is >= pk (n if none).
     fn lower_bound(&self, pk: Key) -> usize {
@@ -411,7 +488,7 @@ impl MappedBase {
 }
 /// Unique index shard: 64-bit key hash -> slot, verified against the row; rare collisions spill into `overflow`.
 #[derive(Default)] pub struct UniqShard { main: FastMapU64<u32>, overflow: HashMap<u64, Vec<u32>> }
-/// Non-unique secondary index on an INT column: key -> slots, hash-sharded. Maintained at publish time, so it only ever
+/// Non-unique secondary index: 64-bit key (see `fold_key`) -> slots, hash-sharded. Maintained at publish time, so it only ever
 /// points at committed rows (a reader still re-checks the row).
 pub struct SecIndex { pub name: String, pub col: usize, shards: Vec<RwLock<FastMap<Vec<u32>>>> }
 impl SecIndex {
@@ -513,7 +590,7 @@ impl Table {
         for c in self.children.read().unwrap().iter() {
             let Some(ct) = c.table.upgrade() else { continue }; if ct.retired.load(Ordering::Relaxed) { continue; }
             let Some(ix) = ct.index_on(c.col) else { continue }; let n = ix.count(fold_key(pk)); if n == 0 { continue; }
-            let n = if ct.schema.columns[c.col].ty == ColType::Uuid { ix.slots(fold_key(pk)).into_iter().filter(|&sl| ct.with_slot(sl, |_, r| col_key128(&ct.schema, r, c.col) == Some(pk)) == Some(true)).count() } else { n }; if n == 0 { continue; }
+            let n = if !matches!(ct.schema.columns[c.col].ty, ColType::Int | ColType::Timestamp) { ix.slots(fold_key(pk)).into_iter().filter(|&sl| ct.with_slot(sl, |_, r| col_key128(&ct.schema, r, c.col) == Some(pk)) == Some(true)).count() } else { n }; if n == 0 { continue; }
             match c.on_delete { FkAction::Restrict => return Err(Abort::Fk(format!("delete from {} blocked: {n} row(s) in {}.{} reference {} = {}", self.schema.name, ct.schema.name, ct.schema.columns[c.col].name, self.schema.columns[self.schema.pk].name, self.schema.key_text(pk)))), _ => todo.push((ct.clone(), c.col, c.on_delete.clone())) }
         }
         Ok(todo)
@@ -571,6 +648,14 @@ impl Table {
         if let Some(&s) = sh.main.get(&h) { if self.slot_key_eq(s, key) { return true; } }
         sh.overflow.get(&h).map(|v| v.iter().any(|&s| self.slot_key_eq(s, key))).unwrap_or(false) || self.mapped_uniq(h, key).is_some()
     }
+    /// A UNIQUE value held by another row at commit. `freed`: rows this transaction deletes, or moves to another value;
+    /// their value is free for the transaction's other rows (delete a row and reuse its value, swap two rows' values).
+    fn uniq_taken(&self, sh: &UniqShard, h: u64, key: &[u8], freed: &HashSet<u32>) -> bool {
+        if freed.is_empty() { return self.uniq_contains_locked(sh, h, key); }
+        if let Some(&s) = sh.main.get(&h) { if !freed.contains(&s) && self.slot_key_eq(s, key) { return true; } }
+        if sh.overflow.get(&h).map(|v| v.iter().any(|&s| !freed.contains(&s) && self.slot_key_eq(s, key))).unwrap_or(false) { return true; }
+        self.mapped_uniq(h, key).is_some_and(|s| !freed.contains(&s))
+    }
     fn uniq_insert_locked(sh: &mut UniqShard, h: u64, slot: u32) { if sh.main.contains_key(&h) { sh.overflow.entry(h).or_default().push(slot); } else { sh.main.insert(h, slot); } }
     pub fn uniq_lookup(&self, key: &[u8]) -> Option<u32> {
         let h = hash_bytes(key); let sh = self.sec()[Self::sec_shard_h(h)].read().unwrap();
@@ -609,7 +694,7 @@ impl Table {
             let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
             let (v, p) = Self::hdr_at(d, off); if v == 0 || self.pk_of(&d[off + 16..off + self.stride]) != pk { return Err(Abort::NotFound); } if p != 0 { return Err(Abort::Conflict); }
             let row = d[off + 16..off + self.stride].to_vec();
-            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_bytes(pk), &row); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
+            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &row); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
         match guard { Some(mut m) => { m.remove(&pk); drop(m); if let Some(k) = self.unique_key(&row) { self.uniq_remove(k, slot); } self.idx_remove(&row, slot); } None => self.unpublish(slot, &row) }
@@ -620,16 +705,16 @@ impl Table {
     }
     /// Idempotent replay of a delete record (payload: the key, 8 or 16 bytes; older logs and transactions carry the row).
     pub fn replay_delete(&self, seq: u64, payload: &[u8]) {
-        let pk = if payload.len() == self.schema.key_width() { self.schema.key_from_bytes(payload) } else { self.pk_of(payload) };
+        let pk = self.schema.delete_key(payload);
         let slot = match self.pk_slot(pk) { Some(s) => s, None => return };
         let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * self.stride);
         let stored: Option<Vec<u8>> = { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); let (v, _) = Self::hdr_at(d, off); if v == 0 || v >= seq || self.pk_of(&d[off + 16..off + self.stride]) != pk { None } else { let r = d[off + 16..off + self.stride].to_vec(); d[off..off + 16].copy_from_slice(&[0u8; 16]); Some(r) } };
         if let Some(r) = stored { self.unpublish(slot, &r); self.free_slot(slot); }
     }
     pub fn index_on(&self, col: usize) -> Option<Arc<SecIndex>> { self.indexes.read().unwrap().iter().find(|i| i.col == col).cloned() }
-    /// Create a non-unique index on an INT column: publish it first (writers maintain it from now on), then backfill.
+    /// Create a non-unique index on an INT, TIMESTAMP, UUID, TEXT or BYTES column: publish it first (writers maintain it from now on), then backfill.
     pub fn create_index(&self, name: &str, col: usize) -> Result<Arc<SecIndex>, String> {
-        if !matches!(self.schema.columns[col].ty, ColType::Int | ColType::Timestamp | ColType::Uuid) { return Err("only INT, TIMESTAMP and UUID columns can be indexed (for now)".into()); }
+        if key_kind(&self.schema.columns[col].ty).is_none() { return Err(format!("a {} column cannot be indexed (for now)", self.schema.columns[col].ty.name())); }
         if self.index_on(col).is_some() { return Err(format!("column {} already has an index", self.schema.columns[col].name)); }
         let ix = Arc::new(SecIndex::new(name, col));
         self.indexes.write().unwrap().push(ix.clone());
@@ -709,7 +794,7 @@ impl Table {
         drop(guard);
         let pad_rows = (CHUNK_ROWS - n as usize % CHUNK_ROWS) % CHUNK_ROWS; w.write_all(&vec![0u8; pad_rows * self.stride]).unwrap();
         let fence_off = align(w);
-        let wide = self.schema.key_is_uuid();
+        let wide = self.schema.key16;
         for &k in &fence { if wide { w.write_all(&k.to_le_bytes()).unwrap(); } else { w.write_all(&(k as i64).to_le_bytes()).unwrap(); } }   // 8 bytes per fence key for INT tables, as before
         let uniq_off = align(w);
         let ucap = if u.is_some() && n > 0 { (2 * n as usize).next_power_of_two().max(16) } else { 0 };
@@ -727,7 +812,7 @@ impl Table {
         if self.schema.auto { self.bump_id(kmax as i64); }
         let nchunks = (n + CHUNK_ROWS - 1) / CHUNK_ROWS;
         for ck in 0..nchunks { let mut c = self.chunks()[ck].write().unwrap(); c.data = Some(ChunkBuf::Mapped(unsafe { base.add(offs[0] as usize + ck * CHUNK_ROWS * self.stride) }, CHUNK_ROWS * self.stride)); }
-        let _ = self.base.set(MappedBase { n, rows: unsafe { base.add(offs[0] as usize) }, rows_off: offs[0] as usize, stride: self.stride, pk_off: self.schema.offsets[self.schema.pk], fence, uniq: unsafe { base.add(offs[2] as usize) } as *const u64, ucap, kmin, kmax, kw: self.schema.key_width() });
+        let _ = self.base.set(MappedBase { n, rows: unsafe { base.add(offs[0] as usize) }, rows_off: offs[0] as usize, stride: self.stride, pk_off: self.schema.offsets[self.schema.pk], fence, uniq: unsafe { base.add(offs[2] as usize) } as *const u64, ucap, kmin, kmax, kty: self.schema.columns[self.schema.pk].ty.clone() });
         let _ = self.map.set(map);
         self.next_slot.store(n as u32, Ordering::Relaxed);
     }
@@ -909,6 +994,10 @@ pub fn check_dir(dir: &Path) -> Result<DirState, String> {
     Err(format!("{shown} is not a sqweezdb database and is not empty (it holds {}{}); open a new or empty directory, e.g. {}/db", sample.join(", "), if foreign.len() > 3 { format!(" and {} more", foreign.len() - 3) } else { String::new() }, shown))
 }
 /// The directory format recorded in `dir`'s marker, or None when there is no marker.
+/// A foreign key column holds the parent's kind of key (a text key of any width); Some(the type it needs) when not.
+fn fk_mismatch(parent: &Schema, col: &ColType) -> Option<String> {
+    match (&parent.columns[parent.pk].ty, col) { (ColType::Text(_), ColType::Text(_)) | (ColType::Bytes(_), ColType::Bytes(_)) => None, (ColType::Text(_), _) => Some("TEXT".into()), (ColType::Bytes(_), _) => Some("BYTES".into()), (p, c) if p == c => None, (p, _) => Some(p.name()) }
+}
 pub fn read_meta(dir: &Path) -> Result<Option<u32>, String> {
     let p = dir.join(META_FILE);
     let text = match fs::read_to_string(&p) { Ok(t) => t, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(format!("{}: {e}", p.display())) };
@@ -944,8 +1033,7 @@ impl Database {
         // memory without a logged CREATE, and every later table would replay under a different id after a restart
         for fk in &schema.fks {
             let parent = names.get(&fk.parent.to_lowercase()).and_then(|&i| tables.get(i)).ok_or(format!("foreign key on {}.{} references unknown table {}", schema.name, schema.columns[fk.col].name, fk.parent))?;
-            let want = if parent.schema.key_is_uuid() { ColType::Uuid } else { ColType::Int };
-            if schema.columns[fk.col].ty != want { return Err(format!("foreign key column {}.{} must be {} to match the key of {}", schema.name, schema.columns[fk.col].name, want.name(), parent.schema.name)); }
+            if let Some(want) = fk_mismatch(&parent.schema, &schema.columns[fk.col].ty) { return Err(format!("foreign key column {}.{} must be {want} to match the key of {}", schema.name, schema.columns[fk.col].name, parent.schema.name)); }
             if fk.on_delete == FkAction::SetNull && !schema.columns[fk.col].nullable { return Err(format!("ON DELETE SET NULL needs a nullable column: {}.{}", schema.name, schema.columns[fk.col].name)); }
         }
         let t = Arc::new(Table::new(tables.len() as u16, schema, self.log.clone(), self.durable));
@@ -960,8 +1048,7 @@ impl Database {
     fn link_fks(&self, t: &Arc<Table>) -> Result<(), String> {
         for fk in t.schema.fks.clone() {
             let parent = self.table(&fk.parent).ok_or(format!("foreign key on {}.{} references unknown table {}", t.schema.name, t.schema.columns[fk.col].name, fk.parent))?;
-            let want = if parent.schema.key_is_uuid() { ColType::Uuid } else { ColType::Int };
-            if t.schema.columns[fk.col].ty != want { return Err(format!("foreign key column {}.{} must be {} to match the key of {}", t.schema.name, t.schema.columns[fk.col].name, want.name(), parent.schema.name)); }
+            if let Some(want) = fk_mismatch(&parent.schema, &t.schema.columns[fk.col].ty) { return Err(format!("foreign key column {}.{} must be {want} to match the key of {}", t.schema.name, t.schema.columns[fk.col].name, parent.schema.name)); }
             if fk.on_delete == FkAction::SetNull && !t.schema.columns[fk.col].nullable { return Err(format!("ON DELETE SET NULL needs a nullable column: {}.{}", t.schema.name, t.schema.columns[fk.col].name)); }
             let index = match t.index_on(fk.col) { Some(ix) => ix, None => t.create_index(&format!("fk_{}_{}", t.schema.name, t.schema.columns[fk.col].name), fk.col)? };
             t.fks.write().unwrap().push(FkLink { col: fk.col, parent: parent.clone(), on_delete: fk.on_delete.clone(), index });
@@ -1023,7 +1110,7 @@ impl Database {
             let here = w.stream_position().unwrap(); w.seek(SeekFrom::Start(dir_pos + (SNAP_HDR * ti) as u64)).unwrap();
             let mut h = Vec::with_capacity(SNAP_HDR);
             // offset 2: key width (0 = 8-byte keys, as in older snapshots)
-            h.extend_from_slice(&tb.id.to_le_bytes()); h.extend_from_slice(&(if tb.schema.key_is_uuid() { 16u16 } else { 0u16 }).to_le_bytes()); h.extend_from_slice(&(tb.schema.row_size as u32).to_le_bytes());
+            h.extend_from_slice(&tb.id.to_le_bytes()); h.extend_from_slice(&(if tb.schema.key16 { 16u16 } else { 0u16 }).to_le_bytes()); h.extend_from_slice(&(tb.schema.row_size as u32).to_le_bytes());
             h.extend_from_slice(&n.to_le_bytes()); h.extend_from_slice(&(tb.stride as u32).to_le_bytes()); h.extend_from_slice(&0u32.to_le_bytes());
             h.extend_from_slice(&ucap.to_le_bytes()); h.extend_from_slice(&max_v.to_le_bytes()); for o in offs { h.extend_from_slice(&o.to_le_bytes()); }
             h.extend_from_slice(&fence_n.to_le_bytes()); h.extend_from_slice(&(kmin as i64).to_le_bytes()); h.extend_from_slice(&(kmax as i64).to_le_bytes());
@@ -1195,7 +1282,7 @@ impl Table {
         Ok(())
     }
     // phase-1 claims
-    fn claim_insert(&self, row: &[u8], slot_out: &mut u32, mark: u64) -> Result<(), Abort> {
+    fn claim_insert(&self, row: &[u8], slot_out: &mut u32, mark: u64, freed: &HashSet<u32>) -> Result<(), Abort> {
         { let links = self.fks.read().unwrap().clone(); let _ = self.fk_guards(&links, row)?; }
         let pk = self.pk_of(row); let ukey = self.unique_key(row).map(|k| k.to_vec());
         let slot = self.alloc_slot();
@@ -1204,7 +1291,7 @@ impl Table {
         if pkm.contains_key(&pk) || self.mapped_live(pk) { self.free_slot(slot); return Err(Abort::Duplicate); }
         let h = ukey.as_ref().map(|k| hash_bytes(k)).unwrap_or(0);
         let mut secm = ukey.as_ref().map(|_| self.sec()[Self::sec_shard_h(h)].write().unwrap());
-        if let (Some(m), Some(k)) = (&secm, &ukey) { if self.uniq_contains_locked(m, h, k) { self.free_slot(slot); return Err(Abort::Duplicate); } }
+        if let (Some(m), Some(k)) = (&secm, &ukey) { if self.uniq_taken(m, h, k, freed) { self.free_slot(slot); return Err(Abort::Duplicate); } }
         let mut c = self.chunks()[ck].write().unwrap();
         pkm.insert(pk, slot);
         let d = Self::alloc(&mut c, self.stride);
@@ -1221,14 +1308,14 @@ impl Table {
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
         self.free_slot(slot);
     }
-    fn claim_update(&self, slot: u32, base: u64, new: &[u8], old_key: Option<&[u8]>, mark: u64) -> Result<(), Abort> {
+    fn claim_update(&self, slot: u32, base: u64, new: &[u8], old_key: Option<&[u8]>, mark: u64, freed: &HashSet<u32>) -> Result<(), Abort> {
         { let links = self.fks.read().unwrap().clone(); let _ = self.fk_guards(&links, new)?; }
         let new_key = self.unique_key(new);
         let key_changed = new_key != old_key;
         let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * self.stride);
         let nh = new_key.map(hash_bytes);
         let mut secm = if key_changed && nh.is_some() { Some(self.sec()[Self::sec_shard_h(nh.unwrap())].write().unwrap()) } else { None };
-        if let (Some(m), Some(k)) = (&secm, new_key) { if self.uniq_contains_locked(m, nh.unwrap(), k) { return Err(Abort::Duplicate); } }
+        if let (Some(m), Some(k)) = (&secm, new_key) { if self.uniq_taken(m, nh.unwrap(), k, freed) { return Err(Abort::Duplicate); } }
         let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
         let (v, p) = Self::hdr_at(d, off);
         if p != 0 || v != base { return Err(Abort::Conflict); }
@@ -1263,10 +1350,14 @@ impl Database {
         if txn.writes.is_empty() { return Ok(0); }
         let mark = TXN_MARK | txn.id;
         let mut claimed = 0; let mut err = None;
+        // the rows whose UNIQUE value this transaction gives up, by table: deleted, or updated to another value
+        let mut freed: HashMap<u16, HashSet<u32>> = HashMap::new();
+        for w in &txn.writes { match w { TxnWrite::Delete { table, slot, .. } => { freed.entry(table.id).or_default().insert(*slot); } TxnWrite::Update { table, slot, row, old_key, .. } if table.unique_key(row) != old_key.as_deref() => { freed.entry(table.id).or_default().insert(*slot); } _ => {} } }
+        let none = HashSet::new();
         for i in 0..txn.writes.len() {
             let r = match &mut txn.writes[i] {
-                TxnWrite::Insert { table, row, slot } => table.claim_insert(row, slot, mark),
-                TxnWrite::Update { table, slot, base, row, old_key } => table.claim_update(*slot, *base, row, old_key.as_deref(), mark),
+                TxnWrite::Insert { table, row, slot } => { let f = freed.get(&table.id).unwrap_or(&none); table.claim_insert(row, slot, mark, f) }
+                TxnWrite::Update { table, slot, base, row, old_key } => { let f = freed.get(&table.id).unwrap_or(&none); table.claim_update(*slot, *base, row, old_key.as_deref(), mark, f) }
                 TxnWrite::Delete { table, slot, base, .. } => table.claim_delete(*slot, *base, mark),
             };
             if let Err(e) = r { err = Some(e); break; }
@@ -1292,7 +1383,7 @@ impl Database {
             }
             let mut payload = Vec::with_capacity(txn.writes.iter().map(|w| w.row().len() + 7).sum());
             let mut ring = Vec::with_capacity(payload.capacity() + 64);
-            for w in &txn.writes { let key; let bytes: &[u8] = if let TxnWrite::Delete { table, row, .. } = w { key = table.pk_of(row).to_le_bytes(); &key } else { w.row() }; payload.extend_from_slice(&w.table().id.to_le_bytes()); payload.push(w.op()); payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); payload.extend_from_slice(bytes);
+            for w in &txn.writes { let key; let bytes: &[u8] = if let TxnWrite::Delete { table, row, .. } = w { key = table.schema.key_record(row); &key } else { w.row() }; payload.extend_from_slice(&w.table().id.to_le_bytes()); payload.push(w.op()); payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); payload.extend_from_slice(bytes);
                                     ring.extend_from_slice(&w.table().id.to_le_bytes()); ring.push(w.op()); ring.extend_from_slice(&(w.row().len() as u32).to_le_bytes()); ring.extend_from_slice(w.row()); }
             seq = self.log.append_with_ring(OP_TXN, u16::MAX, &payload, &ring);
             for w in &txn.writes {
@@ -1344,6 +1435,41 @@ mod log_tests {
         let bytes: u64 = GLog::list_segments(&dir).iter().map(|&f| fs::metadata(GLog::seg_path_in(&dir, f)).unwrap().len()).sum();
         let (recs, _) = parse_glog(&fs::read(GLog::seg_path_in(&dir, GLog::list_segments(&dir)[0])).unwrap());
         assert_eq!(recs.len(), 100, "all 100 records in the segment ({bytes} bytes)");
+        fs::remove_dir_all(&dir).ok();
+    }
+    /// A close right after a write that restarted idle log threads: the write is in the file when stop returns.
+    #[test] fn stop_waits_for_threads_restarted_by_a_write() {
+        for round in 0..20 {
+            let dir = std::env::temp_dir().join(format!("sqweezdb-logrestart-{}-{round}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
+            let log = Arc::new(GLog::new(&dir));
+            { let mut s = log.st.lock().unwrap(); s.started = true; s.running = true; s.idle_exit = Some(Duration::from_millis(5)); }
+            log.spawn_threads();
+            log.append(OP_INSERT, 1, b"first");
+            let t = Instant::now(); while log.st.lock().unwrap().running { assert!(t.elapsed() < Duration::from_secs(5)); std::thread::sleep(Duration::from_millis(2)); }   // the threads left
+            log.append(OP_INSERT, 1, b"second");   // restarts them
+            log.stop();
+            let recs: usize = GLog::list_segments(&dir).iter().map(|&f| parse_glog(&fs::read(GLog::seg_path_in(&dir, f)).unwrap()).0.len()).sum();
+            assert_eq!(recs, 2, "round {round}: both records are in the log when stop returns");
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+    /// `sync_delay`: with nobody waiting, writes reach the file at once but their fsync waits out the delay; a waiter
+    /// (a durable commit, a snapshot, a close) gets its sync right away, and stopping flushes everything.
+    #[test] fn a_delayed_sync_waits_for_the_delay_or_a_waiter() {
+        let dir = std::env::temp_dir().join(format!("sqweezdb-logdelay-{}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
+        let log = Arc::new(GLog::new(&dir));
+        { let mut s = log.st.lock().unwrap(); s.started = true; s.running = true; s.sync_delay = Some(Duration::from_secs(5)); }
+        log.spawn_threads();
+        let seq = log.append(OP_INSERT, 1, b"one");
+        assert!(log.wait_written(Duration::from_secs(5)) >= seq, "the record reaches the file without waiting for the sync");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(log.st.lock().unwrap().durable < seq, "nobody waits: the fsync is held for the delay");
+        let t = Instant::now(); log.wait_durable(seq);
+        assert!(t.elapsed() < Duration::from_secs(2), "a waiter ends the delay ({:?})", t.elapsed());
+        let seq2 = log.append(OP_INSERT, 1, b"two"); log.wait_written(Duration::from_secs(5));
+        let t = Instant::now(); log.stop();
+        assert!(t.elapsed() < Duration::from_secs(2), "stop does not wait out the delay ({:?})", t.elapsed());
+        assert!(log.st.lock().unwrap().durable >= seq2, "stop leaves everything synced");
         fs::remove_dir_all(&dir).ok();
     }
 }

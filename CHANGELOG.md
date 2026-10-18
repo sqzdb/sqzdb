@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.3.0 — 2026-10-17
+
+**Upgrade if you delete rows inside transactions.** Versions 0.1.0 and 0.2.0 replayed a transaction's
+deletes from a table with an `INT` key against the wrong rows after a restart (see Fixed). This version
+replays those logs correctly; a snapshot written after a wrong replay keeps the wrong rows.
+
+### Added
+- **Everyday SQL.** `LEFT JOIN`; `OR`, `NOT`, `LIKE` and `ILIKE` in `WHERE`; `DISTINCT`; `GROUP BY` several
+  columns or expressions; `HAVING`; `ORDER BY` several columns; `OFFSET`; `COUNT(DISTINCT …)`,
+  `group_concat` and `string_agg`; arithmetic, `CASE`, `CAST`, JSON `->` and `->>`, and about 50 functions
+  for text, numbers, time and JSON; `SELECT` without `FROM`; `INSERT … SELECT`; upserts (`ON CONFLICT …
+  DO NOTHING | DO UPDATE`, `INSERT OR IGNORE | REPLACE`, `REPLACE INTO`); `UPDATE … SET col = expression`;
+  `DELETE` by any condition. 148 queries and statements return the same rows as SQLite on the same data
+  (`src/bin/e55_sql_diff.rs`). Where SQLite returns NULL or guesses, these return an error: a division by
+  zero, an integer overflow, a value of the wrong type.
+- **Text primary keys**: `id TEXT PRIMARY KEY` (or `VARCHAR(n)`, `BYTES(n)`), with foreign keys, joins,
+  cascades, transactions, the change feed and live queries. A key of up to 15 bytes is kept exactly; a
+  longer one by 120 bits of its SHA-256.
+- **Indexes on text and bytes columns**, and joins and `IN` on text columns.
+- **`log.syncDelay`**: with `durable: false`, hold the background fsync up to this long so one fsync covers
+  more writes. Off by default. For hosts with thousands of small databases on one disk, where 1 s gave
+  two to three times the write throughput across 10,000 databases. Anything that waits for durability
+  still syncs at once. In Go: `Options.Log.SyncDelay`.
+- **Two demos with benchmarks**: `demos/boards` (a multi-tenant board app) and `demos/agents` (a database
+  per AI agent), each with a load tool that runs the same workload against PocketBase.
+- `CREATE TABLE IF NOT EXISTS` leaves an existing table alone.
+- `PRIMARY KEY (col)` and `UNIQUE (col)` declared at the end of `CREATE TABLE`.
+
+### Changed
+- **SQL that isn't implemented is refused instead of ignored.** These used to run and return a wrong
+  answer without an error, and now fail with `SYNTAX` ("unsupported: … is not implemented yet"): window
+  functions, `FILTER`, `WITH`, `LIMIT offset, count`, `NULLS FIRST/LAST`, `FOR UPDATE`, `CHECK`
+  constraints, generated columns, a second `UNIQUE` column, text or binary columns wider than 65,535
+  bytes, `COLLATE`, `UPDATE … RETURNING`, `UPDATE … FROM`, `DELETE … LIMIT` (which deleted every
+  matching row), `DELETE … RETURNING`, and `CREATE TEMPORARY TABLE`. (`HAVING`, `DISTINCT`,
+  `COUNT(DISTINCT …)`, `OFFSET`, `ORDER BY` a second column and the upserts, which were ignored too,
+  now work.)
+- A join between columns that hold different kinds of values (`INT` with `TEXT`, or any `DOUBLE` or
+  `BOOL` column) is refused. `SUM` and `AVG` over text, bytes, UUID or timestamp columns are refused;
+  they returned 0.
+- A column named `true`, `false` or `null` must be quoted (`"true"`), as in PostgreSQL, because
+  `SELECT true` reads the value.
+- A value of the wrong type for an operator or function, a division by zero and an integer overflow
+  fail with `TYPE`. `UPDATE` by anything other than the primary key fails with `SYNTAX` (it was `ERROR`).
+- Inside a transaction, a read of a table the transaction has written, other than a lookup by primary key,
+  fails with `TRANSACTION`. It used to return rows without the transaction's own writes, and a `DELETE`
+  by any other condition skipped rows the transaction had inserted.
+
+### Fixed
+- **After a restart, a transaction's deletes from a table with an `INT` key were applied to the wrong
+  rows.** Each was logged as a 16-byte key and read back as part of a row, so replaying the log removed a
+  different row, or none, and kept the deleted one. Delete records now carry 8 bytes, and logs written by
+  0.1.0 and 0.2.0 replay correctly. A snapshot written after such a replay already holds the wrong rows;
+  restarting with this version can't repair it.
+- `MIN` and `MAX` over a text, `UUID` or `BOOL` column returned 0. They compare the values now.
+- `MIN` and `MAX` of integers beyond 2^53 were rounded (they went through a double), and `SUM` of
+  integers wrapped around on overflow; `SUM` now fails instead. `SUM` over a `BOOL` column returned 0; it
+  counts the true values.
+- In one transaction, deleting a row (or changing its `UNIQUE` value) and giving that value to another
+  row failed with `DUPLICATE`, and so did swapping two rows' values.
+- With `log.threadsIdleAfter` set, a write that woke the idle log threads, followed at once by a close,
+  could be acknowledged and never written. Closing now waits for those threads.
+- Closing a database opened with a snapshot policy (the default) waited up to 200 ms.
+- With `log.threadsIdleAfter` set, every restart of the log threads began a new log file, so a database
+  written now and then collected one small file per write until its next snapshot.
+
 ## 0.2.0 — 2026-10-17
 
 ### Added

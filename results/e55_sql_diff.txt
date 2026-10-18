@@ -1,0 +1,7 @@
+REFUSED  SELECT id, (SELECT country FROM cities c WHERE c.city = visits.city) FROM visits ORDER BY id
+         unsupported correlation c.city = visits.city: both columns must be INT or TIMESTAMP, or both UUID
+REFUSED  SELECT id FROM visits WHERE EXISTS (SELECT 1 FROM cities c WHERE c.city = visits.city) ORDER BY id
+         unsupported correlation c.city = visits.city: both columns must be INT or TIMESTAMP, or both UUID
+REFUSED  SELECT id FROM visits WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.city = visits.city) ORDER BY id
+         unsupported correlation c.city = visits.city: both columns must be INT or TIMESTAMP, or both UUID
+148 same, 0 differ, 3 refused

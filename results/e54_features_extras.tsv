@@ -1,0 +1,5 @@
+category	feature	sqweezdb	sqlite	turso
+Operations	Encryption of the database files	no: the log and snapshot are plaintext; backups are encrypted with AES-256-GCM (E35)	no: plaintext file (encryption needs SEE, SQLCipher or a VFS)	yes: AEGIS or AES-GCM page encryption (experimental flag); unreadable without the key
+Realtime	Change notifications in the process	yes: filtered subscriptions and live queries, with row policies, also to other processes (E37); a resumable change feed (E32)	partial: update_hook gives table and rowid for every change (2 for 2 rows), same connection only, no filter	partial: change capture into a table read with SQL (turso_cdc), no push
+Operations	Online copy of a live database	yes: snapshot while writers run, point-in-time restore, followers (E26)	yes: the backup API and VACUUM INTO	yes: VACUUM INTO
+Operations	Data readable by other tools	no: its own log and snapshot format; read it through sqweezdb (shell, console, bindings)	yes: the most widely supported file format	yes: SQLite opens the file Turso wrote

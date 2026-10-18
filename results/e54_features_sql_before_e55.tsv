@@ -1,0 +1,89 @@
+category	feature	sqweezdb	sqlite	turso
+Types	Text of any length, no declared maximum	yes: only with a declared maximum, stored at full width	yes	yes
+Types	Text longer than 64 KB	no: column s: TEXT value of 100000 bytes exceeds TEXT(255)	yes	yes
+Types	Binary data (BLOB)	no: unsupported literal X'00ff10'	yes	yes
+Types	Boolean type	yes: as ok = true, not bare ok	yes	yes
+Types	Exact decimals (0.1 + 0.2 = 0.3)	no: unsupported type DECIMAL(10,2)	wrong: returned 0	wrong: returned 0
+Types	A value of the wrong type is rejected	yes	yes: only in STRICT tables	yes: only in STRICT tables
+Types	Generate a UUID	no: unsupported function uuid	no: no such function: uuid	yes: gen_random_uuid()
+Types	UUID column that rejects a malformed value	yes	wrong: accepted	wrong: accepted
+Types	Current date and time	no: unsupported function current_timestamp	yes: CURRENT_TIMESTAMP	yes: CURRENT_TIMESTAMP
+Types	Date arithmetic	no: unsupported: date with more than one argument is not implemented yet	yes: date(…, '+1 day')	yes: date(…, '+1 day')
+Types	Extract a part of a date	no: unsupported: strftime with more than one argument is not implemented yet	yes: strftime	yes: strftime
+Types	Timestamp column defaulting to now	yes: CURRENT_TIMESTAMP	yes: CURRENT_TIMESTAMP	yes: CURRENT_TIMESTAMP
+JSON	Read a field from JSON text	no: unsupported: json_extract with more than one argument is not implemented yet	yes: json_extract	yes: json_extract
+JSON	Filter rows by a field inside JSON	no: unsupported predicate json_extract(doc, '$.n') > 3	yes: json_extract	yes: json_extract
+JSON	Aggregate rows into a JSON array	no: unsupported FROM (SELECT 1 AS x UNION ALL SELECT 2)	yes: json_group_array	yes: json_group_array
+JSON	A JSON column rejects malformed JSON	no: unsupported type JSON	yes: with CHECK (json_valid(…))	yes: with CHECK (json_valid(…))
+Schema	Automatic ids	yes: AUTOINCREMENT	yes: AUTOINCREMENT	yes: AUTOINCREMENT
+Schema	UNIQUE constraint	yes	yes	yes
+Schema	NOT NULL with a DEFAULT	yes	yes	yes
+Schema	CHECK constraint	no: unsupported: CHECK constraint on age is not implemented yet	yes	yes
+Schema	Foreign keys enforced	yes	yes: after PRAGMA foreign_keys = ON (off by default, per connection)	yes: after PRAGMA foreign_keys = ON (off by default, per connection)
+Schema	ON DELETE CASCADE	yes	yes: after PRAGMA foreign_keys = ON	yes: after PRAGMA foreign_keys = ON
+Schema	Composite primary key	no: unsupported: a primary key on more than one column is not implemented yet	yes	yes
+Schema	Text primary key	no: primary key must be an INT or UUID column	yes	yes
+Schema	Index on several columns	no: expected ( column )	yes	yes
+Schema	Index on a text column	no: only INT, TIMESTAMP and UUID columns can be indexed (for now)	yes	yes
+Schema	Expression or partial index	yes: partial	yes: expression	yes: expression
+Schema	Generated columns	no: unsupported: generated column b is not implemented yet	yes	yes: experimental flag
+Schema	Views	no: unsupported statement CREATE VIEW grown AS SELECT id FROM users WHERE age > 28	yes	yes
+Schema	Materialized views	no: unsupported statement CREATE MATERIALIZED VIEW by_grp AS SELECT grp, count(*) AS n FROM users GROUP BY grp	no: near "MATERIALIZED": syntax error	yes: experimental flag
+Schema	Triggers	no: unsupported statement CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN INSERT INTO audit (t_id) VALUES (NEW.id); END	yes	yes
+Schema	ALTER TABLE … ADD COLUMN	yes	yes	yes
+Schema	ALTER TABLE … DROP COLUMN	yes	yes	yes
+Schema	ALTER TABLE … RENAME COLUMN	yes	yes	yes
+Schema	ALTER TABLE … RENAME TO	no: unsupported ALTER TABLE operation RENAME TO people	yes	yes
+Schema	Change a column's type	yes: ALTER COLUMN … TYPE	no: near "TYPE": syntax error	no: near "TYPE": syntax error
+Schema	Case-insensitive comparison	no: unsupported expression 'ALICE' COLLATE NOCASE	yes: COLLATE NOCASE	yes: COLLATE NOCASE
+Schema	List tables from SQL	no: no such table sqlite_schema	yes: sqlite_schema	yes: sqlite_schema
+Schema	Attach a second database file	no: unsupported statement ATTACH DATABASE 'data/nocow/e54/168/other.db' AS other	yes	yes: experimental flag
+Queries	LEFT JOIN	no: only INNER JOIN ... ON is supported, got Left(On(BinaryOp { left: CompoundIdentifier([Ident { value: "o", quote_style: None, span: Span(Loca	yes	yes
+Queries	Join three tables	yes	yes	yes
+Queries	RIGHT and FULL OUTER joins	no: only INNER JOIN ... ON is supported, got FullOuter(On(BinaryOp { left: CompoundIdentifier([Ident { value: "o", quote_style: None, span: Span	yes	no: Parse error: FULL OUTER JOIN requires an equality condition in the ON clause
+Queries	IN (subquery)	yes	yes	yes
+Queries	EXISTS (subquery)	yes: correlated only	yes: uncorrelated	yes: uncorrelated
+Queries	Subquery in FROM (derived table)	no: unsupported FROM (SELECT user_id FROM orders WHERE amount >= 10) t	yes	yes
+Queries	Correlated subquery	no: unsupported predicate (SELECT sum(amount) FROM orders o WHERE o.user_id = u.id) > 25	yes	yes
+Queries	WITH (common table expressions)	no: unsupported: WITH is not implemented yet	yes	yes
+Queries	Recursive WITH	no: unsupported: WITH is not implemented yet	yes	yes
+Queries	Window functions	no: unsupported FROM (SELECT row_number() OVER (PARTITION BY grp ORDER BY age) AS r FROM users) t	yes	yes
+Queries	GROUP BY with HAVING	no: unsupported FROM (SELECT grp FROM users GROUP BY grp HAVING avg(age) > 30) t	yes	yes
+Queries	ORDER BY two columns	no: unsupported: ORDER BY on more than one column is not implemented yet	yes	yes
+Queries	LIMIT with OFFSET	no: unsupported: OFFSET is not implemented yet	yes	yes
+Queries	SELECT DISTINCT	no: unsupported: DISTINCT is not implemented yet	yes	yes
+Queries	UNION and EXCEPT	no: unsupported FROM (SELECT id FROM users UNION SELECT user_id FROM orders EXCEPT SELECT 4) t	yes	yes
+Queries	CASE expressions	no: sum needs a column	yes	yes
+Queries	COUNT(DISTINCT …)	no: unsupported: count(DISTINCT …) is not implemented yet	yes	yes
+Queries	Aggregates (avg)	yes	yes	yes
+Queries	Arithmetic on aggregates	no: unsupported projection sum(age) + avg(age) + min(age) + max(age)	yes	yes
+Queries	upper() and lower()	no: unsupported function upper	yes	yes
+Queries	substr(), replace(), length()	no: unsupported: replace with more than one argument is not implemented yet	yes	yes
+Queries	Concatenate strings	no: unsupported projection name || '-' || age	yes: ||	yes: ||
+Queries	Join strings across rows	no: unsupported FROM (SELECT name FROM users ORDER BY id) t	yes: group_concat	yes: group_concat
+Queries	Math functions	no: unsupported: round with more than one argument is not implemented yet	yes	yes
+Queries	COALESCE, NULLIF, CAST	no: unsupported: coalesce with more than one argument is not implemented yet	yes	yes
+Queries	BETWEEN and IN lists	yes	yes	yes
+Queries	Query plan (EXPLAIN)	no: unsupported statement EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1	yes: EXPLAIN QUERY PLAN	yes: EXPLAIN QUERY PLAN
+Search	LIKE	no: unsupported predicate name LIKE 'a%'	yes	yes
+Search	Case-insensitive LIKE	no: unsupported predicate name ILIKE 'A%'	yes: LIKE ignores case (ASCII)	yes: LIKE ignores case (ASCII)
+Search	Regular expressions	no: unsupported predicate name REGEXP '^[ab]'	no: no such function: REGEXP	yes: REGEXP
+Search	Full-text search	no: unsupported statement CREATE VIRTUAL TABLE docs USING fts5 (body)	yes: FTS5	yes: fts index (experimental flag)
+Search	Full-text relevance ranking	no: unsupported statement CREATE VIRTUAL TABLE docs USING fts5 (body)	yes: bm25	yes: fts_score (experimental flag)
+Search	Vector similarity (nearest embedding)	no: unsupported expression vector32('[1,0,0]')	no: no such function: vector32	yes: vector32 + vector_distance_cos
+Search	Vector index	no: expected ( column )	no: near "USING": syntax error	yes: toy_vector_sparse_ivf, sparse vectors only (experimental flag)
+Writes	UPSERT (ON CONFLICT DO UPDATE)	no: unsupported: ON CONFLICT / ON DUPLICATE KEY UPDATE is not implemented yet	yes	yes
+Writes	Insert, ignoring duplicates	no: unsupported: ON CONFLICT / ON DUPLICATE KEY UPDATE is not implemented yet	yes: ON CONFLICT DO NOTHING	yes: ON CONFLICT DO NOTHING
+Writes	INSERT … RETURNING	yes	yes	yes
+Writes	UPDATE … RETURNING	no: unsupported: UPDATE … RETURNING is not implemented yet	yes	yes
+Writes	INSERT … SELECT	no: unsupported: INSERT … SELECT (only INSERT … VALUES) is not implemented yet	yes	yes
+Writes	CREATE TABLE … AS SELECT	no: unsupported: CREATE TABLE with OR REPLACE, TEMPORARY, AS SELECT, LIKE, CLONE, INHERITS or PARTITION OF is not implemented yet	yes	yes
+Writes	UPDATE with a subquery	yes	yes	yes
+Writes	UPDATE … FROM another table	no: unsupported: UPDATE … FROM another table is not implemented yet	yes	yes
+Writes	DELETE with a subquery	yes	yes	yes
+Transactions	BEGIN, COMMIT, ROLLBACK	yes	yes	yes
+Transactions	Savepoints	no: unsupported statement SAVEPOINT s	yes	yes
+Transactions	A transaction sees its own writes	no: unsupported: reading users after writing it in the same transaction is not implemented yet (reads see committed data only); commit first, or	yes	yes
+Transactions	Concurrent writers syntax (BEGIN CONCURRENT)	no: unsupported statement PRAGMA journal_mode = 'experimental_mvcc'	no: near "CONCURRENT": syntax error	yes: MVCC journal mode
+Operations	Copy a live database (VACUUM INTO)	no: sql parser error: Expected: end of statement, found: 'data/nocow/e54/348/copy.db' at Line: 1, Column: 13	yes	yes
+Operations	Change capture readable from SQL	no: unsupported statement PRAGMA capture_data_changes_conn('full')	no: no such table: turso_cdc	yes: PRAGMA capture_data_changes_conn

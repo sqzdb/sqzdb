@@ -14,9 +14,10 @@ const SHARDS: usize = 64;
 /// Residency is tracked in 64 shards by tenant name, so opening one tenant never waits on another; eviction is a
 /// per-shard least-recently-used choice. An evicted tenant is simply dropped: its log holds everything and reopening
 /// replays it; a snapshot is taken first only when the unsnapshotted tail is large.
-pub struct TenantHost { pub root: PathBuf, open: Vec<Mutex<HashMap<String, Open>>>, pub max_open: usize, pub idle: Duration, pub opens: AtomicU64, pub evictions: AtomicU64, pub open_us: AtomicU64, pub durable: bool, pub snapshot_tail: u64 }
+pub struct TenantHost { pub root: PathBuf, open: Vec<Mutex<HashMap<String, Open>>>, pub max_open: usize, pub idle: Duration, pub opens: AtomicU64, pub evictions: AtomicU64, pub open_us: AtomicU64, pub durable: bool, pub snapshot_tail: u64, /// `log.syncDelay` for every tenant (see `LogPolicy`); off by default
+    pub sync_delay: Option<Duration> }
 impl TenantHost {
-    pub fn new(root: &std::path::Path, max_open: usize, idle: Duration, durable: bool) -> TenantHost { std::fs::create_dir_all(root).ok(); TenantHost { root: root.to_path_buf(), open: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), max_open, idle, opens: AtomicU64::new(0), evictions: AtomicU64::new(0), open_us: AtomicU64::new(0), durable, snapshot_tail: 1 << 20 } }
+    pub fn new(root: &std::path::Path, max_open: usize, idle: Duration, durable: bool) -> TenantHost { std::fs::create_dir_all(root).ok(); TenantHost { root: root.to_path_buf(), open: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(), max_open, idle, opens: AtomicU64::new(0), evictions: AtomicU64::new(0), open_us: AtomicU64::new(0), durable, snapshot_tail: 1 << 20, sync_delay: None } }
     fn shard(name: &str) -> usize { let mut h: u64 = 0xcbf29ce484222325; for b in name.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); } (h % SHARDS as u64) as usize }
     fn dir(&self, name: &str) -> PathBuf { self.root.join(name) }
     pub fn exists(&self, name: &str) -> bool { self.dir(name).exists() }
@@ -25,7 +26,8 @@ impl TenantHost {
         let shard = &self.open[Self::shard(name)];
         { let mut open = shard.lock().unwrap(); if let Some(o) = open.get_mut(name) { o.last_used = Instant::now(); return Ok(o.sql.clone()); } }
         let t = Instant::now(); let dir = self.dir(name);
-        let sql = if dir.exists() { Arc::new(Sql::open_idle(&dir, self.durable, self.idle)?.0) } else { let s = Sql::recreate_idle(&dir, self.durable, self.idle); let mut se = Session::default(); for q in init { s.exec_s(&mut se, q, &[])?; } Arc::new(s) };
+        let delay = |s: &Sql| s.db.log.st.lock().unwrap().sync_delay = self.sync_delay;
+        let sql = if dir.exists() { let s = Sql::open_idle(&dir, self.durable, self.idle)?.0; delay(&s); Arc::new(s) } else { let s = Sql::recreate_idle(&dir, self.durable, self.idle); delay(&s); let mut se = Session::default(); for q in init { s.exec_s(&mut se, q, &[])?; } Arc::new(s) };
         self.opens.fetch_add(1, Ordering::Relaxed); self.open_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         let mut open = shard.lock().unwrap();
         if let Some(o) = open.get(name) { return Ok(o.sql.clone()); }  // someone else opened it meanwhile
