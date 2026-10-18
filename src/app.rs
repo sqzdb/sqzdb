@@ -110,8 +110,10 @@ impl Shape {
         }).collect())).collect()
     }
 }
-/// Whether a statement may call the embeddings endpoint (`embed()`), so it runs off the runtime's threads.
-fn calls_embed(body: &[u8]) -> bool { body.windows(6).any(|w| w.eq_ignore_ascii_case(b"embed(")) }
+/// Whether statements may wait on something slow besides the CPU: a commit's fsync or the bucket, or (with
+/// `[embed]`) the embeddings endpoint, which any statement may call through `embed()`. Those run off the runtime's
+/// threads. (Deciding by the statement's text would be fooled by `embed (` or a JSON escape.)
+fn sql_may_wait(sql: &Sql) -> bool { sql.cfg.durable != Durability::Visible || sql.cfg.embed.is_some() }
 impl AppState {
     /// A token bucket per client address for sign-up, sign-in and code exchange: 10 at once, then one every 3 s.
     fn allow(&self, ip: IpAddr) -> bool {
@@ -293,6 +295,8 @@ fn sign_up_fields(sql: &Sql, table: &str, v: &J) -> Result<Vec<(String, Value)>,
     let fields = match v.get("fields") { None | Some(J::Null) => return Ok(vec![]), Some(J::Object(m)) => m, _ => return Err(json!({"error": "fields is an object", "code": "ARGUMENTS"})) };
     fields.iter().map(|(k, x)| {
         let c = t.schema.col(k).ok_or_else(|| json!({"error": format!("no such column {k} in {table}"), "code": "SCHEMA"}))?;
+        // a file is attached by its uploader, and someone signing up has uploaded nothing yet: they set it signed in
+        if t.schema.columns[c].file { return Err(denied(format!("a sign-up can't set {k}, a FILE column; set it once signed in"))); }
         let role_col = matches!(at.role, crate::auth::RoleSrc::Column(r) if r == c);
         if role_col || (c != at.login && !open.iter().any(|o| t.schema.col(o) == Some(c))) { return Err(denied(format!("a sign-up may not set {k} (app.signUp.{table} lists the columns a client may set)"))); }
         Ok((k.clone(), j_to_value(x)))
@@ -325,7 +329,7 @@ fn redirect(to: &str, cookies: &[String]) -> Vec<u8> {
 /// Requests whose handling can block a thread for a while: sign-in (password hashing; a provider's token exchange
 /// runs a runtime of its own), static files, and SQL when commits wait for their fsync or the bucket.
 fn blocks(sql: &Sql, req: &Req) -> bool {
-    !req.path.starts_with("/api/") || req.path.starts_with("/api/auth/") || (req.method == "POST" && (sql.cfg.durable != Durability::Visible || calls_embed(&req.body)))
+    !req.path.starts_with("/api/") || req.path.starts_with("/api/auth/") || (req.method == "POST" && sql_may_wait(sql))
 }
 
 /// One connection, plain or TLS: HTTP requests until it closes, or a WebSocket.
@@ -584,7 +588,7 @@ async fn read_loop<R: AsyncRead + Unpin>(weak: &Weak<Sql>, conn: &Arc<Conn>, r: 
         let Some(sql) = weak.upgrade() else { return Ok(()) };
         let (out, live) = match serde_json::from_slice::<J>(&msg) {
             Err(e) => (vec![json!({"error": format!("bad JSON: {e}"), "code": "ARGUMENTS"})], None),
-            Ok(v) if sql.cfg.durable != Durability::Visible || calls_embed(&msg) => {   // waits for an fsync or the embeddings endpoint: off the runtime's threads
+            Ok(v) if sql_may_wait(&sql) => {   // may wait for an fsync or the embeddings endpoint: off the runtime's threads
                 let c = conn.clone();
                 let Ok(x) = tokio::task::spawn_blocking(move || message(&sql, &c, &v)).await else { return Err(io::Error::other("a message failed")) };
                 x

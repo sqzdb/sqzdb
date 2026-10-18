@@ -50,6 +50,8 @@ try {
   assert.deepEqual(found.slice(0, 2).map((r) => r.body).sort(), ['my cat eats fish every morning', 'my cat sleeps on the sofa']);
   assert.ok(found.every((r) => !r.body.startsWith('bob')), 'Ann never sees Bob\'s notes');
   assert.ok(found[0].d < found[2].d);
+  // however it is written (a space, a comment), embed() runs off the server's async threads
+  assert.equal((await ann.sql('SELECT body FROM notes WHERE embedding IS NOT NULL ORDER BY cosine_distance(embedding, embed /* x */ (?)) LIMIT 1', ['cat']))[0].body.includes('cat'), true);
   // a vector comes back as numbers, and goes in as an array
   const [one] = await ann.sql('SELECT embedding FROM notes WHERE body = ?', [notes[0]]);
   assert.equal(one.embedding.length, 64); assert.ok(one.embedding.every((x) => typeof x === 'number'));

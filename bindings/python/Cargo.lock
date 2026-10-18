@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "sqweezdb"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "sqweezdb-python"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "pyo3",
  "sqweezdb",

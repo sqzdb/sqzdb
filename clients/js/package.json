@@ -1,6 +1,6 @@
 {
   "name": "sqweezdb-client",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Sign in and run SQL with live queries against a sqweezdb app API, from a browser, React Native or Node",
   "type": "module",
   "main": "index.js",

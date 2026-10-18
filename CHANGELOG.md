@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.1 — 2026-10-18
+
+**Upgrade from 0.7.0 if you use files, `[embed]` or provider sign-in through the app API.**
+
+### Fixed
+- **A sign-up could take someone else's file.** With a `FILE` column listed in `app.signUp`, a client could
+  sign up with the id of another user's file (seen in a link, say) and keep it through their own row. A
+  sign-up now can't set `FILE` columns; set them once signed in.
+- **A request to the embeddings endpoint could stall the app API.** A statement calling `embed()` written so
+  the server didn't recognize it (a space before the parenthesis, a comment, a JSON escape) ran on the
+  server's async threads while it waited for the model; a few at once could hold up every client. With
+  `[embed]` set, every statement now runs on the blocking pool.
+- **An API key or client secret could go to another host over plain http.** `embed.url` and OAuth endpoints
+  may be http only on this machine, and `http://localhost:80@elsewhere` passed that check. URLs are now
+  parsed, and one with a user or password in it is refused.
+- The search-text cache kept every text whole, up to a megabyte each; it keeps the hash of the text sent.
+
 ## 0.7.0 — 2026-10-18
 
 ### Added

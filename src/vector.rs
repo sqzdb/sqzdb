@@ -24,8 +24,9 @@ const QUERY_CACHE: usize = 1_000;
 /// How long a text the endpoint refused is left alone before it is tried again.
 const SKIP_FOR: Duration = Duration::from_secs(600);
 
-/// Per database: whether the embedder runs, search texts already embedded, rows whose text the endpoint refused.
-#[derive(Default)] pub struct VectorState { started: AtomicBool, cache: Mutex<(HashMap<String, Vec<u8>>, VecDeque<String>)>, refused: Mutex<HashMap<(u16, Key), Instant>> }
+/// Per database: whether the embedder runs, search texts already embedded (by the SHA-256 of what was sent, so the
+/// cache is at most QUERY_CACHE vectors whatever the texts), rows whose text the endpoint refused.
+#[derive(Default)] pub struct VectorState { started: AtomicBool, cache: Mutex<(HashMap<[u8; 32], Vec<u8>>, VecDeque<[u8; 32]>)>, refused: Mutex<HashMap<(u16, Key), Instant>> }
 
 fn clip(mut s: String) -> String { if s.len() > MAX_TEXT { let mut n = MAX_TEXT; while !s.is_char_boundary(n) { n -= 1; } s.truncate(n); } s }
 fn raw<'r>(schema: &Schema, row: &'r [u8], k: usize) -> (bool, &'r [u8]) { (is_null(row, k), &row[schema.offsets[k]..schema.offsets[k] + schema.columns[k].ty.width()]) }
@@ -70,11 +71,13 @@ impl Sql {
     }
     /// A search text's embedding, as a VECTOR value: cached, so a query run again (a live one, say) costs nothing.
     pub(crate) fn embed_query(&self, text: &str) -> Result<Vec<u8>, String> {
-        if let Some(v) = self.vectors.cache.lock().unwrap().0.get(text) { return Ok(v.clone()); }
-        let v: Vec<u8> = self.embed_texts(&[clip(text.to_string())])?.remove(0).iter().flat_map(|x| x.to_le_bytes()).collect();
+        use sha2::Digest;
+        let sent = clip(text.to_string()); let key: [u8; 32] = sha2::Sha256::digest(sent.as_bytes()).into();
+        if let Some(v) = self.vectors.cache.lock().unwrap().0.get(&key) { return Ok(v.clone()); }
+        let v: Vec<u8> = self.embed_texts(&[sent])?.remove(0).iter().flat_map(|x| x.to_le_bytes()).collect();
         let mut c = self.vectors.cache.lock().unwrap();
         if c.0.len() >= QUERY_CACHE { if let Some(old) = c.1.pop_front() { c.0.remove(&old); } }
-        if c.0.insert(text.to_string(), v.clone()).is_none() { c.1.push_back(text.to_string()); }
+        if c.0.insert(key, v.clone()).is_none() { c.1.push_back(key); }
         Ok(v)
     }
 

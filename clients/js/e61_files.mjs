@@ -10,9 +10,9 @@ const BIN = new URL('../../target/release/sqweezdb', import.meta.url).pathname;
 const dir = new URL('../../data/nocow/e61', import.meta.url).pathname; fs.rmSync(dir, { recursive: true, force: true });
 const port = await new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
 const url = `http://127.0.0.1:${port}`;
-fs.writeFileSync(`${dir}.toml`, `[app]\norigins = ["http://localhost:5173"]\npublicUrl = "${url}"\n\n[app.signUp]\nusers = []\n\n[app.files]\nmaxSize = "16MB"\n`);
+fs.writeFileSync(`${dir}.toml`, `[app]\norigins = ["http://localhost:5173"]\npublicUrl = "${url}"\n\n[app.signUp]\nusers = ["avatar"]\n\n[app.files]\nmaxSize = "16MB"\n`);
 execFileSync(BIN, ['shell', dir], { input: [
-  "CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member');",
+  "CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member', avatar FILE);",
   'CREATE TABLE notes (id SERIAL PRIMARY KEY, owner INT NOT NULL, body TEXT, attachment FILE);',
   'CREATE ROLE member;', 'GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO member;',
   'CREATE POLICY own ON notes FOR ALL TO member USING (owner = SESSION.id);',
@@ -57,6 +57,8 @@ try {
   await assert.rejects(bob.sql('INSERT INTO notes (owner, body, attachment) VALUES (?, ?, ?)', [b.user.id, 'mine now', f.id]), (e) => e.code === 'DENIED');
   await assert.rejects(bob.sql('INSERT INTO notes (owner, body, attachment) VALUES (?, ?, ?)', [b.user.id, 'mine now', f]), (e) => e.code === 'DENIED');
   await assert.rejects(ann.sql('INSERT INTO notes (owner, body, attachment) VALUES (?, ?, ?)', [a.user.id, 'x', '01234567-89ab-4def-8123-456789abcdef']), (e) => e.code === 'NOT_FOUND');
+  // nor by signing up with it: someone signing up has uploaded nothing, so a FILE column waits until they are in
+  await assert.rejects(connect(url, { storage: null }).auth.signUp({ email: 'mal@x.test', avatar: f.id }, 'the password 1'), (e) => e.code === 'DENIED' && /FILE/.test(e.message));
   // a file from a result goes back as its id: an edit that keeps it, or puts it in another row of hers
   await ann.sql('UPDATE notes SET body = ?, attachment = ? WHERE id = ?', ['still a cat', f, note.id]);
   assert.equal((await ann.sql('SELECT attachment FROM notes WHERE id = ?', [note.id]))[0].attachment.id, f.id);

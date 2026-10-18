@@ -130,7 +130,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.7.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.7.1` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -383,7 +383,8 @@ model = "nomic-embed-text"        # Ollama on this machine: 768 numbers
   text it embedded; live queries see it arrive (about 2 ms after the write, plus the model's time). No
   statement writes that column. Rows written while the database was closed are embedded when it opens.
 - **Search text.** `embed(?)` in a query becomes the embedding of the parameter when the statement runs,
-  and is cached, so a live search re-run costs no request. Until a row is embedded its distance is `NULL`,
+  and is cached, so a live search re-run costs no request. With `[embed]` set, the app API runs statements
+  on its blocking pool, since any of them may wait for the endpoint. Until a row is embedded its distance is `NULL`,
   which sorts first: search with `WHERE embedding IS NOT NULL`.
 - **Values.** A vector is written as a JSON array of numbers (a client's array parameter is one) and
   comes back as an array through the app API, as raw little-endian floats through the libraries.
@@ -661,7 +662,8 @@ img.src = note.attachment.url        // { id, name, type, size, url }
 
 - **Uploading.** A `File` or `Blob` passed as a parameter is uploaded, and its id goes in the statement.
   `db.files.upload(blob)` uploads on its own and returns the file. A file from a result can be passed back
-  as a parameter. Only signed-in users upload, up to `app.files.maxSize` (25 MB).
+  as a parameter. Only signed-in users upload, up to `app.files.maxSize` (25 MB). A sign-up can't set a
+  `FILE` column (nothing is uploaded yet); set it once signed in.
 - **Who may put a file in a row.** A user may set a `FILE` column only to a file they uploaded within the
   last hour, or leave it as the row has it. So a file id someone has seen, in a link say, can't be copied
   into a row of their own. The application, through the library, may set any file.
@@ -1029,7 +1031,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.7.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.7.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

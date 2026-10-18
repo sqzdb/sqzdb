@@ -112,6 +112,13 @@ impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: ve
 /// unset) under an account with `email` as its contact. `acme_root` is a root to trust for the CA itself (a private
 /// CA, or a test one); `redirect` is an address where plain HTTP requests are sent on to https.
 #[derive(Clone, Debug)] pub struct TlsPolicy { pub domains: Vec<String>, pub email: Option<String>, pub cert: Option<PathBuf>, pub key: Option<PathBuf>, pub acme: String, pub acme_root: Option<PathBuf>, pub dir: Option<PathBuf>, pub redirect: Option<String> }
+/// An endpoint the server sends secrets to: https, or http to this machine (tests, a local model), parsed as a URL
+/// so `http://localhost:80@elsewhere` is elsewhere (and refused: no user or password in it).
+pub fn secure_url(u: &str) -> bool {
+    let Ok(p) = reqwest::Url::parse(u) else { return false };
+    if !p.username().is_empty() || p.password().is_some() || p.host_str().is_none() { return false; }
+    match p.scheme() { "https" => true, "http" => matches!(p.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")), _ => false }
+}
 pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// A name a CA can check over TLS-ALPN-01: letters, digits and hyphens in dot-separated labels, no wildcard, not an IP.
 fn is_dns_name(d: &str) -> bool {
@@ -202,8 +209,7 @@ fn resolve_oauth(name: &str, f: OAuthFile) -> Result<OAuthProvider, String> {
     let preset = |g: &str, h: &str| -> Option<String> { match (name, &kind) { ("google", OAuthKind::Oidc) => Some(g.to_string()), ("github", OAuthKind::Github) => Some(h.to_string()), _ => None }.filter(|s| !s.is_empty()) };
     let url = |v: Option<String>, p: Option<String>, k: &str| -> Result<String, String> {
         let u = v.filter(|s| !s.is_empty()).or(p).ok_or_else(|| format!("{key}.{k} is required"))?;
-        let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"].iter().any(|h| u.starts_with(h) && matches!(u.as_bytes().get(h.len()), Some(b':') | Some(b'/') | None));
-        if !u.starts_with("https://") && !local { return Err(format!("{key}.{k}: an https URL")); }
+        if !secure_url(&u) { return Err(format!("{key}.{k}: an https URL (http only to this machine), with no user or password in it")); }
         Ok(u)
     };
     let p = OAuthProvider {
@@ -278,8 +284,7 @@ impl ConfigFile {
         }
         if let Some(e) = self.embed {
             let url = e.url.filter(|u| !u.is_empty()).ok_or("embed.url: the endpoint, such as https://api.openai.com/v1 or http://localhost:11434/v1")?.trim_end_matches('/').to_string();
-            let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|p| url.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with(':') || r.starts_with('/')));
-            if !url.starts_with("https://") && !local { return Err("embed.url: https, or http on this machine (an API key goes with each request)".into()); }
+            if !secure_url(&url) { return Err("embed.url: https, or http to this machine, with no user or password in it (an API key goes with each request)".into()); }
             let model = e.model.filter(|m| !m.is_empty()).ok_or("embed.model: the embedding model, such as text-embedding-3-small or nomic-embed-text")?;
             if let Some(d) = e.dimensions { if !(1..=16_000).contains(&d) { return Err("embed.dimensions: between 1 and 16,000".into()); } }
             let batch = e.batch.unwrap_or(64); if !(1..=2048).contains(&batch) { return Err("embed.batch: between 1 and 2048".into()); }
@@ -406,6 +411,11 @@ mod tests {
             assert!(tls(bad).unwrap_err().contains(says), "{bad}: {}", tls(bad).unwrap_err());
         }
         assert!(Config::from_json(r#"{"app":{"tls":{"domains":["a.example.com"]}}}"#).unwrap_err().contains("listen.app"));
+    }
+    #[test] fn endpoints_that_get_secrets() {
+        for ok in ["https://api.openai.com/v1", "http://localhost:11434/v1", "http://127.0.0.1/v1", "http://[::1]:8080"] { assert!(secure_url(ok), "{ok}"); }
+        for bad in ["http://localhost:80@evil.example/v1", "http://127.0.0.1@evil.example", "https://user:pw@api.example", "http://evil.example", "http://localhost.evil.example", "ftp://localhost", "localhost:11434", ""] { assert!(!secure_url(bad), "{bad}"); }
+        assert!(Config::from_json(r#"{"embed":{"url":"http://localhost:1@evil.example/v1","model":"m"}}"#).unwrap_err().contains("embed.url"));
     }
     #[test] fn file_then_code_then_env() {
         let dir = std::env::temp_dir().join(format!("sqweezdb-config-test-{}", std::process::id())); std::fs::create_dir_all(&dir).unwrap();
