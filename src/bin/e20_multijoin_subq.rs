@@ -1,7 +1,7 @@
 //! Experiment 20: three-table joins and subqueries through SQL, same statements on both sides. 1M users, 10k products, 5M orders.
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
-use sqweezdb::util::Rng;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
+use sqzdb::util::Rng;
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::PathBuf;

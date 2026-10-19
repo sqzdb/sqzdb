@@ -2,7 +2,7 @@
 // 100k orders across 1000 tenants, a row policy on tenant_id. Point reads by id, each from the reader's own tenant.
 const { open } = require('./index.js');
 const fs = require('fs');
-const dir = process.argv[2] || '/tmp/sqweezdb-e49'; fs.rmSync(dir, { recursive: true, force: true });
+const dir = process.argv[2] || '/tmp/sqzdb-e49'; fs.rmSync(dir, { recursive: true, force: true });
 const db = open(dir);
 const N = 100_000, TENANTS = 1000, OPS = 200_000, ROUNDS = 5;
 db.exec('CREATE TABLE orders (id INTEGER PRIMARY KEY, tenant_id INT NOT NULL, amount DOUBLE)');

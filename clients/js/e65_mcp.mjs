@@ -6,7 +6,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs'; import assert from 'node:assert/strict'; import net from 'node:net'; import crypto from 'node:crypto';
 
-const BIN = new URL('../../target/release/sqweezdb', import.meta.url).pathname;
+const BIN = new URL('../../target/release/sqzdb', import.meta.url).pathname;
 const SDK = process.env.SDK || '/home/iluxa/Projects/cyberdom/node_modules/@modelcontextprotocol/sdk/dist/esm';
 const dir = new URL('../../data/nocow/e65', import.meta.url).pathname; fs.rmSync(dir, { recursive: true, force: true });
 const port = await new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });

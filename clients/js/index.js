@@ -1,16 +1,16 @@
-// sqweezdb client: sign in and query a sqweezdb app API (`listen.app`) from a browser, React Native or Node (22+).
+// sqzdb client: sign in and query a sqzdb app API (`listen.app`) from a browser, React Native or Node (22+).
 // Every statement runs as the signed-in user, under the database's row policies; live queries update themselves.
 //
-//   import { connect } from 'sqweezdb-client'
+//   import { connect } from 'sqzdb-client'
 //   const db = connect('https://api.example')
 //   await db.auth.signIn('ann@example.com', password)        // or db.auth.signInWith('google')
 //   const notes = await db.sql('SELECT * FROM notes ORDER BY created DESC LIMIT 20')
 //   const sub = db.live('SELECT count(*) AS n FROM notes', [], (rows) => render(rows[0].n))
 
-export class SqweezError extends Error {
-  constructor(code, message) { super(message); this.name = 'SqweezError'; this.code = code; }
+export class SqzError extends Error {
+  constructor(code, message) { super(message); this.name = 'SqzError'; this.code = code; }
 }
-const err = (e) => new SqweezError(e.code || 'ERROR', e.error || String(e));
+const err = (e) => new SqzError(e.code || 'ERROR', e.error || String(e));
 const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 // a File or Blob as a parameter is uploaded first; a file a query returned is sent as its id
 const isBlob = (p) => typeof Blob !== 'undefined' && p instanceof Blob;
@@ -34,7 +34,7 @@ class Auth {
    *  and comes back to `returnTo` (this page by default), where `connect` finishes the sign-in. */
   async signInWith(provider, { returnTo } = {}) {
     const back = returnTo || globalThis.location?.href.split('#')[0];
-    if (!back) throw new SqweezError('ARGUMENTS', 'signInWith needs returnTo outside a browser');
+    if (!back) throw new SqzError('ARGUMENTS', 'signInWith needs returnTo outside a browser');
     // the code that comes back works only with this verifier, so a code planted in a link signs no one in
     const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
     const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
@@ -80,7 +80,7 @@ class Client {
   constructor(url, opts = {}) {
     this.url = url.replace(/\/+$/, ''); this.token = null;
     this._store = opts.storage !== undefined ? opts.storage : globalThis.localStorage;
-    this._key = `sqweezdb:${this.url}`; this._fetchImpl = opts.fetch || globalThis.fetch.bind(globalThis);   // a browser's fetch must be called on the window
+    this._key = `sqzdb:${this.url}`; this._fetchImpl = opts.fetch || globalThis.fetch.bind(globalThis);   // a browser's fetch must be called on the window
     this._WS = opts.WebSocket || globalThis.WebSocket;
     this._ws = null; this._open = false; this._wait = []; this._pending = new Map(); this._lives = new Map(); this._next = 1; this._backoff = 500;
     this.auth = new Auth(this, opts.users || 'users'); this.files = new Files(this);
@@ -93,9 +93,9 @@ class Client {
     const h = new URLSearchParams(loc.hash.slice(1)); const code = h.get('sqz_code'), e = h.get('sqz_error');
     if (!code && !e) return;
     globalThis.history?.replaceState(null, '', loc.href.split('#')[0]);
-    if (e) throw new SqweezError('AUTH', e);
+    if (e) throw new SqzError('AUTH', e);
     const verifier = verifiers.take(`${this._key}:verifier`);
-    if (!verifier) throw new SqweezError('AUTH', 'sign-in failed: this page did not start this sign-in');
+    if (!verifier) throw new SqzError('AUTH', 'sign-in failed: this page did not start this sign-in');
     this.auth._took(await this._post('/api/auth/exchange', { code, verifier }, false));
   }
   _fetch(path, init) { return this._fetchImpl(this.url + path, init); }
@@ -142,7 +142,7 @@ class Client {
     ws.onmessage = (ev) => this._receive(JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)));
     ws.onclose = () => {
       this._ws = null; this._open = false;
-      for (const [, p] of this._pending) p.reject(new SqweezError('CLOSED', 'the connection closed'));
+      for (const [, p] of this._pending) p.reject(new SqzError('CLOSED', 'the connection closed'));
       this._pending.clear();
       if (this._lives.size) { setTimeout(() => this._socket(), this._backoff); this._backoff = Math.min(this._backoff * 2, 30000); }
     };
@@ -169,6 +169,6 @@ class Client {
   close() { for (const l of this._lives.values()) l.closed = true; this._lives.clear(); this._ws?.close(); }
 }
 
-/** Connect to a sqweezdb app API. Options: `users` (the table users sign in to, default 'users'), `storage` (where
+/** Connect to a sqzdb app API. Options: `users` (the table users sign in to, default 'users'), `storage` (where
  *  the session is kept: localStorage in a browser, or null), `fetch` and `WebSocket` (for other runtimes). */
 export function connect(url, opts) { return new Client(url, opts); }

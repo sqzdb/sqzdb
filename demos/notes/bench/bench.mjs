@@ -1,4 +1,4 @@
-// E59: the notes app's workloads against sqweezdb's app API and against PocketBase 0.40.5, set up the same way:
+// E59: the notes app's workloads against sqzdb's app API and against PocketBase 0.40.5, set up the same way:
 // users sign up through the public API, a note belongs to its owner (a row policy here, collection rules there),
 // both index notes.owner. Both servers run on this machine with their data on the same disk, and both are driven by
 // the same Node HTTP client (keep-alive, one connection per simulated user). From the repo:
@@ -7,7 +7,7 @@
 //
 // PocketBase 0.40.5 is expected at tools/pocketbase-0.40.5/pocketbase (from its GitHub releases) unless given.
 //
-// Each server is started, measured and stopped in turn: sqweezdb, PocketBase as it comes, and PocketBase with its
+// Each server is started, measured and stopped in turn: sqzdb, PocketBase as it comes, and PocketBase with its
 // request log off (it writes every request to a second SQLite database by default).
 import http from 'node:http'; import fs from 'node:fs'; import net from 'node:net'; import assert from 'node:assert/strict'; import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
@@ -15,7 +15,7 @@ import { connect } from '../../../clients/js/index.js';
 
 const ROOT = new URL('../../../', import.meta.url).pathname;
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i > 0 ? (typeof d === 'number' ? Number(process.argv[i + 1]) : process.argv[i + 1]) : d; };
-const SQZ = ROOT + 'target/release/sqweezdb', PB = arg('pocketbase', ROOT + 'tools/pocketbase-0.40.5/pocketbase'), DATA = ROOT + 'data/nocow/e59';
+const SQZ = ROOT + 'target/release/sqzdb', PB = arg('pocketbase', ROOT + 'tools/pocketbase-0.40.5/pocketbase'), DATA = ROOT + 'data/nocow/e59';
 const USERS = arg('users', 200), NOTES = arg('notes', 50), DEVICES = arg('devices', 1000), PASSWORD = 'the password 1';
 
 // ---------- measuring ----------
@@ -30,7 +30,7 @@ const freePort = () => new Promise((r) => { const s = net.createServer().listen(
 /** `n` workers over `items`, each `fn(item, i)` in turn. */
 async function pool(n, items, fn) { let next = 0; await Promise.all(Array.from({ length: n }, async () => { while (next < items.length) { const i = next++; await fn(items[i], i); } })); }
 
-/** One simulated user's HTTP client: keep-alive, one connection, from its own loopback address (sqweezdb limits
+/** One simulated user's HTTP client: keep-alive, one connection, from its own loopback address (sqzdb limits
  *  sign-ups per address; real users come from many). Resolves to { status, body }. */
 function httpClient(base, i) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1, localAddress: `127.0.${1 + Math.floor(i / 10)}.1` });
@@ -46,11 +46,11 @@ function httpClient(base, i) {
 }
 const ok = (r, what) => { if (r.status !== 200 || r.body?.error) throw new Error(`${what}: HTTP ${r.status} ${JSON.stringify(r.body).slice(0, 300)}`); return r.body; };
 
-// ---------- sqweezdb: the notes demo's own schema and settings ----------
-const sqweezdb = {
-  name: 'sqweezdb',
+// ---------- sqzdb: the notes demo's own schema and settings ----------
+const sqzdb = {
+  name: 'sqzdb',
   async start() {
-    const dir = `${DATA}/sqweezdb`, port = await freePort();
+    const dir = `${DATA}/sqzdb`, port = await freePort();
     execFileSync(SQZ, ['shell', dir], { input: fs.readFileSync(ROOT + 'demos/notes/schema.sql'), stdio: ['pipe', 'ignore', 'inherit'] });
     fs.writeFileSync(`${dir}.toml`, '[app.signUp]\nusers = ["name"]\n');
     const proc = spawn(SQZ, ['serve', dir, '--app', `127.0.0.1:${port}`, '--config', `${dir}.toml`], { stdio: ['ignore', 'pipe', 'inherit'] });
@@ -211,7 +211,7 @@ async function measure(target) {
 }
 
 const results = [];
-for (const target of [sqweezdb, pocketbase(true), pocketbase(false)]) { process.stderr.write(`measuring ${target.name}...\n`); results.push([target.name, await measure(target)]); }
-console.log(`E59: the notes app, ${USERS} users x ${NOTES} notes, ${DEVICES} devices; sqweezdb ${JSON.parse(fs.readFileSync(ROOT + 'clients/js/package.json')).version} vs PocketBase 0.40.5 on ${(await import('node:os')).cpus().length} cores\n`);
+for (const target of [sqzdb, pocketbase(true), pocketbase(false)]) { process.stderr.write(`measuring ${target.name}...\n`); results.push([target.name, await measure(target)]); }
+console.log(`E59: the notes app, ${USERS} users x ${NOTES} notes, ${DEVICES} devices; sqzdb ${JSON.parse(fs.readFileSync(ROOT + 'clients/js/package.json')).version} vs PocketBase 0.40.5 on ${(await import('node:os')).cpus().length} cores\n`);
 for (const key of Object.keys(results[0][1])) { console.log(key); for (const [name, r] of results) console.log(`  ${name.padEnd(30)} ${r[key]}`); }
 process.exit(0);   // the realtime clients' sockets would keep Node waiting

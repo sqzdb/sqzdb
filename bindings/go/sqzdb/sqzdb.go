@@ -1,22 +1,22 @@
-// Package sqweezdb is a thin Go binding over the C ABI of the sqweezdb engine (one process owns a database directory).
-package sqweezdb
+// Package sqzdb is a thin Go binding over the C ABI of the sqzdb engine (one process owns a database directory).
+package sqzdb
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -lsqweezdb -Wl,-rpath,${SRCDIR}/../../../target/release
+#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -lsqzdb -Wl,-rpath,${SRCDIR}/../../../target/release
 #include <stdlib.h>
 #include <stddef.h>
 typedef struct Db Db; typedef struct Stmt Stmt; typedef struct Sess Sess; typedef struct Rows Rows;
 typedef struct { int tag; long long i; double f; const unsigned char* ptr; size_t len; } CValue;
-Db* sqweezdb_open(const char* path, int durable); long long sqweezdb_last_insert_id(Sess*); Db* sqweezdb_open_with(const char* path, const char* json); const char* sqweezdb_open_error(); void sqweezdb_close(Db*); const char* sqweezdb_last_error(Db*);
-Sess* sqweezdb_session(Db*); void sqweezdb_session_free(Sess*); int sqweezdb_login(Db*, Sess*, const char*); int sqweezdb_assume(Db*, Sess*, const char*);
-char* sqweezdb_sign_up(Db*, const char*, const char*, const char*); char* sqweezdb_sign_in(Db*, const char*, const char*, const char*); int sqweezdb_sign_out(Db*, const char*);
-int sqweezdb_set_password(Db*, const char*, const char*, const char*); int sqweezdb_sign_out_everywhere(Db*, const char*, const char*); int sqweezdb_use_token(Db*, Sess*, const char*); void sqweezdb_free_string(char*);
-char* sqweezdb_oauth_start(Db*, const char*, const char*, const char*, const char*); char* sqweezdb_oauth_finish(Db*, const char*, const char*, const char*, const char*, const char*);
-Stmt* sqweezdb_prepare(Db*, const char*); void sqweezdb_finalize(Stmt*);
-Rows* sqweezdb_exec(Db*, Sess*, Stmt*, const CValue*, int); Rows* sqweezdb_exec_text(Db*, Sess*, const char*, const CValue*, int);
-int sqweezdb_rows_count(Rows*); int sqweezdb_rows_cols(Rows*); int sqweezdb_rows_get(Rows*, int, int, CValue*); int sqweezdb_rows_all(Rows*, CValue*, int); void sqweezdb_rows_free(Rows*);
-long long sqweezdb_snapshot(Db*);
-typedef struct Sub Sub; Sub* sqweezdb_subscribe(Db*, Sess*, const char*, const CValue*, int); int sqweezdb_sub_next(Sub*, int, Rows**); void sqweezdb_sub_free(Sub*);
+Db* sqzdb_open(const char* path, int durable); long long sqzdb_last_insert_id(Sess*); Db* sqzdb_open_with(const char* path, const char* json); const char* sqzdb_open_error(); void sqzdb_close(Db*); const char* sqzdb_last_error(Db*);
+Sess* sqzdb_session(Db*); void sqzdb_session_free(Sess*); int sqzdb_login(Db*, Sess*, const char*); int sqzdb_assume(Db*, Sess*, const char*);
+char* sqzdb_sign_up(Db*, const char*, const char*, const char*); char* sqzdb_sign_in(Db*, const char*, const char*, const char*); int sqzdb_sign_out(Db*, const char*);
+int sqzdb_set_password(Db*, const char*, const char*, const char*); int sqzdb_sign_out_everywhere(Db*, const char*, const char*); int sqzdb_use_token(Db*, Sess*, const char*); void sqzdb_free_string(char*);
+char* sqzdb_oauth_start(Db*, const char*, const char*, const char*, const char*); char* sqzdb_oauth_finish(Db*, const char*, const char*, const char*, const char*, const char*);
+Stmt* sqzdb_prepare(Db*, const char*); void sqzdb_finalize(Stmt*);
+Rows* sqzdb_exec(Db*, Sess*, Stmt*, const CValue*, int); Rows* sqzdb_exec_text(Db*, Sess*, const char*, const CValue*, int);
+int sqzdb_rows_count(Rows*); int sqzdb_rows_cols(Rows*); int sqzdb_rows_get(Rows*, int, int, CValue*); int sqzdb_rows_all(Rows*, CValue*, int); void sqzdb_rows_free(Rows*);
+long long sqzdb_snapshot(Db*);
+typedef struct Sub Sub; Sub* sqzdb_subscribe(Db*, Sess*, const char*, const CValue*, int); int sqzdb_sub_next(Sub*, int, Rows**); void sqzdb_sub_free(Sub*);
 */
 import "C"
 import (
@@ -121,35 +121,35 @@ func OpenWith(path string, opts Options) (*DB, error) {
 	cjson := C.CString(string(js))
 	defer C.free(unsafe.Pointer(cpath))
 	defer C.free(unsafe.Pointer(cjson))
-	p := C.sqweezdb_open_with(cpath, cjson)
+	p := C.sqzdb_open_with(cpath, cjson)
 	if p == nil {
-		return nil, errors.New(C.GoString(C.sqweezdb_open_error()))
+		return nil, errors.New(C.GoString(C.sqzdb_open_error()))
 	}
 	return &DB{p: p}, nil
 }
-func (db *DB) Close()            { C.sqweezdb_close(db.p) }
-func (db *DB) Snapshot() int64   { return int64(C.sqweezdb_snapshot(db.p)) }
-func (db *DB) lastError() error  { return errors.New(C.GoString(C.sqweezdb_last_error(db.p))) }
-func (db *DB) Session() *Session { return &Session{db: db, p: C.sqweezdb_session(db.p)} }
-func (s *Session) Close()        { C.sqweezdb_session_free(s.p) }
+func (db *DB) Close()            { C.sqzdb_close(db.p) }
+func (db *DB) Snapshot() int64   { return int64(C.sqzdb_snapshot(db.p)) }
+func (db *DB) lastError() error  { return errors.New(C.GoString(C.sqzdb_last_error(db.p))) }
+func (db *DB) Session() *Session { return &Session{db: db, p: C.sqzdb_session(db.p)} }
+func (s *Session) Close()        { C.sqzdb_session_free(s.p) }
 func (db *DB) Prepare(sql string) (*Stmt, error) {
 	cs := C.CString(sql)
 	defer C.free(unsafe.Pointer(cs))
-	p := C.sqweezdb_prepare(db.p, cs)
+	p := C.sqzdb_prepare(db.p, cs)
 	if p == nil {
 		return nil, db.lastError()
 	}
 	return &Stmt{p: p}, nil
 }
-func (st *Stmt) Close() { C.sqweezdb_finalize(st.p) }
+func (st *Stmt) Close() { C.sqzdb_finalize(st.p) }
 
 // LastInsertID is the primary key of the last row this session inserted (an automatic id, or the one given).
-func (s *Session) LastInsertID() int64 { return int64(C.sqweezdb_last_insert_id(s.p)) }
+func (s *Session) LastInsertID() int64 { return int64(C.sqzdb_last_insert_id(s.p)) }
 
 func (s *Session) Login(user string) error {
 	cu := C.CString(user)
 	defer C.free(unsafe.Pointer(cu))
-	if C.sqweezdb_login(s.db.p, s.p, cu) != 0 {
+	if C.sqzdb_login(s.db.p, s.p, cu) != 0 {
 		return s.db.lastError()
 	}
 	return nil
@@ -167,7 +167,7 @@ func (s *Session) Assume(roles []string, attrs map[string]any) error {
 	}
 	cj := C.CString(string(b))
 	defer C.free(unsafe.Pointer(cj))
-	if C.sqweezdb_assume(s.db.p, s.p, cj) != 0 {
+	if C.sqzdb_assume(s.db.p, s.p, cj) != 0 {
 		return s.db.lastError()
 	}
 	return nil
@@ -179,7 +179,7 @@ func (s *Session) Assume(roles []string, attrs map[string]any) error {
 func (s *Session) UseToken(token string) error {
 	ct := C.CString(token)
 	defer C.free(unsafe.Pointer(ct))
-	if C.sqweezdb_use_token(s.db.p, s.p, ct) != 0 {
+	if C.sqzdb_use_token(s.db.p, s.p, ct) != 0 {
 		return s.db.lastError()
 	}
 	return nil
@@ -207,7 +207,7 @@ func (a *Auth) result(p *C.char) (SignedIn, error) {
 	if p == nil {
 		return SignedIn{}, a.db.lastError()
 	}
-	defer C.sqweezdb_free_string(p)
+	defer C.sqzdb_free_string(p)
 	var out struct {
 		Token   string                     `json:"token"`
 		User    map[string]json.RawMessage `json:"user"`
@@ -248,11 +248,11 @@ func (a *Auth) OAuthStart(provider, redirectURI, linkToken string) (url, state, 
 		cl = C.CString(linkToken)
 		defer C.free(unsafe.Pointer(cl))
 	}
-	p := C.sqweezdb_oauth_start(a.db.p, ct, cp, cr, cl)
+	p := C.sqzdb_oauth_start(a.db.p, ct, cp, cr, cl)
 	if p == nil {
 		return "", "", "", a.db.lastError()
 	}
-	defer C.sqweezdb_free_string(p)
+	defer C.sqzdb_free_string(p)
 	var out struct {
 		URL    string `json:"url"`
 		State  string `json:"state"`
@@ -273,7 +273,7 @@ func (a *Auth) OAuthFinish(provider, code, state, cookie string) (SignedIn, erro
 	defer C.free(unsafe.Pointer(cc))
 	defer C.free(unsafe.Pointer(cs))
 	defer C.free(unsafe.Pointer(ck))
-	return a.result(C.sqweezdb_oauth_finish(a.db.p, ct, cp, cc, cs, ck))
+	return a.result(C.sqzdb_oauth_finish(a.db.p, ct, cp, cc, cs, ck))
 }
 
 // SignUp inserts a user (fields must include the login column) and sets their password.
@@ -286,7 +286,7 @@ func (a *Auth) SignUp(fields map[string]any, password string) (SignedIn, error) 
 	defer C.free(unsafe.Pointer(ct))
 	defer C.free(unsafe.Pointer(cf))
 	defer C.free(unsafe.Pointer(cp))
-	return a.result(C.sqweezdb_sign_up(a.db.p, ct, cf, cp))
+	return a.result(C.sqzdb_sign_up(a.db.p, ct, cf, cp))
 }
 
 // SignIn checks a login and password and starts a session.
@@ -295,14 +295,14 @@ func (a *Auth) SignIn(login, password string) (SignedIn, error) {
 	defer C.free(unsafe.Pointer(ct))
 	defer C.free(unsafe.Pointer(cl))
 	defer C.free(unsafe.Pointer(cp))
-	return a.result(C.sqweezdb_sign_in(a.db.p, ct, cl, cp))
+	return a.result(C.sqzdb_sign_in(a.db.p, ct, cl, cp))
 }
 
 // SignOut ends one session; an unknown token is not an error.
 func (a *Auth) SignOut(token string) error {
 	ct := C.CString(token)
 	defer C.free(unsafe.Pointer(ct))
-	if C.sqweezdb_sign_out(a.db.p, ct) != 0 {
+	if C.sqzdb_sign_out(a.db.p, ct) != 0 {
 		return a.db.lastError()
 	}
 	return nil
@@ -318,7 +318,7 @@ func (a *Auth) SetPassword(key any, password string) error {
 	defer C.free(unsafe.Pointer(ct))
 	defer C.free(unsafe.Pointer(ck))
 	defer C.free(unsafe.Pointer(cp))
-	if C.sqweezdb_set_password(a.db.p, ct, ck, cp) != 0 {
+	if C.sqzdb_set_password(a.db.p, ct, ck, cp) != 0 {
 		return a.db.lastError()
 	}
 	return nil
@@ -333,7 +333,7 @@ func (a *Auth) SignOutEverywhere(key any) error {
 	ct, ck := C.CString(a.table), C.CString(string(b))
 	defer C.free(unsafe.Pointer(ct))
 	defer C.free(unsafe.Pointer(ck))
-	if C.sqweezdb_sign_out_everywhere(a.db.p, ct, ck) != 0 {
+	if C.sqzdb_sign_out_everywhere(a.db.p, ct, ck) != 0 {
 		return a.db.lastError()
 	}
 	return nil
@@ -375,14 +375,14 @@ func args(a []any, pin *runtime.Pinner) ([]C.CValue, []any) {
 	return vals, a
 }
 func collect(r *C.Rows) [][]any {
-	n, m := int(C.sqweezdb_rows_count(r)), int(C.sqweezdb_rows_cols(r))
+	n, m := int(C.sqzdb_rows_count(r)), int(C.sqzdb_rows_cols(r))
 	out := make([][]any, n)
 	if n == 0 || m == 0 {
-		C.sqweezdb_rows_free(r)
+		C.sqzdb_rows_free(r)
 		return out
 	}
 	flat := make([]C.CValue, n*m)
-	C.sqweezdb_rows_all(r, &flat[0], C.int(len(flat)))
+	C.sqzdb_rows_all(r, &flat[0], C.int(len(flat)))
 	for i := 0; i < n; i++ {
 		row := make([]any, m)
 		for j := 0; j < m; j++ {
@@ -402,7 +402,7 @@ func collect(r *C.Rows) [][]any {
 		}
 		out[i] = row
 	}
-	C.sqweezdb_rows_free(r)
+	C.sqzdb_rows_free(r)
 	return out
 }
 
@@ -416,7 +416,7 @@ func (s *Session) Exec(st *Stmt, a ...any) ([][]any, error) {
 		pin.Pin(&vals[0])
 		vp = &vals[0]
 	}
-	r := C.sqweezdb_exec(s.db.p, s.p, st.p, vp, C.int(len(vals)))
+	r := C.sqzdb_exec(s.db.p, s.p, st.p, vp, C.int(len(vals)))
 	runtime.KeepAlive(keep)
 	if r == nil {
 		return nil, s.db.lastError()
@@ -436,7 +436,7 @@ func (s *Session) ExecText(sql string, a ...any) ([][]any, error) {
 		pin.Pin(&vals[0])
 		vp = &vals[0]
 	}
-	r := C.sqweezdb_exec_text(s.db.p, s.p, cs, vp, C.int(len(vals)))
+	r := C.sqzdb_exec_text(s.db.p, s.p, cs, vp, C.int(len(vals)))
 	runtime.KeepAlive(keep)
 	if r == nil {
 		return nil, s.db.lastError()
@@ -461,7 +461,7 @@ func (s *Session) Subscribe(sql string, a ...any) (*Subscription, error) {
 		pin.Pin(&vals[0])
 		vp = &vals[0]
 	}
-	p := C.sqweezdb_subscribe(s.db.p, s.p, cs, vp, C.int(len(vals)))
+	p := C.sqzdb_subscribe(s.db.p, s.p, cs, vp, C.int(len(vals)))
 	runtime.KeepAlive(keep)
 	if p == nil {
 		return nil, s.db.lastError()
@@ -472,14 +472,14 @@ func (s *Session) Subscribe(sql string, a ...any) (*Subscription, error) {
 // Next blocks up to timeout for an event; it returns (nil, nil) on timeout and an error when the subscription was dropped.
 func (sub *Subscription) Next(timeoutMs int) ([]any, error) {
 	var r *C.Rows
-	switch C.sqweezdb_sub_next(sub.p, C.int(timeoutMs), &r) {
+	switch C.sqzdb_sub_next(sub.p, C.int(timeoutMs), &r) {
 	case 0:
 		rows := collect(r)
 		return rows[0], nil
 	case 1:
 		return nil, nil
 	default:
-		return nil, errors.New("sqweezdb: subscription fell behind and was dropped; resubscribe")
+		return nil, errors.New("sqzdb: subscription fell behind and was dropped; resubscribe")
 	}
 }
-func (sub *Subscription) Close() { C.sqweezdb_sub_free(sub.p) }
+func (sub *Subscription) Close() { C.sqzdb_sub_free(sub.p) }

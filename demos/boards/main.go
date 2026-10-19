@@ -1,4 +1,4 @@
-// Boards: a multi-tenant task board on sqweezdb. Every organization sees only its own boards and cards: the rule lives in
+// Boards: a multi-tenant task board on sqzdb. Every organization sees only its own boards and cards: the rule lives in
 // the database as row policies, and each request runs as the signed-in member's identity (role "member", attribute org).
 // Live updates are one change subscription per organization, fanned out to that organization's browsers as SSE.
 //
@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iluxav/sqweezdb/bindings/go/sqweezdb"
+	"github.com/sqzdb/sqzdb/bindings/go/sqzdb"
 )
 
 //go:embed static
@@ -48,9 +48,9 @@ var schema = []string{
 var cardCols = []string{"id", "org_id", "board_id", "title", "status", "author_id", "created_at"}
 
 type server struct {
-	db     *sqweezdb.DB
+	db     *sqzdb.DB
 	secret []byte
-	stmts  map[string]*sqweezdb.Stmt
+	stmts  map[string]*sqzdb.Stmt
 	mu     sync.Mutex
 	hubs   map[string]*hub // by org id
 }
@@ -70,11 +70,11 @@ func main() {
 	benchSeed := flag.String("bench-seed", "", "ORGS,USERS: deterministic load-test data instead (org<n>, u<i>@org<n>.test, boards work and read)")
 	flag.Parse()
 
-	db, err := sqweezdb.Open(*dir, false)
+	db, err := sqzdb.Open(*dir, false)
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{db: db, secret: make([]byte, 32), stmts: map[string]*sqweezdb.Stmt{}, hubs: map[string]*hub{}}
+	s := &server{db: db, secret: make([]byte, 32), stmts: map[string]*sqzdb.Stmt{}, hubs: map[string]*hub{}}
 	if _, err := rand.Read(s.secret); err != nil {
 		log.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func main() {
 }
 
 // ---- sample data (the application's own session: no policies)
-func seed(app *sqweezdb.Session, orgs, users int) {
+func seed(app *sqzdb.Session, orgs, users int) {
 	names := []string{"Acme", "Globex", "Initech", "Umbrella", "Hooli", "Stark", "Wayne", "Tyrell"}
 	people := []string{"Ada", "Grace", "Alan", "Edsger", "Barbara", "Ken", "Margaret", "Donald", "Frances", "John", "Radia", "Linus"}
 	tasks := []string{"Write the onboarding email", "Fix the login redirect", "Plan the Q3 roadmap", "Review the pricing page", "Interview candidates", "Ship the mobile build"}
@@ -175,7 +175,7 @@ func seed(app *sqweezdb.Session, orgs, users int) {
 }
 
 // The load test's data: the same shape is created in PocketBase by the bench tool.
-func seedBench(app *sqweezdb.Session, orgs, users int) {
+func seedBench(app *sqzdb.Session, orgs, users int) {
 	for o := 0; o < orgs; o++ {
 		r, err := app.ExecText("INSERT INTO orgs (name) VALUES (?) RETURNING id", fmt.Sprintf("org%d", o))
 		if err != nil {
@@ -235,7 +235,7 @@ func (s *server) verify(tok string) (identity, error) {
 	return id, nil
 }
 
-type handler func(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session)
+type handler func(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session)
 
 func (s *server) auth(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +291,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	reply(w, map[string]any{"token": s.sign(id), "user": id.User, "org": id.Org, "name": id.Name})
 }
 
-func (s *server) me(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) me(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	org, err := sess.Exec(s.stmts["orgName"])
 	if err != nil || len(org) == 0 {
 		fail(w, 500, fmt.Errorf("org: %v", err))
@@ -305,7 +305,7 @@ func (s *server) me(w http.ResponseWriter, r *http.Request, id identity, sess *s
 	reply(w, map[string]any{"user": id.User, "name": id.Name, "org": id.Org, "orgName": org[0][0], "members": table([]string{"id", "name", "email"}, members)})
 }
 
-func (s *server) boards(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) boards(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	rows, err := sess.Exec(s.stmts["boards"])
 	if err != nil {
 		fail(w, 500, err)
@@ -314,7 +314,7 @@ func (s *server) boards(w http.ResponseWriter, r *http.Request, id identity, ses
 	reply(w, table([]string{"id", "title"}, rows))
 }
 
-func (s *server) cards(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) cards(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	rows, err := sess.Exec(s.stmts["cards"], r.PathValue("id"))
 	if err != nil {
 		fail(w, 400, err)
@@ -323,7 +323,7 @@ func (s *server) cards(w http.ResponseWriter, r *http.Request, id identity, sess
 	reply(w, table(cardCols, rows))
 }
 
-func (s *server) addCard(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) addCard(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	var body struct{ Title string }
 	if json.NewDecoder(r.Body).Decode(&body) != nil || strings.TrimSpace(body.Title) == "" {
 		fail(w, 400, errors.New("title required"))
@@ -344,7 +344,7 @@ func (s *server) addCard(w http.ResponseWriter, r *http.Request, id identity, se
 	reply(w, table(cardCols, rows)[0])
 }
 
-func (s *server) moveCard(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) moveCard(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	var body struct{ Status string }
 	if json.NewDecoder(r.Body).Decode(&body) != nil || (body.Status != "todo" && body.Status != "doing" && body.Status != "done") {
 		fail(w, 400, errors.New("status must be todo, doing or done"))
@@ -358,7 +358,7 @@ func (s *server) moveCard(w http.ResponseWriter, r *http.Request, id identity, s
 	reply(w, map[string]any{"changed": rows})
 }
 
-func (s *server) delCard(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) delCard(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	rows, err := sess.Exec(s.stmts["delCard"], r.PathValue("id"))
 	if err != nil {
 		fail(w, 400, err)
@@ -425,7 +425,7 @@ func (s *server) hubFor(org string) (*hub, error) {
 	return h, nil
 }
 
-func (s *server) events(w http.ResponseWriter, r *http.Request, id identity, sess *sqweezdb.Session) {
+func (s *server) events(w http.ResponseWriter, r *http.Request, id identity, sess *sqzdb.Session) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		fail(w, 500, errors.New("streaming unsupported"))

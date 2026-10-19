@@ -1,7 +1,7 @@
 //! E13's scan queries (Q3, Q4, Q5, Q7) and its UPDATE by id (W1) on the same 1M rows, many repetitions: a quick A/B.
-use sqweezdb::sql::Sql;
-use sqweezdb::table::Value;
-use sqweezdb::util::Rng;
+use sqzdb::sql::Sql;
+use sqzdb::table::Value;
+use sqzdb::util::Rng;
 use std::time::Instant;
 const N: i64 = 1_000_000;
 fn median(iters: usize, mut f: impl FnMut()) -> f64 { let mut ts = vec![]; for _ in 0..iters { let t = Instant::now(); f(); ts.push(t.elapsed().as_secs_f64() * 1e3); } ts.sort_by(|a, b| a.partial_cmp(b).unwrap()); ts[iters / 2] }

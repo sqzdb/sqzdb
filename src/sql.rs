@@ -366,7 +366,7 @@ pub fn error_code(msg: &str) -> &'static str {
     else if m.starts_with("foreign key violation") || m.contains(" blocked: ") { "FOREIGN_KEY" }
     else if m.starts_with("permission denied") { "DENIED" }
     else if m.starts_with("statement needs ") { "ARGUMENTS" }
-    else if m.contains("is not a sqweezdb database") || m.contains("a sqweezdb database is a directory") || m.contains("written by a newer sqweezdb") || m.contains("sqweezdb.meta") || m.contains("holds no sqweezdb database") { "PATH" }
+    else if m.contains("is not a sqzdb database") || m.contains("a sqzdb database is a directory") || m.contains("written by a newer sqzdb") || m.contains("sqzdb.meta") || m.contains("holds no sqzdb database") { "PATH" }
     else if m.starts_with("options:") || m.contains(".toml") || m.contains(" is required") || m.starts_with("no database in") || m.starts_with("durable") || m.starts_with("follow") || m.starts_with("listen.") || m.starts_with("snapshot.") || m.starts_with("live.") || m.starts_with("log.") || m.starts_with("backup.") { "CONFIG" }
     else if m.starts_with("already in a transaction") || m.starts_with("not in a transaction") { "TRANSACTION" }
     else if m.contains("can't be named ") { "SYNTAX" }
@@ -1352,17 +1352,29 @@ pub enum CorrMap { N(FastMap<f64>), W(crate::util::WideMap<f64>) }
 #[inline] fn mix_pair(a: i64, b: i64) -> i64 { ((a as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (b as u64).rotate_left(32).wrapping_mul(0xC2B2AE3D27D4EB4F)) as i64 }
 /// kind: 0 integer, 1 DOUBLE, 2 BOOL, 3 TEXT(n)/BYTES(n) bytes, 4 UUID, 6 TEXT(n)/BYTES(n) IN, 7 long IN, 8 long (its key
 /// for = and <>, its bytes otherwise, from `store` when not in the row), 9 never, 20 correlated scalar
-pub struct CPred { off: usize, kind: u8, cmp: Cmp, i: i64, f: f64, b: Vec<u8>, nb: usize, nm: u8, set: Option<Arc<KeySet>>, pair: Option<(usize, usize, u8)>, corr_map: Option<Arc<CorrMap>>, ckind: u8, key: crate::table::Key, store: Option<Arc<crate::table::ValueStore>> }
+pub struct CPred { off: usize, kind: u8, cmp: Cmp, i: i64, f: f64, b: Vec<u8>, nb: usize, nm: u8, set: Option<Arc<KeySet>>, pair: Option<(usize, usize, u8)>, corr_map: Option<Arc<CorrMap>>, ckind: u8, key: crate::table::Key, store: Option<Arc<crate::table::ValueStore>>,
+    /// kind 8: where the row's tail starts, and the long columns before this one ((offset, index)), to find this
+    /// column's value in a row that carries it (a row being written, which a policy checks)
+    tail: Option<Arc<(usize, Vec<(usize, usize)>)>> }
 impl CPred {
-    /// A long column against a value: = and <> by key; an order by bytes, fetched when not in the row (a row with its
-    /// tail, which only change feeds see, passes: they re-check by running the query).
+    /// A long column against a value: = and <> by key; an order by bytes, from the row, its tail, or the store. A value
+    /// that can't be found fails the comparison (never passes it).
     #[inline(never)] fn long_cmp(&self, row: &[u8]) -> bool {
         let o = self.off; let k = i128::from_le_bytes(row[o + 4..o + 20].try_into().unwrap());
         match self.cmp { Cmp::Eq => return k == self.key, Cmp::Ne => return k != self.key, _ => {} }
         let n = u32::from_le_bytes(row[o..o + 4].try_into().unwrap()) as usize;
         if n <= crate::table::LONG_INLINE { return Self::ok(self.cmp, &row[o + 20..o + 20 + n], &self.b[..]); }
         match u64::from_le_bytes(row[o + 20..o + 28].try_into().unwrap()) {
-            0 => true,
+            0 => {
+                let Some(t) = self.tail.as_deref() else { return false };
+                let mut at = t.0;
+                for &(off, j) in &t.1 {
+                    if row[j >> 3] >> (j & 7) & 1 == 1 { continue; }
+                    let len = u32::from_le_bytes(row[off..off + 4].try_into().unwrap()) as usize;
+                    if len > crate::table::LONG_INLINE && u64::from_le_bytes(row[off + 20..off + 28].try_into().unwrap()) == 0 { at += len; }
+                }
+                row.get(at..at + n).is_some_and(|v| Self::ok(self.cmp, v, &self.b[..]))
+            }
             id => self.store.as_ref().and_then(|s| s.get(id)).is_some_and(|v| Self::ok(self.cmp, &v[..], &self.b[..])),
         }
     }
@@ -1763,7 +1775,7 @@ impl Sql {
         if let Some(f) = &cfg.follow {
             let mut sv = Services::default();
             let (src, poll) = match f {
-                Follow::Dir { dir: src, poll } => { if crate::table::check_dir(src)? == crate::table::DirState::Empty { return Err(format!("follow.dir {} holds no sqweezdb database", src.display())); } (src.clone(), *poll) }
+                Follow::Dir { dir: src, poll } => { if crate::table::check_dir(src)? == crate::table::DirState::Empty { return Err(format!("follow.dir {} holds no sqzdb database", src.display())); } (src.clone(), *poll) }
                 Follow::Bucket { source, poll } => { crate::table::check_dir(dir)?; sv.puller = Some(crate::cloud::start_puller(source.cloud(), dir.to_path_buf(), *poll)); (dir.to_path_buf(), *poll) }
             };
             let lock = if matches!(f, Follow::Bucket { .. }) { Some(lock_dir(dir)?) } else { None };
@@ -2103,7 +2115,7 @@ impl Sql {
     pub fn compile(&self, sess: &Session, schema: &Schema, p: &Pred, params: &[Value]) -> Result<CPred, String> {
         let off = schema.offsets[p.col]; let c = &schema.columns[p.col];
         let (nb, nm) = (p.col >> 3, 1u8 << (p.col & 7));
-        let base = CPred { off, kind: 0, cmp: p.cmp, i: 0, f: 0.0, b: vec![], nb, nm, set: None, pair: None, corr_map: None, ckind: 0, key: 0, store: None };
+        let base = CPred { off, kind: 0, cmp: p.cmp, i: 0, f: 0.0, b: vec![], nb, nm, set: None, pair: None, corr_map: None, ckind: 0, key: 0, store: None, tail: None };
         if let Expr::Scalar(sp) = &p.rhs { if let Some((_, oc)) = sp.corr {
             if !matches!(c.ty, ColType::Int | ColType::Float | ColType::Timestamp) { return Err(format!("column {}: correlated comparison needs a numeric column", c.name)); }
             let rows = self.run_select(sess, sp, params)?;
@@ -2155,7 +2167,8 @@ impl Sql {
             ColType::Text(_) => CPred { kind: 3, b: match v { Value::Text(s) => s.into_bytes(), v => return Err(format!("column {}: expected TEXT, got {v:?}", c.name)) }, ..base },
             ColType::Bytes(_) => CPred { kind: 3, b: match v { Value::Bytes(b) => b, v => return Err(format!("column {}: expected BYTES, got {v:?}", c.name)) }, ..base },
             ColType::LongText | ColType::LongBytes => { let b = match (&c.ty, v) { (ColType::LongText, Value::Text(s)) => s.into_bytes(), (ColType::LongBytes, Value::Bytes(b)) => b, (_, v) => return Err(format!("column {}: expected {}, got {v:?}", c.name, c.ty.name())) };
-                CPred { kind: 8, key: crate::table::text_key(&b), b, store: c.store.clone(), ..base } }
+                let earlier = (0..p.col).filter(|&j| schema.columns[j].ty.is_long()).map(|j| (schema.offsets[j], j)).collect();
+                CPred { kind: 8, key: crate::table::text_key(&b), b, store: c.store.clone(), tail: Some(Arc::new((schema.row_size, earlier))), ..base } }
             ColType::Uuid => CPred { kind: 4, b: match &v { Value::Text(s) => crate::table::parse_uuid(s).ok_or_else(|| format!("column {}: not a UUID: {s:?}", c.name))?.to_vec(), Value::Bytes(b) if b.len() == 16 => b.clone(), v => return Err(format!("column {}: expected a UUID, got {v:?}", c.name)) }, ..base },
         })
     }
@@ -2695,7 +2708,7 @@ fn bootstrap_from_bucket(dir: &std::path::Path, b: &crate::config::Backup) -> Re
     let (files, file_bytes) = crate::cloud::download_files(&b.cloud(), &scratch)?;
     for e in std::fs::read_dir(&scratch).map_err(|e| e.to_string())? { let e = e.map_err(|e| e.to_string())?; std::fs::rename(e.path(), dir.join(e.file_name())).map_err(|e| e.to_string())?; }
     let _ = std::fs::remove_dir_all(&scratch);
-    eprintln!("sqweezdb: bootstrapped {} from the bucket ({chunks} log objects, {files} files, {:.1} MB)", dir.display(), (bytes + file_bytes) as f64 / 1e6);
+    eprintln!("sqzdb: bootstrapped {} from the bucket ({chunks} log objects, {files} files, {:.1} MB)", dir.display(), (bytes + file_bytes) as f64 / 1e6);
     Ok(true)
 }
 /// The snapshot policy thread: a snapshot once the log written since the last one exceeds max(`log_bytes`, size of that
@@ -2749,7 +2762,7 @@ mod dir_tests {
     use super::*;
     use crate::config::Config;
     use crate::table::{check_dir, read_meta, DirState, DIR_FORMAT, META_FILE};
-    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqweezdb-dirtest-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); let _ = std::fs::remove_file(&p); p }
+    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqzdb-dirtest-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); let _ = std::fs::remove_file(&p); p }
     fn files(p: &std::path::Path) -> Vec<String> { let mut v: Vec<String> = std::fs::read_dir(p).map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default(); v.sort(); v }
     /// Closing does not wait out the snapshot policy's 200 ms tick (a host closing thousands of databases, E53).
     #[test] fn close_does_not_wait_for_the_snapshotter_tick() {
@@ -2789,7 +2802,7 @@ mod dir_tests {
         let d = tmp("new");
         { let s = Sql::open_with(&d, Config::default()).unwrap(); s.exec_s(&mut Session::default(), "CREATE TABLE t(id INTEGER PRIMARY KEY)", &[]).unwrap(); }
         assert_eq!(read_meta(&d).unwrap(), Some(DIR_FORMAT)); assert_eq!(check_dir(&d).unwrap(), DirState::Database);
-        assert!(std::fs::read_to_string(d.join(META_FILE)).unwrap().contains("created_by = \"sqweezdb "));
+        assert!(std::fs::read_to_string(d.join(META_FILE)).unwrap().contains("created_by = \"sqzdb "));
         let s = Sql::open_with(&d, Config::default()).unwrap(); assert!(s.db.table("t").is_some()); drop(s);
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -2801,7 +2814,7 @@ mod dir_tests {
     #[test] fn a_foreign_directory_is_refused_untouched() {
         let d = tmp("foreign"); std::fs::create_dir_all(d.join("src")).unwrap(); std::fs::write(d.join("package.json"), b"{}").unwrap();
         let before = files(&d);
-        let e = Sql::open_with(&d, Config::default()).err().unwrap(); assert!(e.contains("is not a sqweezdb database and is not empty"), "{e}"); assert_eq!(error_code(&e), "PATH");
+        let e = Sql::open_with(&d, Config::default()).err().unwrap(); assert!(e.contains("is not a sqzdb database and is not empty"), "{e}"); assert_eq!(error_code(&e), "PATH");
         assert_eq!(files(&d), before, "nothing may be written into a directory we refuse");
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -2813,13 +2826,17 @@ mod dir_tests {
     #[test] fn an_unmarked_database_is_adopted() {
         let d = tmp("legacy");
         { let s = Sql::open_with(&d, Config::default()).unwrap(); s.exec_s(&mut Session::default(), "CREATE TABLE t(id INTEGER PRIMARY KEY)", &[]).unwrap(); s.exec_s(&mut Session::default(), "INSERT INTO t VALUES (7)", &[]).unwrap(); }
+        // a directory marked before the rename (sqweezdb.meta) is a database as it is, and keeps its marker
+        std::fs::rename(d.join(META_FILE), d.join(crate::table::LEGACY_META_FILE)).unwrap(); assert_eq!(check_dir(&d).unwrap(), DirState::Database);
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); drop(s); } assert!(!d.join(META_FILE).exists() && d.join(crate::table::LEGACY_META_FILE).exists());
+        std::fs::rename(d.join(crate::table::LEGACY_META_FILE), d.join(META_FILE)).unwrap();
         std::fs::remove_file(d.join(META_FILE)).unwrap(); assert_eq!(check_dir(&d).unwrap(), DirState::Unmarked);
         let s = Sql::open_with(&d, Config::default()).unwrap(); assert_eq!(s.exec_s(&mut Session::default(), "SELECT count(*) FROM t", &[]).unwrap()[0][0], Value::Int(1)); drop(s);
         assert_eq!(read_meta(&d).unwrap(), Some(DIR_FORMAT), "the marker is written on adoption"); std::fs::remove_dir_all(&d).unwrap();
     }
     #[test] fn a_newer_format_and_a_broken_marker_are_refused() {
         let d = tmp("newer"); std::fs::create_dir_all(&d).unwrap(); std::fs::write(d.join(META_FILE), format!("format = {}\n", DIR_FORMAT + 1)).unwrap();
-        let e = Sql::open_with(&d, Config::default()).err().unwrap(); assert!(e.contains("newer sqweezdb"), "{e}");
+        let e = Sql::open_with(&d, Config::default()).err().unwrap(); assert!(e.contains("newer sqzdb"), "{e}");
         std::fs::write(d.join(META_FILE), "format = \"one\"\n").unwrap(); let e = Sql::open_with(&d, Config::default()).err().unwrap(); assert!(e.contains("no format number"), "{e}");
         std::fs::write(d.join(META_FILE), "this is [not toml").unwrap(); let e = Sql::open_with(&d, Config::default()).err().unwrap(); assert!(e.contains("unreadable"), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
@@ -2848,7 +2865,7 @@ mod dir_tests {
     #[test] fn follow_dir_must_be_a_database() {
         let src = tmp("follow-src"); std::fs::create_dir_all(&src).unwrap(); let dst = tmp("follow-dst");
         let cfg = Config { follow: Some(crate::config::Follow::Dir { dir: src.clone(), poll: std::time::Duration::from_millis(20) }), ..Config::default() };
-        assert!(Sql::open_with(&dst, cfg).err().unwrap().contains("holds no sqweezdb database")); std::fs::remove_dir_all(&src).unwrap();
+        assert!(Sql::open_with(&dst, cfg).err().unwrap().contains("holds no sqzdb database")); std::fs::remove_dir_all(&src).unwrap();
     }
 }
 
@@ -2856,7 +2873,7 @@ mod dir_tests {
 mod gen_tests {
     use super::*;
     use crate::config::Config;
-    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqweezdb-gentest-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
+    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqzdb-gentest-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
     fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn int(v: &Value) -> i64 { match v { Value::Int(i) => *i, v => panic!("not an int: {v:?}") } }
     #[test] fn auto_ids_fill_in_and_respect_explicit_keys() {
@@ -2884,7 +2901,7 @@ mod gen_tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
     #[test] fn a_wrong_number_of_values_names_the_columns_and_the_fix() {
-        let d = std::env::temp_dir().join(format!("sqweezdb-valcount-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-valcount-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, crate::config::Config::default()).unwrap();
         let err = |sql: &str| s.exec_s(&mut Session::default(), sql, &[]).unwrap_err();
         s.exec_s(&mut Session::default(), "CREATE TABLE people (id UUID PRIMARY KEY DEFAULT uuid(), name VARCHAR(32), at TIMESTAMP DEFAULT now())", &[]).unwrap();
@@ -2951,7 +2968,7 @@ mod gen_tests {
 mod uuid_key_tests {
     use super::*;
     use crate::config::Config;
-    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqweezdb-uuidkey-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
+    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqzdb-uuidkey-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
     fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn qp(s: &Sql, sql: &str, p: &[Value]) -> Result<Vec<Vec<Value>>, String> { s.exec_s(&mut Session::default(), sql, p) }
     fn text(v: &Value) -> String { match v { Value::Text(t) => t.clone(), v => panic!("not text: {v:?}") } }
@@ -3208,7 +3225,7 @@ mod identity_tests {
     fn as_app(s: &Sql, sql: &str) { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")); }
     fn attrs(kv: &[(&str, Value)]) -> HashMap<String, Value> { kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() }
     #[test] fn an_app_supplied_identity_gets_its_roles_and_attributes_and_nothing_more() {
-        let d = std::env::temp_dir().join(format!("sqweezdb-identity-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-identity-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap();
         as_app(&s, "CREATE TABLE orders (id SERIAL PRIMARY KEY, tenant_id INT NOT NULL, item VARCHAR(32))");
         as_app(&s, "INSERT INTO orders (tenant_id, item) VALUES (1, 'apples'), (1, 'pears'), (2, 'bolts')");
@@ -3250,7 +3267,7 @@ mod identity_tests {
         drop(s); std::fs::remove_dir_all(&d).unwrap();
     }
     #[test] fn a_uuid_attribute_scopes_a_uuid_keyed_table() {
-        let d = std::env::temp_dir().join(format!("sqweezdb-identity-uuid-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-identity-uuid-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap();
         let (a, b) = ("01a14620-70cb-7000-9087-223339ad636c", "01a14620-70cb-7001-be11-62ba95687997");
         as_app(&s, "CREATE TABLE notes (id UUID PRIMARY KEY DEFAULT uuid(), owner UUID NOT NULL, body VARCHAR(32))");
@@ -3269,7 +3286,7 @@ mod unsupported_tests {
     use super::*;
     use crate::config::Config;
     fn db(name: &str) -> (Arc<Sql>, std::path::PathBuf) {
-        let d = std::env::temp_dir().join(format!("sqweezdb-unsup-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-unsup-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap();
         for q in ["CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40), age INT, grp INT)", "INSERT INTO users VALUES (1, 'alice', 30, 1), (2, 'bob', 25, 1), (3, 'carol', 35, 2)", "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INT, amount INT)", "INSERT INTO orders VALUES (1, 1, 10), (2, 1, 20)"] { s.exec_s(&mut Session::default(), q, &[]).unwrap(); }
         (s, d)
@@ -3342,7 +3359,7 @@ mod expression_tests {
     use super::*;
     use crate::config::Config;
     fn db(name: &str) -> (Arc<Sql>, std::path::PathBuf) {
-        let d = std::env::temp_dir().join(format!("sqweezdb-expr-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-expr-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap();
         for q in ["CREATE TABLE t (id UUID PRIMARY KEY DEFAULT uuid(), n INT, name VARCHAR(20), nick VARCHAR(20), at TIMESTAMP, doc VARCHAR(200))",
                   "INSERT INTO t (id, n, name, nick, at, doc) VALUES ('0190d3c8-7c4b-7a3e-9f00-000000000001', 1, 'Alice', NULL, '2026-10-01', '{\"tags\":[\"a\",\"b\"],\"n\":5}'), ('0190d3c8-7c4b-7a3e-9f00-000000000002', 2, 'bob', 'bobby', '2026-10-20 08:00:00', '{\"n\":1}')"] {
@@ -3395,7 +3412,7 @@ mod expression_tests {
         assert_eq!(r, vec![vec![Value::Text("?".into()), Value::Int(2)]], "a ? inside quotes or a comment is not a parameter");
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
-    #[test] fn sqweezdb_semantics_that_differ_from_sqlite() {
+    #[test] fn sqzdb_semantics_that_differ_from_sqlite() {
         let (s, d) = db("strict");
         let one = |q: &str| s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
         let err = |q: &str| s.exec_s(&mut Session::default(), q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}"));
@@ -3435,7 +3452,7 @@ mod insert_tests {
     use super::*;
     use crate::config::Config;
     fn db(name: &str) -> (Arc<Sql>, std::path::PathBuf) {
-        let d = std::env::temp_dir().join(format!("sqweezdb-ins-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-ins-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap();
         for q in ["CREATE TABLE kv (k INTEGER PRIMARY KEY, email VARCHAR(40) UNIQUE, n INT DEFAULT 0, at TIMESTAMP)", "INSERT INTO kv (k, email, n) VALUES (1, 'a@x', 1), (2, 'b@x', 2)",
                   "CREATE TABLE logins (id SERIAL PRIMARY KEY, who VARCHAR(40), at TIMESTAMP DEFAULT now())"] { s.exec_s(&mut Session::default(), q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
@@ -3602,7 +3619,7 @@ mod long_tests {
     use super::*;
     use crate::config::Config;
     use crate::table::{decode_col, reclaim};
-    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqweezdb-long-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
+    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqzdb-long-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
     fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn qp(s: &Sql, sql: &str, p: &[Value]) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, p).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn err(s: &Sql, sql: &str, p: &[Value]) -> String { s.exec_s(&mut Session::default(), sql, p).err().unwrap_or_else(|| panic!("{sql}: no error")) }
@@ -3749,6 +3766,20 @@ mod long_tests {
         { let s = Sql::open_with(&d, Config::default()).unwrap(); assert_eq!(qp(&s, "SELECT length(notes), s FROM old", &[]), vec![vec![i(10_000), t(&"o".repeat(255))]]); }
         std::fs::remove_dir_all(&d).ok();
     }
+    #[test] fn a_policy_compares_a_long_value_in_a_row_being_written() {
+        // the row an INSERT checks carries its long values after it (not in a store yet): an order comparison must read them
+        let d = tmp("policy"); let s = Sql::open_with(&d, Config::default()).unwrap();
+        for st in ["CREATE TABLE docs (id SERIAL PRIMARY KEY, title TEXT, label TEXT)", "CREATE ROLE member", "GRANT SELECT, INSERT ON docs TO member",
+                   "CREATE POLICY below ON docs FOR ALL TO member USING (label < SESSION.limit)"] { q(&s, st); }
+        let mut sess = Session::default(); s.assume(&mut sess, &["member".into()], [("limit".to_string(), t("m"))].into_iter().collect()).unwrap();
+        let ins = |sess: &mut Session, title: &str, label: String| s.exec_s(sess, "INSERT INTO docs (title, label) VALUES (?, ?)", &[t(title), t(&label)]);
+        let (title, label) = ("x".repeat(100), "z".repeat(100));
+        assert!(ins(&mut sess, &title, label).is_err(), "a long label past the limit, behind another long value: refused");
+        assert!(ins(&mut sess, &title, "z".into()).is_err(), "a short one too");
+        ins(&mut sess, &title, "a".repeat(100)).unwrap();
+        assert_eq!(s.exec_s(&mut sess, "SELECT count(*) FROM docs", &[]).unwrap(), vec![vec![i(1)]]);
+        drop(s); std::fs::remove_dir_all(&d).ok();
+    }
     #[test] fn changes_and_alter_carry_long_values() {
         let d = tmp("feed"); let s = Sql::open_with(&d, Config::default()).unwrap();
         q(&s, "CREATE TABLE d (id INT PRIMARY KEY, title TEXT(40), body TEXT)");
@@ -3779,7 +3810,7 @@ mod long_timing {
         let n = 100; let t = std::time::Instant::now(); for _ in 0..n { let s = String::from_utf8_lossy(&b).into_owned(); std::hint::black_box(s); } println!("lossy+owned   {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
         let t = std::time::Instant::now(); for _ in 0..n { let s = std::str::from_utf8(&b).unwrap().to_owned(); std::hint::black_box(s); } println!("from_utf8+own {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
         let t = std::time::Instant::now(); for _ in 0..n { let s = b.to_vec(); std::hint::black_box(s); } println!("to_vec        {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
-        let d = std::env::temp_dir().join(format!("sqweezdb-lt-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-lt-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, crate::config::Config::default()).unwrap(); s.exec_s(&mut Session::default(), "CREATE TABLE t (id INT PRIMARY KEY, body TEXT)", &[]).unwrap();
         s.exec_s(&mut Session::default(), "INSERT INTO t VALUES (1, ?)", &[Value::Text(String::from_utf8(b.to_vec()).unwrap())]).unwrap();
         let p = s.prepare("SELECT body FROM t WHERE id = 1").unwrap(); let mut sess = Session::default();

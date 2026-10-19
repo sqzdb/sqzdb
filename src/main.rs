@@ -1,13 +1,13 @@
-//! The `sqweezdb` command: `serve` a database directory (Unix socket, TCP, the web console) and `shell` into one.
+//! The `sqzdb` command: `serve` a database directory (Unix socket, TCP, the web console) and `shell` into one.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;   // musl's allocator halves the engine's speed (E45)
 
 use serde_json::{json, Map, Value as J};
-use sqweezdb::config::Config;
-use sqweezdb::net::Client;
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::{format_timestamp, ColType, Value};
+use sqzdb::config::Config;
+use sqzdb::net::Client;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::{format_timestamp, ColType, Value};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,17 +21,17 @@ fn main() {
     match args.first().map(|s| s.as_str()) {
         Some("serve") => serve(&args[1..]),
         Some("shell") => shell(&args[1..]),
-        Some("version") | Some("--version") => println!("sqweezdb {}", env!("CARGO_PKG_VERSION")),
+        Some("version") | Some("--version") => println!("sqzdb {}", env!("CARGO_PKG_VERSION")),
         _ => usage(),
     }
 }
 fn usage() -> ! {
-    eprintln!("usage:\n  sqweezdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps; with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqweezdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqweezdb shell <host:port> --token <t>    The same over TCP against a running server.");
+    eprintln!("usage:\n  sqzdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps; with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqzdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqzdb shell <host:port> --token <t>    The same over TCP against a running server.");
     std::process::exit(2)
 }
 fn flag(a: &[String], name: &str) -> Option<String> { a.iter().position(|s| s == name).and_then(|i| a.get(i + 1).cloned()) }
 fn has(a: &[String], name: &str) -> bool { a.iter().any(|s| s == name) }
-fn fail(e: impl std::fmt::Display) -> ! { eprintln!("sqweezdb: {e}"); std::process::exit(1) }
+fn fail(e: impl std::fmt::Display) -> ! { eprintln!("sqzdb: {e}"); std::process::exit(1) }
 fn random_token() -> String { let mut b = [0u8; 16]; std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b)).unwrap_or_else(|e| fail(format!("/dev/urandom: {e}"))); b.iter().map(|x| format!("{x:02x}")).collect() }
 
 /// Every connected user holds a socket: take the hard limit on open files (a service often starts with 1,024).
@@ -58,7 +58,7 @@ fn serve(a: &[String]) {
     let cfg = Config::load(&dir, Some(&J::Object(opts).to_string())).unwrap_or_else(|e| fail(e));
     let t = Instant::now(); let sql = Sql::open_with(&dir, cfg.clone()).unwrap_or_else(|e| fail(e));
     let rows = sql.snapshot_rows();
-    println!("sqweezdb serving {} ({} tables, {} rows, opened in {:.0} ms)", dir.display(), sql.db.table_names().len(), rows, t.elapsed().as_secs_f64() * 1e3);
+    println!("sqzdb serving {} ({} tables, {} rows, opened in {:.0} ms)", dir.display(), sql.db.table_names().len(), rows, t.elapsed().as_secs_f64() * 1e3);
     println!("  durability: {:?}{}", cfg.durable, cfg.backup.as_ref().map(|b| format!("; backup to {}/{} every {:?}{}", b.bucket, b.prefix.trim_matches('/'), b.interval, if b.passphrase.is_some() { ", encrypted" } else { "" })).unwrap_or_default());
     if let Some(p) = &cfg.listen.socket { println!("  socket:     {}", p.display()); }
     if let Some(t) = &cfg.listen.tcp { println!("  tcp:        {t}"); }
@@ -84,9 +84,9 @@ fn shell(a: &[String]) {
         Conn::Remote(Client::connect_tcp(&target, &token).unwrap_or_else(|e| fail(format!("{target}: {e}"))))
     } else { Conn::Local(Sql::open_with(std::path::Path::new(&target), Config::default()).unwrap_or_else(|e| fail(e)), Session::default()) };
     let mut out = std::io::stdout(); let stdin = std::io::stdin(); let mut buf = String::new();
-    eprintln!("sqweezdb shell: statements end with ';'   .tables   .quit");
+    eprintln!("sqzdb shell: statements end with ';'   .tables   .quit");
     loop {
-        eprint!("{}", if buf.is_empty() { "sqweezdb> " } else { "      ... " }); let _ = std::io::stderr().flush();
+        eprint!("{}", if buf.is_empty() { "sqzdb> " } else { "      ... " }); let _ = std::io::stderr().flush();
         let mut line = String::new(); if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { break; }
         let l = line.trim();
         if buf.is_empty() && l.starts_with('.') { match l { ".quit" | ".exit" => break, ".tables" => { let t = Instant::now(); match &mut conn { Conn::Local(s, _) => { let rows: Vec<Vec<Value>> = s.db.table_names().into_iter().map(|n| vec![Value::Text(n)]).collect(); print_rows(&mut out, &[("table".into(), None)], &rows, t.elapsed()) } Conn::Remote(_) => eprintln!(".tables is not available over TCP yet; query the console's /api/tables") } } other => eprintln!("unknown command {other}") } continue; }
@@ -96,8 +96,8 @@ fn shell(a: &[String]) {
         let text = buf.trim().trim_end_matches(';').trim().to_string(); buf.clear(); if text.is_empty() { continue; }
         let t = Instant::now();
         match &mut conn {
-            Conn::Local(s, sess) => match s.query(sess, &text, &[]) { Ok((cols, rows)) => print_rows(&mut out, &cols, &rows, t.elapsed()), Err(e) => eprintln!("error [{}]: {e}", sqweezdb::sql::error_code(&e)) },
-            Conn::Remote(c) => match c.exec(&text, &[]) { Ok(rows) => print_rows(&mut out, &[], &rows, t.elapsed()), Err(e) => eprintln!("error [{}]: {e}", sqweezdb::sql::error_code(&e)) },
+            Conn::Local(s, sess) => match s.query(sess, &text, &[]) { Ok((cols, rows)) => print_rows(&mut out, &cols, &rows, t.elapsed()), Err(e) => eprintln!("error [{}]: {e}", sqzdb::sql::error_code(&e)) },
+            Conn::Remote(c) => match c.exec(&text, &[]) { Ok(rows) => print_rows(&mut out, &[], &rows, t.elapsed()), Err(e) => eprintln!("error [{}]: {e}", sqzdb::sql::error_code(&e)) },
         }
     }
 }

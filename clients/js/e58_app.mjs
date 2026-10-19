@@ -1,4 +1,4 @@
-// E58: the app API end to end with the JS client against `sqweezdb serve --app`: users sign up and query from the
+// E58: the app API end to end with the JS client against `sqzdb serve --app`: users sign up and query from the
 // client under row policies, live queries move between devices, and the API refuses what a client may not do.
 // Sign-in with a provider goes through the browser's redirects against a local OpenID Connect provider (as in E57).
 // Then: SQL round trips over the socket and over HTTP, a write's way to the other device's live query, and the
@@ -31,7 +31,7 @@ await new Promise((r) => idp.listen(0, '127.0.0.1', r)); const idpUrl = `http://
 // the user approves at the provider, which sends the browser back with `code`
 const approve = (to, code, sub, email) => { const q = new URL(to).searchParams; grants.set(code, { challenge: q.get('code_challenge'), nonce: q.get('nonce'), sub, email }); return q.get('state'); };
 
-const BIN = new URL('../../target/release/sqweezdb', import.meta.url).pathname;
+const BIN = new URL('../../target/release/sqzdb', import.meta.url).pathname;
 const dir = new URL('../../data/nocow/e58', import.meta.url).pathname; fs.rmSync(dir, { recursive: true, force: true });
 const port = await new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
 const url = `http://127.0.0.1:${port}`;

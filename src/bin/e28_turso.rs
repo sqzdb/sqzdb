@@ -1,8 +1,8 @@
 //! Experiment 28: the same workloads against Turso (Rust rewrite of SQLite, MVCC "BEGIN CONCURRENT"), SQLite (system lib),
 //! and ours. Each engine runs in its own child process so memory is measured cleanly. 1M rows, identical statements.
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
-use sqweezdb::util::Rng;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
+use sqzdb::util::Rng;
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::PathBuf;

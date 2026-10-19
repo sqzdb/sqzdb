@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sqweezdb console</title>
+<title>sqzdb console</title>
 <style>
 :root {
   --bg:#141518; --panel:#1b1d21; --raised:#212429; --hover:#272a30; --active:#2e3138; --line:#2b2e34; --line-2:#383c43;
@@ -317,7 +317,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 <body>
 <div class="app" id="app">
   <aside class="side" aria-label="Database">
-    <div class="brand"><div class="wordmark">sqweez<span>db</span></div><span id="conn" class="pill"><span class="dot"></span><span id="conntext">connecting</span></span></div>
+    <div class="brand"><div class="wordmark">sqz<span>db</span></div><span id="conn" class="pill"><span class="dot"></span><span id="conntext">connecting</span></span></div>
     <div class="dbname" id="dbname" title=""><b id="dbbase">&#8203;</b><span id="dbpath"></span></div>
     <div class="sec-head"><span>Tables</span><span class="count" id="tcount">0</span><button id="newtable" class="icon-btn" title="New table" aria-label="New table"></button></div>
     <label class="search"><span id="searchicon"></span><input id="tfilter" class="input" placeholder="Filter tables" aria-label="Filter tables" autocomplete="off" spellcheck="false"><kbd>/</kbd></label>
@@ -382,7 +382,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 
 <div id="gate" class="gate hidden" role="dialog" aria-modal="true" aria-labelledby="gtitle">
   <form class="box" id="gateform">
-    <div class="wordmark">sqweez<span>db</span></div>
+    <div class="wordmark">sqz<span>db</span></div>
     <h2 id="gtitle">Connect to the console</h2>
     <p>Paste the token this server printed when it started, or the one you passed with <code>--token</code>.</p>
     <label for="token">Token</label>
@@ -427,7 +427,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   const MOD = isMac ? '⌘' : 'Ctrl';
   $('runkbd').textContent = `${MOD} ↵`;
   const store = { get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (_) { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) {} } };
-  let token = ''; try { token = sessionStorage.getItem('sqweezdb.token') || ''; } catch (_) {}
+  let token = ''; try { token = sessionStorage.getItem('sqzdb.token') || ''; } catch (_) {}
   const fmtBytes = (n) => n == null ? '—' : n < 1e3 ? n + ' B' : n < 1e6 ? (n / 1e3).toFixed(0) + ' KB' : n < 1e9 ? (n / 1e6).toFixed(1) + ' MB' : (n / 1e9).toFixed(2) + ' GB';
   const fmtN = (n) => Number(n).toLocaleString();
 
@@ -453,11 +453,11 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     return body;
   }
   $('gateform').addEventListener('submit', async (e) => {
-    e.preventDefault(); token = $('token').value.trim(); try { sessionStorage.setItem('sqweezdb.token', token); } catch (_) {}
+    e.preventDefault(); token = $('token').value.trim(); try { sessionStorage.setItem('sqzdb.token', token); } catch (_) {}
     $('gerr').textContent = '';
     try { await api('/api/status'); $('gate').classList.add('hidden'); tablesKey = ''; await refresh(); toast('Connected'); } catch (err) { if (!err.auth) $('gerr').textContent = err.message; }
   });
-  $('disconnect').onclick = () => { token = ''; try { sessionStorage.removeItem('sqweezdb.token'); } catch (_) {} stopLive(); stopFeed(); setConn('warn', 'locked'); showGate(''); };
+  $('disconnect').onclick = () => { token = ''; try { sessionStorage.removeItem('sqzdb.token'); } catch (_) {} stopLive(); stopFeed(); setConn('warn', 'locked'); showGate(''); };
 
   // ---- SQL highlighting (display only; the textarea above it holds the text)
   const KW = new Set('select from where and or not in is null as on join left inner outer cross using group by order asc desc limit offset insert into values update set delete create table alter add drop column rename to type data primary key unique references foreign cascade restrict default index if exists begin commit rollback transaction returning distinct having between like with case when then else end true false role user grant revoke policy for all session serial autoincrement generated always identity varchar text int integer bigint double real float bool boolean bytes blob timestamp uuid count sum avg min max'.split(' '));
@@ -493,7 +493,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 
   // ---- status + tables
   let tablesCache = [], tablesKey = '', selected = '', filter = '';
-  const openTables = new Set(store.get('sqweezdb.open', []));
+  const openTables = new Set(store.get('sqzdb.open', []));
   async function refresh() {
     if (!$('gate').classList.contains('hidden')) return;
     try {
@@ -532,7 +532,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     }).join('');
   }
   $('tables').addEventListener('click', (e) => {
-    const tg = e.target.closest('[data-toggle]'); if (tg) { const n = tg.dataset.toggle; if (openTables.has(n)) openTables.delete(n); else openTables.add(n); store.set('sqweezdb.open', [...openTables]); tablesKey = ''; renderTables(); return; }
+    const tg = e.target.closest('[data-toggle]'); if (tg) { const n = tg.dataset.toggle; if (openTables.has(n)) openTables.delete(n); else openTables.add(n); store.set('sqzdb.open', [...openTables]); tablesKey = ''; renderTables(); return; }
     const ed = e.target.closest('[data-edit]'); if (ed) { openDesigner(ed.dataset.edit); return; }
     const row = e.target.closest('.trow'); if (row) { selected = row.dataset.name; tablesKey = ''; renderTables(); setSQL(`SELECT * FROM ${qid(row.dataset.name)} LIMIT 100`); showTab('console'); run(); }
   });
@@ -584,13 +584,13 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   function params() { const p = $('params').value.trim(); if (!p) return []; let v; try { v = JSON.parse(p); } catch (_) { throw Object.assign(new Error('parameters must be a JSON array, like [42, "alice"]'), { code: 'ARGUMENTS' }); } if (!Array.isArray(v)) throw Object.assign(new Error('parameters must be a JSON array'), { code: 'ARGUMENTS' }); return v; }
 
   // ---- history (this browser only)
-  function remember(q) { q = q.trim(); if (!q) return; const h = store.get('sqweezdb.history', []).filter((x) => x.q !== q); h.unshift({ q, at: Date.now() }); store.set('sqweezdb.history', h.slice(0, 40)); }
+  function remember(q) { q = q.trim(); if (!q) return; const h = store.get('sqzdb.history', []).filter((x) => x.q !== q); h.unshift({ q, at: Date.now() }); store.set('sqzdb.history', h.slice(0, 40)); }
   function ago(t) { const s = (Date.now() - t) / 1000; return s < 60 ? 'just now' : s < 3600 ? Math.floor(s / 60) + ' min ago' : s < 86400 ? Math.floor(s / 3600) + ' h ago' : Math.floor(s / 86400) + ' d ago'; }
   let pop = null;
   function closePop() { if (pop) { pop.remove(); pop = null; $('histbtn').setAttribute('aria-expanded', 'false'); } }
   $('histbtn').onclick = (e) => {
     e.stopPropagation(); if (pop) return closePop();
-    const h = store.get('sqweezdb.history', []); pop = document.createElement('div'); pop.className = 'pop'; pop.setAttribute('role', 'menu');
+    const h = store.get('sqzdb.history', []); pop = document.createElement('div'); pop.className = 'pop'; pop.setAttribute('role', 'menu');
     pop.innerHTML = h.length ? h.map((x, k) => `<button class="item" role="menuitem" data-k="${k}"><code>${esc(x.q.replace(/\s+/g, ' '))}</code><small>${ago(x.at)}</small></button>`).join('') : '<div class="none">Queries you run show up here.</div>';
     document.body.append(pop); const r = $('histbtn').getBoundingClientRect(); pop.style.left = Math.max(16, Math.min(r.left, innerWidth - pop.offsetWidth - 16)) + 'px'; pop.style.top = (r.bottom + 6 + scrollY) + 'px';
     $('histbtn').setAttribute('aria-expanded', 'true');
@@ -721,7 +721,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
         + '[backup]\n' + `endpoint   = ${q(v('bf-endpoint', 'https://s3.eu-central-1.amazonaws.com'))}\nbucket     = ${q(v('bf-bucket', 'my-bucket'))}\nprefix     = ${q($('bf-prefix').value.trim())}\nregion     = ${q(v('bf-region', 'us-east-1'))}\n`
         + 'accessKey  = "${S3_KEY}"\nsecretKey  = "${S3_SECRET}"\n' + (enc ? 'passphrase = "${DB_PASSPHRASE}"\n' : '');
       const dir = /\s/.test(st.dir) ? `"${st.dir}"` : st.dir; const l = st.listen || {};
-      const cmd = `S3_KEY=… S3_SECRET=…${enc ? ' DB_PASSPHRASE=…' : ''} \\\n  sqweezdb serve ${dir} --config backup.toml${l.http ? ' --ui ' + l.http : ''}${l.tcp ? ' --tcp ' + l.tcp : ''}`;
+      const cmd = `S3_KEY=… S3_SECRET=…${enc ? ' DB_PASSPHRASE=…' : ''} \\\n  sqzdb serve ${dir} --config backup.toml${l.http ? ' --ui ' + l.http : ''}${l.tcp ? ' --tcp ' + l.tcp : ''}`;
       $('bf-toml').innerHTML = tomlHL(toml); $('bf-cmd').textContent = cmd;
     };
     for (const id of ['bf-endpoint', 'bf-bucket', 'bf-prefix', 'bf-region']) $(id).addEventListener('input', upd);
@@ -913,7 +913,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     for (const b of document.querySelectorAll('.tab')) b.setAttribute('aria-selected', String(b.dataset.tab === name));
     for (const t of ['console', 'changes', 'acl', 'backup']) $('tab-' + t).classList.toggle('hidden', t !== name);
     if (name === 'acl') acl(); if (name === 'backup') renderBackup(); if (name === 'changes') { feedEmpty(); if (!$('csql').value.trim() && tablesCache[0]) $('csql').value = `SELECT * FROM ${qid(tablesCache[0].name)}`; }
-    store.set('sqweezdb.tab', name);
+    store.set('sqzdb.tab', name);
   }
   for (const b of document.querySelectorAll('.tab')) b.onclick = () => showTab(b.dataset.tab);
   document.querySelector('.tabs').addEventListener('keydown', (e) => {
@@ -928,7 +928,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   $('tfilter').addEventListener('keydown', (e) => { if (e.key === 'Escape') { $('tfilter').value = ''; filter = ''; tablesKey = ''; renderTables(); $('tfilter').blur(); } if (e.key === 'Enter') { const r = $('tables').querySelector('.trow'); if (r) r.click(); } });
 
   syncEditor(); renderEmpty(); feedEmpty();
-  const tab0 = store.get('sqweezdb.tab', 'console'); showTab(['console', 'changes', 'acl', 'backup'].includes(tab0) ? tab0 : 'console');
+  const tab0 = store.get('sqzdb.tab', 'console'); showTab(['console', 'changes', 'acl', 'backup'].includes(tab0) ? tab0 : 'console');
   if (!token) { setConn('warn', 'locked'); showGate(''); } else refresh();
   setInterval(refresh, 2000);
 })();

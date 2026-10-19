@@ -1,6 +1,6 @@
 [package]
-name = "sqweezdb_node"
-version = "0.9.0"
+name = "sqzdb_node"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
 
@@ -8,7 +8,7 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-sqweezdb = { path = "../.." }   # includes the web console (off until listen.http is set)
+sqzdb = { path = "../.." }   # includes the web console (off until listen.http is set)
 napi = { version = "2", default-features = false, features = ["napi8"] }
 napi-derive = "2"
 

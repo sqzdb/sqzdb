@@ -1,4 +1,4 @@
-# The notes app's server settings. From demos/notes:  sqweezdb serve ./data --config notes.toml
+# The notes app's server settings. From demos/notes:  sqzdb serve ./data --config notes.toml
 [listen]
 app = "127.0.0.1:8075"          # the app API, and the page from staticDir
 

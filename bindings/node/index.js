@@ -1,16 +1,32 @@
 'use strict';
-// sqweezdb for Node: the API developers see. Synchronous like better-sqlite3 and node:sqlite, because a read answers in
+// sqzdb for Node: the API developers see. Synchronous like better-sqlite3 and node:sqlite, because a read answers in
 // well under a microsecond; promises only where there is real waiting (durability, subscriptions, long scans).
-const native = require('./sqweezdb.node');
+const native = loadNative();
 
-class SqweezError extends Error {
-  constructor(code, message) { super(message); this.name = 'SqweezError'; this.code = code; }
+/** The engine, built for this system: a local build (`make node`, in a checkout), else the prebuilt one npm installed
+ * alongside this package (@sqzdb/<platform>-<arch>[-<libc>], one of its optionalDependencies). */
+function loadNative() {
+  try { return require('./sqzdb.node'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; }
+  const { platform, arch } = process;
+  const libc = platform === 'linux' ? (isMusl() ? 'musl' : 'gnu') : '';
+  const name = `@sqzdb/${platform}-${arch}${libc && '-' + libc}`;
+  try { return require(name); } catch (e) {
+    if (e.code !== 'MODULE_NOT_FOUND') throw e;
+    throw new Error(`sqzdb: no engine for ${platform} ${arch}${libc && ' (' + libc + ')'}. It comes as ${name}, which npm installs with sqzdb on Linux and macOS (x64, arm64). Was it left out (--no-optional, or a lockfile made on another system)?`);
+  }
+}
+function isMusl() {
+  try { return !process.report.getReport().header.glibcVersionRuntime; } catch { return require('node:fs').existsSync('/etc/alpine-release'); }
+}
+
+class SqzError extends Error {
+  constructor(code, message) { super(message); this.name = 'SqzError'; this.code = code; }
 }
 function wrap(e) {
-  if (e instanceof SqweezError) return e;
+  if (e instanceof SqzError) return e;
   const m = /^([A-Z_]+)\|([\s\S]*)$/.exec((e && e.message) || '');
   if (!m) return e;
-  const err = new SqweezError(m[1], m[2]); if (e.stack) err.stack = err.stack.split('\n')[0] + '\n' + e.stack.split('\n').slice(1).join('\n'); return err;
+  const err = new SqzError(m[1], m[2]); if (e.stack) err.stack = err.stack.split('\n')[0] + '\n' + e.stack.split('\n').slice(1).join('\n'); return err;
 }
 const norm = (p) => (p === undefined ? [] : Array.isArray(p) ? p : [p]);
 // a short randomized pause between transaction retries (microseconds), without yielding to the event loop
@@ -101,7 +117,7 @@ class Auth {
   constructor(native, table) { this._n = native; this.table = table; }
   /** Insert a user (fields must include the login column) and set their password: resolves to { token, user }. */
   async signUp(fields, password) {
-    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) throw new SqweezError('TYPE', 'signUp() takes the new row as an object, such as { email, name }');
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) throw new SqzError('TYPE', 'signUp() takes the new row as an object, such as { email, name }');
     const keys = Object.keys(fields);
     try { return await this._n.signUp(this.table, keys, keys.map((k) => fields[k]), String(password)); } catch (e) { throw wrap(e); }
   }
@@ -207,9 +223,9 @@ class Database {
     else if (who && typeof who === 'object' && !Array.isArray(who)) {
       const { role, roles, ...attrs } = who;
       const list = roles !== undefined ? roles : role !== undefined ? [role] : [];
-      if (!Array.isArray(list) || list.some((r) => typeof r !== 'string')) throw new SqweezError('TYPE', "as(): 'role' is a role name and 'roles' an array of role names");
+      if (!Array.isArray(list) || list.some((r) => typeof r !== 'string')) throw new SqzError('TYPE', "as(): 'role' is a role name and 'roles' an array of role names");
       identity = Object.freeze({ roles: Object.freeze([...list]), ...attrs });
-    } else throw new SqweezError('TYPE', "as() takes a user name, or an identity such as { role: 'customer', tenant: 42 }");
+    } else throw new SqzError('TYPE', "as() takes a user name, or an identity such as { role: 'customer', tenant: 42 }");
     try {
       sess = this._db.session();
       if (user !== null) sess.login(user);
@@ -222,7 +238,7 @@ class Database {
    * milliseconds and runs off the JavaScript thread, so signUp, signIn and setPassword return promises.
    */
   auth(table) {
-    if (typeof table !== 'string') throw new SqweezError('TYPE', 'auth() takes the name of a table users sign in to');
+    if (typeof table !== 'string') throw new SqzError('TYPE', 'auth() takes the name of a table users sign in to');
     return new Auth(this._db, table);
   }
   /**
@@ -231,7 +247,7 @@ class Database {
    * ended by a password change, or expired. Cheap enough to call once per request.
    */
   session(token) {
-    if (typeof token !== 'string') throw new SqweezError('TYPE', 'session() takes a session token');
+    if (typeof token !== 'string') throw new SqzError('TYPE', 'session() takes a session token');
     let sess; try { sess = this._db.session(); sess.useToken(token); } catch (e) { throw wrap(e); }
     return new Database(this._db, sess, { path: this.path, durable: this.durable, user: null, identity: null, stmts: this._stmts, rowMode: this.rowMode });
   }
@@ -255,4 +271,4 @@ function open(path, opts) {
   return new Database(handle, sess, { path, durable: handle.isDurable(), rowMode });
 }
 
-module.exports = { open, Database, Statement, Subscription, RunResult, SqweezError, Auth };
+module.exports = { open, Database, Statement, Subscription, RunResult, SqzError, Auth };

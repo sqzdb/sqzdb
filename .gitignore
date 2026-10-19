@@ -24,3 +24,4 @@ RESULTS.md
 
 # release tarballs from `make dist`
 /dist/
+dist-npm/

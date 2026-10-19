@@ -1,12 +1,51 @@
 {
-  "name": "sqweezdb",
-  "version": "0.9.0",
-  "description": "Embedded SQL database with many writers, enforced types, row policies and live subscriptions",
+  "name": "sqzdb",
+  "version": "0.10.0",
+  "description": "An embedded SQL database for Node: concurrent writers, row policies, live queries, files, vectors, sign-in and MCP for agents",
+  "keywords": [
+    "database",
+    "sql",
+    "embedded",
+    "sqlite",
+    "realtime",
+    "mcp",
+    "row-level-security"
+  ],
+  "homepage": "https://sqzdb.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sqzdb/sqzdb.git",
+    "directory": "bindings/node"
+  },
+  "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
-  "exports": { ".": { "types": "./index.d.ts", "import": "./index.mjs", "require": "./index.js" } },
-  "files": ["index.js", "index.mjs", "index.d.ts", "sqweezdb.node"],
-  "engines": { "node": ">=20" },
-  "license": "MIT",
-  "private": true
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "optionalDependencies": {
+    "@sqzdb/linux-x64-gnu": "0.10.0",
+    "@sqzdb/linux-x64-musl": "0.10.0",
+    "@sqzdb/linux-arm64-gnu": "0.10.0",
+    "@sqzdb/linux-arm64-musl": "0.10.0",
+    "@sqzdb/darwin-x64": "0.10.0",
+    "@sqzdb/darwin-arm64": "0.10.0"
+  }
 }

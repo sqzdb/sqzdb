@@ -1,7 +1,7 @@
 //! Experiment 29: SQLite's own "Quirks" page (sqlite.org/quirks.html), one statement sequence per quirk, run against
 //! SQLite (system lib, in memory) and ours. Expected verdicts are stated up front and checked.
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 use rusqlite::{types::Value as SV, Connection};
 use std::path::PathBuf;
 

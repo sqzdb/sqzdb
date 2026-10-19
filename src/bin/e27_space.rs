@@ -1,9 +1,9 @@
 //! Experiment 27: reclaiming space without stopping. (a) delete half of 2M rows, compare file sizes; (b) reclaim while a
 //! writer keeps inserting: SQLite VACUUM vs our snapshot, measuring the writer's worst stall; (c) churn: 1M live rows,
 //! 3M insert+delete pairs: SQLite file growth (default and auto_vacuum=FULL) vs our slot reuse and memory.
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
-use sqweezdb::util::Rng;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
+use sqzdb::util::Rng;
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::{Path, PathBuf};

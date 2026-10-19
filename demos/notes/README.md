@@ -1,6 +1,6 @@
-# Notes: an app with no server code, on sqweezdb
+# Notes: an app with no server code, on sqzdb
 
-A notes app whose only server is sqweezdb. The page signs users in, runs SQL as them and keeps its list
+A notes app whose only server is sqzdb. The page signs users in, runs SQL as them and keeps its list
 current with live queries, all through the [app API](../../README.md#the-app-api-sql-from-the-browser).
 Open it in two windows: a note written in one shows up in the other. Attach a picture (or paste one) and it
 shows in both: the attachment is a `FILE` column, and the image loads from a signed link the query returned.
@@ -16,7 +16,7 @@ Every statement from the browser runs under that policy, live queries included. 
 `WHERE owner = ?`, and still sees only the signed-in user's notes:
 
 ```js
-import { connect } from '/api/client.js'           // the client, served by sqweezdb itself
+import { connect } from '/api/client.js'           // the client, served by sqzdb itself
 const db = connect(location.origin)
 await db.auth.signIn(email, password)
 db.live('SELECT id, body, pinned, created FROM notes WHERE body ILIKE ? ORDER BY pinned DESC, created DESC LIMIT 200', [`%${search}%`], render)
@@ -26,10 +26,10 @@ await db.sql('INSERT INTO notes (owner, body) VALUES (?, ?)', [db.auth.user.id, 
 ## Run it
 
 ```sh
-cargo build --release                                   # or use an installed sqweezdb
+cargo build --release                                   # or use an installed sqzdb
 cd demos/notes
-../../target/release/sqweezdb shell ./data < schema.sql
-../../target/release/sqweezdb serve ./data --config notes.toml   # then open http://127.0.0.1:8075
+../../target/release/sqzdb shell ./data < schema.sql
+../../target/release/sqzdb serve ./data --config notes.toml   # then open http://127.0.0.1:8075
 ```
 
 [`notes.toml`](notes.toml) turns on the app API, serves [`static/`](static) beside it, and lets anyone
@@ -43,7 +43,7 @@ Add an embedding of each note, made by the database when a note is written, and 
 on this machine (`ollama pull nomic-embed-text`) or OpenAI both work; the column's size is the model's:
 
 ```sh
-echo "ALTER TABLE notes ADD COLUMN embedding VECTOR(768) GENERATED ALWAYS AS (embed(body)) STORED;" | ../../target/release/sqweezdb shell ./data
+echo "ALTER TABLE notes ADD COLUMN embedding VECTOR(768) GENERATED ALWAYS AS (embed(body)) STORED;" | ../../target/release/sqzdb shell ./data
 ```
 
 Then uncomment `[embed]` in `notes.toml` and restart. The page notices the column and shows **≈ meaning**
@@ -55,7 +55,7 @@ SELECT id, body, cosine_distance(embedding, embed(?)) AS d FROM notes WHERE embe
 
 ## Benchmark against PocketBase
 
-[`bench/bench.mjs`](bench/bench.mjs) runs the same workloads against sqweezdb and against PocketBase
+[`bench/bench.mjs`](bench/bench.mjs) runs the same workloads against sqzdb and against PocketBase
 0.40.5 set up the same way. Users sign up through the public API, notes are restricted to their owner
 (a policy here, `owner = @request.auth.id` collection rules there), and `notes.owner` is indexed in both.
 Both servers run on the same machine with data on the same disk, and the same Node client drives them
@@ -71,7 +71,7 @@ at `tools/pocketbase-0.40.5/pocketbase`, or pass `--pocketbase <path>`.
 On a 12-core Linux machine, 200 users with 50 notes each and 1,000 connected devices
 ([`results/e59_notes_vs_pocketbase.txt`](../../results/e59_notes_vs_pocketbase.txt)):
 
-| | sqweezdb | PocketBase | PocketBase, log off |
+| | sqzdb | PocketBase | PocketBase, log off |
 |---|---|---|---|
 | Notes created, 32 users writing at once | 47,548/s | 4,972/s | 5,761/s |
 | Server CPU per note created | 12 µs | 352 µs | 305 µs |
@@ -88,15 +88,15 @@ On a 12-core Linux machine, 200 users with 50 notes each and 1,000 connected dev
 
 What the rows measure, and where they are uneven:
 
-- A sqweezdb device holds two live queries: its newest 10 notes and its count, both kept current by the
+- A sqzdb device holds two live queries: its newest 10 notes and its count, both kept current by the
   server. A PocketBase device holds one subscription to note events, and the app works out the rest.
-- In the 32-users-at-once row, sqweezdb's server used one core, so the single Node client was the limit
+- In the 32-users-at-once row, sqzdb's server used one core, so the single Node client was the limit
   there.
-- A note with a picture is two requests for sqweezdb (the upload, then the INSERT, which the JS client does
+- A note with a picture is two requests for sqzdb (the upload, then the INSERT, which the JS client does
   for a `File` parameter) and one multipart request for PocketBase. Its download is a signed link for
-  sqweezdb, and a file token plus the file's URL for PocketBase (both with protected files).
+  sqzdb, and a file token plus the file's URL for PocketBase (both with protected files).
 - PocketBase checks the collection rule for every subscriber on every event. That is where its writes
   slow down with 1,000 devices connected.
-- Sign-up rates are not compared. Both hash passwords on purpose (sqweezdb uses argon2id, 19 MiB, about
+- Sign-up rates are not compared. Both hash passwords on purpose (sqzdb uses argon2id, 19 MiB, about
   10 ms), and PocketBase also needs a sign-in after sign-up to get a session.
 - On both servers, no device saw another user's note.

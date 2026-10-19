@@ -1,6 +1,6 @@
-# Agents: a database per AI agent on sqweezdb
+# Agents: a database per AI agent on sqzdb
 
-Each agent gets its own sqweezdb database: a directory holding that agent's memories. An agent's
+Each agent gets its own sqzdb database: a directory holding that agent's memories. An agent's
 database is created on first use and stays open while the agent works. It is closed when the agent
 goes idle or when too many are open, and opened again from disk when the agent wakes up. Forgetting
 an agent deletes its directory, so nothing of it stays behind in a shared table.
@@ -11,7 +11,7 @@ Here it runs in one Go process.
 ## Run it
 
 ```sh
-cargo build --release                        # builds target/release/libsqweezdb.so, which the Go binding links
+cargo build --release                        # builds target/release/libsqzdb.so, which the Go binding links
 cd demos/agents
 go run . -dir ./agents -addr 127.0.0.1:8071  # then open http://127.0.0.1:8071
 ```
@@ -47,7 +47,7 @@ Two benchmarks, both on the lab machine (Ryzen 5 9600X, NVMe under btrfs):
 
 - **The engines** ([`src/bin/e53_agents.rs`](../../src/bin/e53_agents.rs),
   [`results/e53_agents.txt`](../../results/e53_agents.txt)): 10,000 agents in one process on
-  sqweezdb's tenant host, SQLite and Turso 0.8.3 (a file per agent), and PocketBase as one process per
+  sqzdb's tenant host, SQLite and Turso 0.8.3 (a file per agent), and PocketBase as one process per
   agent, the way PocketHost isolates tenants.
 - **This server over HTTP** (`bench/`, [`results/e53_agents_http.txt`](../../results/e53_agents_http.txt)):
   against PocketBase 0.40.5 built the way you would build it there, with one shared `memories`
@@ -58,7 +58,7 @@ cargo run --release --features lab --bin e53_agents          # the engines (Pock
 
 go build -o /tmp/agents . && go build -o /tmp/agents-bench ./bench
 /tmp/agents -dir /tmp/agents-data &
-/tmp/agents-bench -target sqweezdb -url http://127.0.0.1:8071 -pid $! -dir /tmp/agents-data
+/tmp/agents-bench -target sqzdb -url http://127.0.0.1:8071 -pid $! -dir /tmp/agents-data
 pocketbase superuser upsert admin@bench.test benchpass123 --dir /tmp/pb_data
 pocketbase serve --http 127.0.0.1:8090 --dir /tmp/pb_data &
 /tmp/agents-bench -target pocketbase -url http://127.0.0.1:8090 -pid $! -dir /tmp/pb_data -setup [-no-request-log]
@@ -70,10 +70,10 @@ Each agent creates its database, defines a table, writes 20 memories one at a ti
 the newest 10. Then every agent stays open while memory is measured. Then 8 threads pick random
 agents to write one memory and read the newest 10 ("steps"). Finally closed agents are reopened. Two
 runs each; every phase starts after a `sync()` and a pause. SQLite and Turso run with
-`synchronous=OFF`, so they never fsync. sqweezdb doesn't wait for fsync either, but by default it
-fsyncs every write in the background at once; the second sqweezdb column uses `log.syncDelay = 1s`.
+`synchronous=OFF`, so they never fsync. sqzdb doesn't wait for fsync either, but by default it
+fsyncs every write in the background at once; the second sqzdb column uses `log.syncDelay = 1s`.
 
-| | sqweezdb | sqweezdb, `syncDelay 1s` | SQLite 3.53 | Turso 0.8.3 | PocketBase, a process per agent |
+| | sqzdb | sqzdb, `syncDelay 1s` | SQLite 3.53 | Turso 0.8.3 | PocketBase, a process per agent |
 |---|---:|---:|---:|---:|---:|
 | Create an agent | 232–243 µs | 274–284 µs | 251–253 µs | 1.8–1.9 ms | 43–44 ms to start |
 | Memory per open agent | 99–101 KB | 149–154 KB | 188 KB | 865–1,201 KB | 35 MB idle, empty |
@@ -91,7 +91,7 @@ recall their newest 10. Then 100 agents are forgotten. Forgetting means deleting
 in PocketBase it means listing the agent's records and deleting each one, because its API has no
 delete by filter. Two runs each.
 
-| | sqweezdb | sqweezdb, at most 200 open | sqweezdb, `-body-max 256` | PocketBase | PocketBase, request log off |
+| | sqzdb | sqzdb, at most 200 open | sqzdb, `-body-max 256` | PocketBase | PocketBase, request log off |
 |---|---:|---:|---:|---:|---:|
 | Spawn 2,000 agents | 0.54–0.55 s | 0.57–0.59 s | 0.50–0.51 s | 2.7–3.5 s | 2.3 s |
 | Steps per second, 8 clients | 21,100–21,500 | 5,300–5,400 | 24,500–24,600 | 6,800–7,000 | 7,000–8,400 |
@@ -109,13 +109,13 @@ No agent ever got another agent's memories back, on either server.
   about 100 KB, and forgetting one is a directory delete that takes under a millisecond. In PocketBase
   the choice is a shared table, where forgetting means deleting records one at a time, or a process
   per agent at 35 MB each.
-- **Memory text is expensive.** sqweezdb rows are fixed width: a `VARCHAR(2000)` memory takes 2 KB in
+- **Memory text is expensive.** sqzdb rows are fixed width: a `VARCHAR(2000)` memory takes 2 KB in
   memory and in the log whatever its length. The end-of-run figures don't hold the same data: being
-  faster, sqweezdb wrote about 450,000 memories of about 90 bytes, PocketBase about 150,000. Per
-  memory that is roughly 4 KB of server memory for sqweezdb against 0.7–1.4 KB for PocketBase, and
-  0.7 KB for sqweezdb with `-body-max 256`. Variable-length text is the biggest gap for this use case.
+  faster, sqzdb wrote about 450,000 memories of about 90 bytes, PocketBase about 150,000. Per
+  memory that is roughly 4 KB of server memory for sqzdb against 0.7–1.4 KB for PocketBase, and
+  0.7 KB for sqzdb with `-body-max 256`. Variable-length text is the biggest gap for this use case.
 - **There is no text search.** `LIKE` and full-text search don't exist yet, so recall by word scans the
-  agent's newest 5,000 memories in Go. Turso pitches vector search for agents, and sqweezdb has none.
+  agent's newest 5,000 memories in Go. Turso pitches vector search for agents, and sqzdb has none.
 - **Many small databases on one disk are bound by fsync.** By default every write gets its own
   background fsync, and with 10,000 agents those can't be shared. `log.syncDelay` lets one fsync
   cover a second of an agent's writes, which gives two to three times the throughput.

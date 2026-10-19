@@ -1,16 +1,16 @@
 //! Experiment 53: a database per agent. 10,000 agents, each with its own database: created on demand with a schema, 20
 //! memories written one at a time, the last 10 read back; then all agents open at once (memory per agent), random agents
-//! working from 8 threads, every agent closed and reopened, disk per agent. sqweezdb's tenant host, SQLite and Turso
+//! working from 8 threads, every agent closed and reopened, disk per agent. sqzdb's tenant host, SQLite and Turso
 //! 0.8.3 with a file per agent, and PocketBase with a process per agent (how PocketHost isolates tenants). Each engine runs
 //! in its own child process so memory is measured cleanly, and every phase starts after a sync() and a pause.
 //! Sync settings: SQLite and Turso run with synchronous=OFF (they never fsync); ours does not wait for fsync either but
 //! by default fsyncs every write within half a millisecond, and is also run with log.syncDelay = 1 s (one fsync per
 //! agent per second at most).
 use rusqlite::{params, Connection};
-use sqweezdb::sql::Session;
-use sqweezdb::table::Value;
-use sqweezdb::tenants::TenantHost;
-use sqweezdb::util::Rng;
+use sqzdb::sql::Session;
+use sqzdb::table::Value;
+use sqzdb::tenants::TenantHost;
+use sqzdb::util::Rng;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -30,7 +30,7 @@ fn body(a: usize, m: i64) -> String { format!("agent {a} noted step {m}: the use
 fn rss_mb() -> f64 { let s = fs::read_to_string("/proc/self/status").unwrap(); s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap() / 1024.0 }
 fn rss_of(pid: u32) -> f64 { fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok())).unwrap_or(0.0) / 1024.0 }
 fn du_kb(p: &PathBuf) -> f64 { let o = Command::new("du").args(["-sk", p.to_str().unwrap()]).output().unwrap(); String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("0").parse().unwrap_or(0.0) }
-fn line(e: &str, what: &str, v: String) { let e = if e == "sqweezdb" { match delay() { Some(d) => format!("sqweezdb {}ms", d.as_millis()), None => e.to_string() } } else { e.to_string() }; println!("{e:<15} {what:<46} {v}"); }
+fn line(e: &str, what: &str, v: String) { let e = if e == "sqzdb" { match delay() { Some(d) => format!("sqzdb {}ms", d.as_millis()), None => e.to_string() } } else { e.to_string() }; println!("{e:<15} {what:<46} {v}"); }
 unsafe extern "C" { fn malloc_trim(pad: usize) -> i32; }
 /// Flush the page cache and wait, so one phase's writeback does not stall the next (E50's lesson), then return freed heap.
 static SPLIT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -49,9 +49,9 @@ fn ours() {
         assert_eq!(s.exec_s(&mut se, LAST10, &[]).unwrap().len(), 10);
     }
     let spawn = t0.elapsed(); settle();
-    line("sqweezdb", "spawn: create + schema + 20 writes + read", format!("{:.0} us per agent ({:.2} s for {})", spawn.as_secs_f64() * 1e6 / NA() as f64, spawn.as_secs_f64(), NA()));
-    line("sqweezdb", "memory with every agent open", format!("{:.0} KB per agent ({:.0} MB for {})", (rss_mb() - r0) * 1024.0 / NA() as f64, rss_mb() - r0, NA()));
-    line("sqweezdb", "disk per agent (20 memories)", format!("{:.1} KB", du_kb(&root) / NA() as f64));
+    line("sqzdb", "spawn: create + schema + 20 writes + read", format!("{:.0} us per agent ({:.2} s for {})", spawn.as_secs_f64() * 1e6 / NA() as f64, spawn.as_secs_f64(), NA()));
+    line("sqzdb", "memory with every agent open", format!("{:.0} KB per agent ({:.0} MB for {})", (rss_mb() - r0) * 1024.0 / NA() as f64, rss_mb() - r0, NA()));
+    line("sqzdb", "disk per agent (20 memories)", format!("{:.1} KB", du_kb(&root) / NA() as f64));
     let work = |host: &Arc<TenantHost>| -> f64 {
         let stop = Arc::new(AtomicBool::new(false)); let ops = Arc::new(AtomicU64::new(0));
         let hs: Vec<_> = (0..8u64).map(|k| { let (host, stop, ops) = (host.clone(), stop.clone(), ops.clone()); std::thread::spawn(move || { let mut rng = Rng(11 + k); let mut se = Session::default();
@@ -61,12 +61,12 @@ fn ours() {
         std::thread::sleep(Duration::from_secs(4)); stop.store(true, Ordering::Relaxed); for h in hs { h.join().unwrap(); } let n = ops.load(Ordering::Relaxed);
         if std::env::var_os("E53_SPLIT").is_some() { eprintln!("split per step: get {:.1} us, insert {:.1} us, last-10 {:.1} us", SPLIT[0].load(Ordering::Relaxed) as f64 / n as f64 / 1e3, SPLIT[1].load(Ordering::Relaxed) as f64 / n as f64 / 1e3, SPLIT[2].load(Ordering::Relaxed) as f64 / n as f64 / 1e3); }
         n as f64 / 4.0 };
-    line("sqweezdb", "random agents, 8 threads: write + read last 10", format!("{:.0} agent steps/s", work(&host)));
+    line("sqzdb", "random agents, 8 threads: write + read last 10", format!("{:.0} agent steps/s", work(&host)));
     drop(host); settle();
     // reopen: a fresh host, every agent closed; open 2,000 agents and read their last 10
     let mut host = TenantHost::new(&root, NA() + 1, Duration::from_millis(env_or("E53_IDLE_MS", 300)), false); host.sync_delay = delay(); let host = Arc::new(host); let mut se = Session::default(); let t = Instant::now();
     for a in 0..2000 { let s = host.get(&format!("a{a:05}"), INIT).unwrap(); assert_eq!(s.exec_s(&mut se, LAST10, &[]).unwrap().len(), 10); }
-    line("sqweezdb", "reopen a closed agent + read last 10", format!("{:.0} us per agent", t.elapsed().as_secs_f64() * 1e6 / 2000.0));
+    line("sqzdb", "reopen a closed agent + read last 10", format!("{:.0} us per agent", t.elapsed().as_secs_f64() * 1e6 / 2000.0));
     drop(host);
     let _ = fs::remove_dir_all(&root);
 }

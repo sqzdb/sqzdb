@@ -1,7 +1,7 @@
-//! Python extension over the sqweezdb engine (PyO3). The interpreter lock is released while a statement runs, so Python
+//! Python extension over the sqzdb engine (PyO3). The interpreter lock is released while a statement runs, so Python
 //! threads get the engine's parallel reads.
-use sqweezdb::sql::{Prepared, Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::sql::{Prepared, Session, Sql};
+use sqzdb::table::Value;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::sync::{Arc, Mutex};
@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 #[pyclass(name = "Database")] struct PyDb { sql: Arc<Sql> }
 #[pyclass(name = "Statement")] struct PyStmt { p: Arc<Prepared> }
 #[pyclass(name = "Session")] struct PySess { sql: Arc<Sql>, s: Mutex<Session> }
-#[pyclass(name = "Subscription")] struct PySub { s: sqweezdb::live::Subscription }
+#[pyclass(name = "Subscription")] struct PySub { s: sqzdb::live::Subscription }
 /// Sign-up, sign-in and sessions for one table marked `ALTER TABLE <table> ENABLE AUTH` (`db.auth("users")`).
 #[pyclass(name = "Auth")] struct PyAuth { sql: Arc<Sql>, table: String }
-fn auth_err(e: String) -> PyErr { match sqweezdb::sql::error_code(&e) { "AUTH" | "DENIED" => pyo3::exceptions::PyPermissionError::new_err(e), "TYPE" | "DUPLICATE" | "SCHEMA" => pyo3::exceptions::PyValueError::new_err(e), _ => pyo3::exceptions::PyRuntimeError::new_err(e) } }
-fn signed_in<'py>(py: Python<'py>, si: sqweezdb::auth::SignedIn) -> PyResult<Bound<'py, PyTuple>> {
+fn auth_err(e: String) -> PyErr { match sqzdb::sql::error_code(&e) { "AUTH" | "DENIED" => pyo3::exceptions::PyPermissionError::new_err(e), "TYPE" | "DUPLICATE" | "SCHEMA" => pyo3::exceptions::PyValueError::new_err(e), _ => pyo3::exceptions::PyRuntimeError::new_err(e) } }
+fn signed_in<'py>(py: Python<'py>, si: sqzdb::auth::SignedIn) -> PyResult<Bound<'py, PyTuple>> {
     let user = pyo3::types::PyDict::new(py); for (k, v) in &si.user { user.set_item(k, to_py(py, v)?)?; }
     PyTuple::new(py, [si.token.into_pyobject(py)?.into_any(), user.into_any()])
 }
@@ -60,8 +60,8 @@ fn signed_in<'py>(py: Python<'py>, si: sqweezdb::auth::SignedIn) -> PyResult<Bou
     fn next<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Option<Bound<'py, PyTuple>>> {
         let ev = py.detach(|| self.s.recv_timeout(std::time::Duration::from_millis(timeout_ms)));
         match ev {
-            Some(sqweezdb::live::Event::Change(c)) => { let mut cells: Vec<Bound<'py, PyAny>> = vec![to_py(py, &Value::Int(match c.op { sqweezdb::sql::ChangeOp::Insert => 1, sqweezdb::sql::ChangeOp::Update => 2, sqweezdb::sql::ChangeOp::Delete => 3 }))?, to_py(py, &Value::Text(c.table.clone()))?, to_py(py, &c.pk.clone())?]; if let Some(r) = &c.row { for v in r { cells.push(to_py(py, v)?); } } Ok(Some(PyTuple::new(py, cells)?)) }
-            Some(sqweezdb::live::Event::Overflow { .. }) => Err(pyo3::exceptions::PyRuntimeError::new_err("subscription fell behind and was dropped; resubscribe")),
+            Some(sqzdb::live::Event::Change(c)) => { let mut cells: Vec<Bound<'py, PyAny>> = vec![to_py(py, &Value::Int(match c.op { sqzdb::sql::ChangeOp::Insert => 1, sqzdb::sql::ChangeOp::Update => 2, sqzdb::sql::ChangeOp::Delete => 3 }))?, to_py(py, &Value::Text(c.table.clone()))?, to_py(py, &c.pk.clone())?]; if let Some(r) = &c.row { for v in r { cells.push(to_py(py, v)?); } } Ok(Some(PyTuple::new(py, cells)?)) }
+            Some(sqzdb::live::Event::Overflow { .. }) => Err(pyo3::exceptions::PyRuntimeError::new_err("subscription fell behind and was dropped; resubscribe")),
             _ => Ok(None),
         }
     }
@@ -93,7 +93,7 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
         let dict = match options { Some(d) => d.copy()?, None => pyo3::types::PyDict::new(py) };
         if !dict.contains("durable")? { dict.set_item("durable", durable)?; }
         let json: String = py.import("json")?.call_method1("dumps", (&dict,))?.extract()?;
-        let cfg = sqweezdb::config::Config::load(&p, Some(&json)).map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let cfg = sqzdb::config::Config::load(&p, Some(&json)).map_err(pyo3::exceptions::PyValueError::new_err)?;
         let sql = Sql::open_with(&p, cfg).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Ok(PyDb { sql })
     }
@@ -148,4 +148,4 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
         rows_to_py(py, r.map_err(pyo3::exceptions::PyRuntimeError::new_err)?)
     }
 }
-#[pymodule(name = "sqweezdb")] fn sqweezdb_module(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<PyDb>()?; m.add_class::<PyStmt>()?; m.add_class::<PySess>()?; m.add_class::<PySub>()?; m.add_class::<PyAuth>()?; Ok(()) }
+#[pymodule(name = "sqzdb")] fn sqzdb_module(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<PyDb>()?; m.add_class::<PyStmt>()?; m.add_class::<PySess>()?; m.add_class::<PySub>()?; m.add_class::<PyAuth>()?; Ok(()) }

@@ -2,8 +2,8 @@
 //! synchronous=FULL), Turso 0.8.3 (MVCC, BEGIN CONCURRENT, synchronous=FULL) and ours (durable). Every commit waits
 //! for its fsync. Writers insert disjoint keys; at the end the row count must equal the acknowledged commits.
 use rusqlite::{params, Connection};
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +78,7 @@ fn ours() {
         }) }).collect();
         for h in hs { h.join().unwrap(); }
         let rows = match &sql.exec_s(&mut s0, "SELECT count(*) FROM t WHERE id >= ? AND id < ?", &[Value::Int(key(round, 0, 0)), Value::Int(key(round + 1, 0, 0))]).unwrap()[0][0] { Value::Int(n) => *n, _ => -1 };
-        report("sqweezdb", w, ok.load(Ordering::Relaxed), retried.load(Ordering::Relaxed), rows);
+        report("sqzdb", w, ok.load(Ordering::Relaxed), retried.load(Ordering::Relaxed), rows);
     }
 }
 

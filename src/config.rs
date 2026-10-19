@@ -441,22 +441,22 @@ mod tests {
         assert!(Config::from_json(r#"{"embed":{"url":"http://localhost:1@evil.example/v1","model":"m"}}"#).unwrap_err().contains("embed.url"));
     }
     #[test] fn file_then_code_then_env() {
-        let dir = std::env::temp_dir().join(format!("sqweezdb-config-test-{}", std::process::id())); std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("SQWEEZDB_TEST_SECRET", "s3cr3t"); }
+        let dir = std::env::temp_dir().join(format!("sqzdb-config-test-{}", std::process::id())); std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("SQZDB_TEST_SECRET", "s3cr3t"); }
         let file = dir.join("orders.toml");
-        std::fs::write(&file, "durable = true\n[backup]\nendpoint = \"http://127.0.0.1:9000\"\nbucket = \"from-file\"\naccessKey = \"k\"\nsecretKey = \"${SQWEEZDB_TEST_SECRET}\"\n[snapshot]\nlogBytes = \"64MB\"\n").unwrap();
+        std::fs::write(&file, "durable = true\n[backup]\nendpoint = \"http://127.0.0.1:9000\"\nbucket = \"from-file\"\naccessKey = \"k\"\nsecretKey = \"${SQZDB_TEST_SECRET}\"\n[snapshot]\nlogBytes = \"64MB\"\n").unwrap();
         let json = format!(r#"{{"configFile":{:?},"backup":{{"bucket":"from-code"}},"snapshot":{{"idleAfter":"10s"}}}}"#, file.to_str().unwrap());
         let c = Config::load(&dir, Some(&json)).unwrap();
         assert_eq!(c.durable, Durability::Fsync, "from the file");
         let b = c.backup.unwrap(); assert_eq!(b.bucket, "from-code", "code wins over the file"); assert_eq!(b.secret_key, "s3cr3t", "secret from the environment"); assert_eq!(b.endpoint, "http://127.0.0.1:9000", "untouched file values survive the overlay");
         assert_eq!(c.snapshot.log_bytes, Some(64 << 20)); assert_eq!(c.snapshot.idle_after, Some(Duration::from_secs(10)));
         // a file inside the data directory is data, not configuration: it is never read unless named
-        std::fs::write(dir.join("sqweezdb.toml"), "durable = true\n[listen]\ntcp = \"0.0.0.0:1\"\ntoken = \"x\"\n").unwrap();
+        std::fs::write(dir.join("sqzdb.toml"), "durable = true\n[listen]\ntcp = \"0.0.0.0:1\"\ntoken = \"x\"\n").unwrap();
         let c = Config::load(&dir, Some("{}")).unwrap(); assert_eq!(c.durable, Durability::Visible); assert!(c.listen.tcp.is_none());
         std::fs::write(&file, "configFile = \"other.toml\"\n").unwrap();
         assert!(Config::load(&dir, Some(&format!(r#"{{"configFile":{:?}}}"#, file.to_str().unwrap()))).unwrap_err().contains("cannot be set from a file"));
-        std::fs::write(&file, "[backup]\nsecretKey = \"${SQWEEZDB_TEST_UNSET_VAR}\"\n").unwrap();
-        assert!(Config::load(&dir, Some(&format!(r#"{{"configFile":{:?}}}"#, file.to_str().unwrap()))).unwrap_err().contains("SQWEEZDB_TEST_UNSET_VAR"));
+        std::fs::write(&file, "[backup]\nsecretKey = \"${SQZDB_TEST_UNSET_VAR}\"\n").unwrap();
+        assert!(Config::load(&dir, Some(&format!(r#"{{"configFile":{:?}}}"#, file.to_str().unwrap()))).unwrap_err().contains("SQZDB_TEST_UNSET_VAR"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

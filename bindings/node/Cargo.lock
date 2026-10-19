@@ -1879,8 +1879,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqweezdb"
-version = "0.9.0"
+name = "sqzdb"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1907,13 +1907,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqweezdb_node"
-version = "0.9.0"
+name = "sqzdb_node"
+version = "0.10.0"
 dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "sqweezdb",
+ "sqzdb",
 ]
 
 [[package]]

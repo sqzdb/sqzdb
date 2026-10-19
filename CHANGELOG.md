@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.0 — 2026-10-18
+
+**sqweezdb is now sqzdb** (https://sqzdb.dev, https://github.com/sqzdb/sqzdb). What changed:
+- the command is `sqzdb`;
+- the crate and npm package are `sqzdb`, the engines `@sqzdb/<platform>`, the Python module `sqzdb`, the Go
+  package `github.com/sqzdb/sqzdb/bindings/go/sqzdb`;
+- the C library is `libsqzdb` with `sqzdb_*` functions;
+- the installer's variables are `SQZDB_*`;
+- the JavaScript error class is `SqzError`.
+
+Databases open as they are: a directory marked `sqweezdb.meta` keeps that marker, and new ones get `sqzdb.meta`.
+The old GitHub URLs redirect. After installing, remove the old command (the installer says where it is). The
+installer's `SQWEEZDB_*` variables still work. To install a release from before the rename, use that release's
+`install.sh`.
+
+### Fixed
+- **A loopback redirect could be sent elsewhere.** An agent registered with `http://localhost/…` could ask
+  for `http://localhost:@evil.example/…`, which matched by port but took the browser, and the code, to
+  `evil.example`. Loopback redirect URIs are now parsed strictly.
+- **A policy could pass a row it should refuse.** A `<`, `<=`, `>` or `>=` policy on a long `TEXT` value
+  was let through for a row being written, when the value sat behind another long value in that row. It is
+  compared now.
+- The limit on sign-ins in progress counts an IPv6 client by its /64.
+- The test of large values through the shared-memory ring runs on Linux only (macOS has no /dev/shm).
+
+### Added
+- The Node package can be installed from npm (`npm install sqzdb`), with a prebuilt engine for Linux and
+  macOS, x64 and arm64, glibc and musl, as `@sqzdb/<platform>` optional dependencies. The release
+  workflow builds and smoke-tests them on each tag, and publishes them when the repository has an
+  `NPM_TOKEN` secret. The package's types cover the app API, MCP, sign-in and embeddings options.
+
 ## 0.9.0 — 2026-10-18
 
 **`TEXT` without a length now means text of any length.** In tables made before this version, `TEXT`

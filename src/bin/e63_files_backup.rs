@@ -3,11 +3,11 @@
 //! and the files; deletions by the sweep reach the bucket; a restart puts the directory and the bucket back in
 //! agreement; with durable = "cloud" an upload returns once its file is in the bucket. Costs: from an upload to the
 //! bucket, 1,000 small files, one 50 MB file (and the memory it takes), a bootstrap. Local rclone S3 on 127.0.0.1:9000.
-use sqweezdb::cloud::{clear_prefix, list_files, rt};
-use sqweezdb::config::{Backup, Config, Durability, SnapshotPolicy};
-use sqweezdb::files::FilesStats;
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::{now_micros, Value};
+use sqzdb::cloud::{clear_prefix, list_files, rt};
+use sqzdb::config::{Backup, Config, Durability, SnapshotPolicy};
+use sqzdb::files::FilesStats;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::{now_micros, Value};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,14 +16,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const ROOT: &str = "data/nocow/e63"; const STORE: &str = "data/nocow/s3store"; const S3: &str = "127.0.0.1:9000";
-fn backup_in(prefix: &str, bootstrap: bool) -> Backup { Backup { endpoint: format!("http://{S3}"), bucket: "sqweezdb".into(), prefix: prefix.into(), region: "us-east-1".into(), access_key: "minioadmin".into(), secret_key: "minioadmin".into(), passphrase: Some("e63-passphrase".into()), interval: Duration::from_millis(200), compress: true, compact_after: Duration::from_secs(60), compact_every: Duration::from_secs(30), bootstrap } }
+fn backup_in(prefix: &str, bootstrap: bool) -> Backup { Backup { endpoint: format!("http://{S3}"), bucket: "sqzdb".into(), prefix: prefix.into(), region: "us-east-1".into(), access_key: "minioadmin".into(), secret_key: "minioadmin".into(), passphrase: Some("e63-passphrase".into()), interval: Duration::from_millis(200), compress: true, compact_after: Duration::from_secs(60), compact_every: Duration::from_secs(30), bootstrap } }
 fn backup(bootstrap: bool) -> Backup { backup_in("e63", bootstrap) }
 fn open(dir: &Path, bootstrap: bool, durable: Durability) -> Arc<Sql> { open_in("e63", dir, bootstrap, durable) }
 fn open_in(prefix: &str, dir: &Path, bootstrap: bool, durable: Durability) -> Arc<Sql> { Sql::open_with(dir, Config { backup: Some(backup_in(prefix, bootstrap)), durable, snapshot: SnapshotPolicy { log_bytes: None, idle_after: None }, ..Config::default() }).unwrap() }
 fn fresh(name: &str) -> PathBuf { let p = Path::new(ROOT).join(name); let _ = std::fs::remove_dir_all(&p); p }
 fn s3_server() -> Option<Child> {
     if TcpStream::connect(S3).is_ok() { return None; }
-    std::fs::create_dir_all(format!("{STORE}/sqweezdb")).unwrap();
+    std::fs::create_dir_all(format!("{STORE}/sqzdb")).unwrap();
     let child = Command::new("tools/rclone").args(["serve", "s3", "--addr", S3, "--auth-key", "minioadmin,minioadmin", "--dir-cache-time", "1s", STORE]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("tools/rclone");
     for _ in 0..100 { if TcpStream::connect(S3).is_ok() { return Some(child); } std::thread::sleep(Duration::from_millis(100)); }
     panic!("rclone did not come up");
@@ -78,7 +78,7 @@ fn main() {
     // ---- (c) a new node from the bucket: rows and files
     caught_up(&sql); let files = app(&sql, "SELECT count(*) FROM notes", &[]); let total = bucket().len(); drop(sql);
     let dir2 = fresh("node"); let t = Instant::now(); let node = open(&dir2, true, Durability::Visible); let el = t.elapsed();
-    let same = [&photo, &notes].iter().all(|id| std::fs::read(sqweezdb::files::file_path_in(&dir, id)).unwrap() == std::fs::read(node.file_path(id)).unwrap());
+    let same = [&photo, &notes].iter().all(|id| std::fs::read(sqzdb::files::file_path_in(&dir, id)).unwrap() == std::fs::read(node.file_path(id)).unwrap());
     let here = std::fs::read_dir(dir2.join("files")).unwrap().flatten().filter(|d| d.file_name() != "tmp").map(|d| std::fs::read_dir(d.path()).unwrap().count()).sum::<usize>();
     println!("(c) a new node with an empty directory and bootstrap = true: open in {:.2} s with {} notes and {here} of {total} files, byte for byte the same: {same}", el.as_secs_f64(), match files[0][0] { Value::Int(n) => n, _ => -1 });
     assert!(same && here == total);
@@ -95,8 +95,8 @@ fn main() {
     assert_eq!(left.len(), total - gone); assert_eq!(left.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>(), [notes.as_str()]);
 
     // ---- (e) a restart repairs the difference
-    drop(node); std::fs::remove_file(sqweezdb::files::file_path_in(&dir2, &notes)).unwrap();
-    let orphan = "0123abcd-89ab-4def-8123-456789abcdef"; { let c = backup(false).cloud(); let store = c.store(); let src = Path::new(ROOT).join("orphan"); std::fs::write(&src, b"no row has me").unwrap(); rt().block_on(sqweezdb::cloud::put_file(&*store, &c, orphan, &src)).unwrap(); }
+    drop(node); std::fs::remove_file(sqzdb::files::file_path_in(&dir2, &notes)).unwrap();
+    let orphan = "0123abcd-89ab-4def-8123-456789abcdef"; { let c = backup(false).cloud(); let store = c.store(); let src = Path::new(ROOT).join("orphan"); std::fs::write(&src, b"no row has me").unwrap(); rt().block_on(sqzdb::cloud::put_file(&*store, &c, orphan, &src)).unwrap(); }
     let node = open(&dir2, false, Durability::Visible);
     until("agreement", || stats(&node).fetched.load(Relaxed) == 1 && stats(&node).deleted.load(Relaxed) == 1);
     println!("(e) restarted without one of its files, and with an object of a file it never had in the bucket: fetched back {}, deleted {}; the file reads the same: {}", stats(&node).fetched.load(Relaxed), stats(&node).deleted.load(Relaxed), std::fs::read(node.file_path(&notes)).unwrap() == text);
@@ -105,7 +105,7 @@ fn main() {
     // ---- (f) durable = "cloud"
     let dir3 = fresh("cloud"); let c = open_in("e63-cloud", &dir3, false, Durability::Cloud);
     let (mut cl, mut vis) = (vec![], vec![]);
-    for _ in 0..100 { let t = Instant::now(); let id = put(&c, "p.jpg", "image/jpeg", &small); cl.push(t.elapsed().as_secs_f64() * 1e3); assert!(sqweezdb::files::file_path_in(&dir3, &id).exists()); }
+    for _ in 0..100 { let t = Instant::now(); let id = put(&c, "p.jpg", "image/jpeg", &small); cl.push(t.elapsed().as_secs_f64() * 1e3); assert!(sqzdb::files::file_path_in(&dir3, &id).exists()); }
     let in_bucket = { let c = backup_in("e63-cloud", false).cloud(); let store = c.store(); rt().block_on(list_files(&*store, &c)).unwrap().len() }; drop(c);
     let dir4 = fresh("visible"); let v = open_in("e63-visible", &dir4, false, Durability::Visible);
     for _ in 0..100 { let t = Instant::now(); put(&v, "p.jpg", "image/jpeg", &small); vis.push(t.elapsed().as_secs_f64() * 1e3); }

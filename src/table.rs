@@ -410,7 +410,7 @@ pub fn long_bytes<'a>(schema: &Schema, row: &'a [u8], i: usize) -> Option<ValueR
         0 => { let at = tail_at(schema, row, i); row.get(at..at + n).map(ValueRef::Row) }
         id => schema.columns[i].store.as_ref().and_then(|s| s.get(id)).map(ValueRef::Stored),
     };
-    if v.is_none() { static ONCE: std::sync::Once = std::sync::Once::new(); ONCE.call_once(|| eprintln!("sqweezdb: a long value of {}.{} was read after it was freed (read as NULL)", schema.name, schema.columns[i].name)); }
+    if v.is_none() { static ONCE: std::sync::Once = std::sync::Once::new(); ONCE.call_once(|| eprintln!("sqzdb: a long value of {}.{} was read after it was freed (read as NULL)", schema.name, schema.columns[i].name)); }
     v
 }
 /// Set long column `i` of a row (None: NULL), keeping the other values in the tail in column order.
@@ -1218,8 +1218,10 @@ pub struct Database {
 }
 #[derive(Debug, Default)] pub struct SnapStats { pub rows: u64, pub bytes: u64, pub low_water: u64, pub secs: f64, pub deleted_segments: usize }
 #[derive(Debug, Default)] pub struct RecStats { pub snap_rows: u64, pub snap_secs: f64, pub catalog: usize, pub replayed: u64, pub skipped: u64, pub replay_secs: f64, pub segments: usize, pub low_water: u64 }
-/// The file that marks a directory as one sqweezdb database and records the layout version of its files.
-pub const META_FILE: &str = "sqweezdb.meta";
+/// The file that marks a directory as one sqzdb database and records the layout version of its files.
+pub const META_FILE: &str = "sqzdb.meta";
+/// The marker's name before sqweezdb became sqzdb (0.9 and older): still read, never written.
+pub const LEGACY_META_FILE: &str = "sqweezdb.meta";
 /// Directory format this build writes and reads. Bump it when the files in a database directory change incompatibly.
 pub const DIR_FORMAT: u32 = 1;
 
@@ -1237,11 +1239,11 @@ pub fn check_dir(dir: &Path) -> Result<DirState, String> {
     match fs::metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DirState::Empty),
         Err(e) => return Err(format!("{shown}: {e}")),
-        Ok(m) if !m.is_dir() => return Err(format!("{shown} is a file; a sqweezdb database is a directory (give the path of a new or existing database directory)")),
+        Ok(m) if !m.is_dir() => return Err(format!("{shown} is a file; a sqzdb database is a directory (give the path of a new or existing database directory)")),
         Ok(_) => {}
     }
     if let Some(format) = read_meta(dir)? {
-        if format > DIR_FORMAT { return Err(format!("{shown} was written by a newer sqweezdb (directory format {format}; this build reads up to {DIR_FORMAT}); upgrade sqweezdb to open it")); }
+        if format > DIR_FORMAT { return Err(format!("{shown} was written by a newer sqzdb (directory format {format}; this build reads up to {DIR_FORMAT}); upgrade sqzdb to open it")); }
         return Ok(DirState::Database);
     }
     if dir.join("snap").exists() || !GLog::list_segments(dir).is_empty() { return Ok(DirState::Unmarked); }
@@ -1251,7 +1253,7 @@ pub fn check_dir(dir: &Path) -> Result<DirState, String> {
         .collect();
     if foreign.is_empty() { return Ok(DirState::Empty); }
     let mut sample: Vec<&str> = foreign.iter().map(|s| s.as_str()).take(3).collect(); sample.sort();
-    Err(format!("{shown} is not a sqweezdb database and is not empty (it holds {}{}); open a new or empty directory, e.g. {}/db", sample.join(", "), if foreign.len() > 3 { format!(" and {} more", foreign.len() - 3) } else { String::new() }, shown))
+    Err(format!("{shown} is not a sqzdb database and is not empty (it holds {}{}); open a new or empty directory, e.g. {}/db", sample.join(", "), if foreign.len() > 3 { format!(" and {} more", foreign.len() - 3) } else { String::new() }, shown))
 }
 /// The directory format recorded in `dir`'s marker, or None when there is no marker.
 /// A foreign key column holds the parent's kind of key (a text key of any width); Some(the type it needs) when not.
@@ -1259,7 +1261,7 @@ fn fk_mismatch(parent: &Schema, col: &ColType) -> Option<String> {
     match (&parent.columns[parent.pk].ty, col) { (p, c) if (p.is_text() && c.is_text()) || (p.is_bytes() && c.is_bytes()) => None, (p, _) if p.is_text() => Some("TEXT".into()), (p, _) if p.is_bytes() => Some("BYTES".into()), (p, c) if p == c => None, (p, _) => Some(p.name()) }
 }
 pub fn read_meta(dir: &Path) -> Result<Option<u32>, String> {
-    let p = dir.join(META_FILE);
+    let p = if dir.join(META_FILE).exists() || !dir.join(LEGACY_META_FILE).exists() { dir.join(META_FILE) } else { dir.join(LEGACY_META_FILE) };
     let text = match fs::read_to_string(&p) { Ok(t) => t, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(format!("{}: {e}", p.display())) };
     let v: toml::Value = toml::from_str(&text).map_err(|e| format!("{} is unreadable: {e}", p.display()))?;
     let f = v.get("format").and_then(|f| f.as_integer()).ok_or_else(|| format!("{} has no format number", p.display()))?;
@@ -1267,9 +1269,9 @@ pub fn read_meta(dir: &Path) -> Result<Option<u32>, String> {
 }
 /// Write the marker if it is missing (written to a temporary file and renamed, so it is never half there).
 pub fn write_meta_if_missing(dir: &Path) -> std::io::Result<()> {
-    let p = dir.join(META_FILE); if p.exists() { return Ok(()); }
+    let p = dir.join(META_FILE); if p.exists() || dir.join(LEGACY_META_FILE).exists() { return Ok(()); }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0);
-    let text = format!("# Every file in this directory belongs to one sqweezdb database. Copy, move or delete the directory as a whole.\nformat = {DIR_FORMAT}\ncreated_by = \"sqweezdb {}\"\ncreated_at = \"{}\"\n", env!("CARGO_PKG_VERSION"), format_timestamp(now));
+    let text = format!("# Every file in this directory belongs to one sqzdb database. Copy, move or delete the directory as a whole.\nformat = {DIR_FORMAT}\ncreated_by = \"sqzdb {}\"\ncreated_at = \"{}\"\n", env!("CARGO_PKG_VERSION"), format_timestamp(now));
     let tmp = dir.join(format!(".{META_FILE}.tmp")); fs::write(&tmp, text)?; fs::rename(&tmp, &p)
 }
 
@@ -1698,7 +1700,7 @@ mod log_tests {
     /// Back-pressure: an appender blocked on a full buffer is woken by the writer draining it (its own condvar, apart
     /// from the commits waiting for durability), and nothing it appended is lost.
     #[test] fn appenders_blocked_on_a_full_buffer_resume_when_the_writer_drains_it() {
-        let dir = std::env::temp_dir().join(format!("sqweezdb-logbp-{}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("sqzdb-logbp-{}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
         let log = Arc::new(GLog::new(&dir));
         let (tx, rx) = std::sync::mpsc::channel();
         let l2 = log.clone();
@@ -1719,7 +1721,7 @@ mod log_tests {
     /// A close right after a write that restarted idle log threads: the write is in the file when stop returns.
     #[test] fn stop_waits_for_threads_restarted_by_a_write() {
         for round in 0..20 {
-            let dir = std::env::temp_dir().join(format!("sqweezdb-logrestart-{}-{round}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
+            let dir = std::env::temp_dir().join(format!("sqzdb-logrestart-{}-{round}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
             let log = Arc::new(GLog::new(&dir));
             { let mut s = log.st.lock().unwrap(); s.started = true; s.running = true; s.idle_exit = Some(Duration::from_millis(5)); }
             log.spawn_threads();
@@ -1735,7 +1737,7 @@ mod log_tests {
     /// `sync_delay`: with nobody waiting, writes reach the file at once but their fsync waits out the delay; a waiter
     /// (a durable commit, a snapshot, a close) gets its sync right away, and stopping flushes everything.
     #[test] fn a_delayed_sync_waits_for_the_delay_or_a_waiter() {
-        let dir = std::env::temp_dir().join(format!("sqweezdb-logdelay-{}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("sqzdb-logdelay-{}", std::process::id())); let _ = fs::remove_dir_all(&dir); fs::create_dir_all(&dir).unwrap();
         let log = Arc::new(GLog::new(&dir));
         { let mut s = log.st.lock().unwrap(); s.started = true; s.running = true; s.sync_delay = Some(Duration::from_secs(5)); }
         log.spawn_threads();

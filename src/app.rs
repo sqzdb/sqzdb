@@ -131,7 +131,7 @@ pub fn start(sql: Arc<Sql>, addr: &str) -> Result<crate::net::Listener, String> 
     let std_listener = std::net::TcpListener::bind(addr).map_err(fail)?; std_listener.set_nonblocking(true).map_err(fail)?;
     let local = std_listener.local_addr().map_err(fail)?;
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4);
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).max_blocking_threads(64).thread_name("sqweezdb-app").enable_all().build().map_err(fail)?;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).max_blocking_threads(64).thread_name("sqzdb-app").enable_all().build().map_err(fail)?;
     let listener = { let _in = rt.enter(); tokio::net::TcpListener::from_std(std_listener).map_err(fail)? };
     let tls = match &sql.cfg.app.tls { Some(p) => Some(Arc::new(crate::tls::Tls::start(p, &sql.db.dir, rt.handle())?)), None => None };
     if let Some(p) = sql.cfg.app.tls.as_ref().filter(|p| p.redirect.is_some()) {

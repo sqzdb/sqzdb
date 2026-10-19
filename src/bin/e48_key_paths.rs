@@ -1,9 +1,9 @@
 //! Experiment 48: the primary-key paths, measured before and after widening keys to 128 bits (UUID primary keys).
 //! INT keys must not get slower; UUID keys are measured on the same paths once supported (pass `uuid`), and text keys
 //! (pass `text` for 15-character keys, packed exactly, or `textlong` for 27-character keys, which are hashed).
-use sqweezdb::config::{Config, SnapshotPolicy};
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::config::{Config, SnapshotPolicy};
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 use std::time::Instant;
 
 const N: i64 = 1_000_000; const ROOT: &str = "data/nocow/e48";

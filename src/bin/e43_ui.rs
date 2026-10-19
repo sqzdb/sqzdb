@@ -1,8 +1,8 @@
-//! Experiment 43: the web console and the `sqweezdb serve` command. What it costs (binary size, idle memory) and what
+//! Experiment 43: the web console and the `sqzdb serve` command. What it costs (binary size, idle memory) and what
 //! the console's HTTP path costs per query against the frame protocol over TCP; insert → live update in a browser-style
 //! client; a wrong token; graceful stop with a final snapshot and the restart that follows.
-use sqweezdb::net::Client;
-use sqweezdb::table::Value;
+use sqzdb::net::Client;
+use sqzdb::table::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
@@ -24,13 +24,13 @@ impl Http {
 fn next_event(r: &mut BufReader<TcpStream>) -> String { loop { let mut l = String::new(); if r.read_line(&mut l).unwrap() == 0 { return String::new(); } if let Some(d) = l.strip_prefix("data: ") { return d.trim().to_string(); } } }
 
 fn main() {
-    println!("=== E43: the web console (`sqweezdb serve --ui`): what it costs and how fast it is ===");
-    let bin = "target/release/sqweezdb"; let stripped = format!("{DIR}-bin"); let _ = std::fs::create_dir_all(DIR); std::fs::copy(bin, &stripped).unwrap(); Command::new("strip").arg(&stripped).status().unwrap();
-    println!("the sqweezdb command: {:.1} MB stripped (engine, S3 client, TLS, SQL parser, console); the embedded page is {:.1} KB", std::fs::metadata(&stripped).unwrap().len() as f64 / 1e6, include_str!("../ui/index.html").len() as f64 / 1e3);
+    println!("=== E43: the web console (`sqzdb serve --ui`): what it costs and how fast it is ===");
+    let bin = "target/release/sqzdb"; let stripped = format!("{DIR}-bin"); let _ = std::fs::create_dir_all(DIR); std::fs::copy(bin, &stripped).unwrap(); Command::new("strip").arg(&stripped).status().unwrap();
+    println!("the sqzdb command: {:.1} MB stripped (engine, S3 client, TLS, SQL parser, console); the embedded page is {:.1} KB", std::fs::metadata(&stripped).unwrap().len() as f64 / 1e6, include_str!("../ui/index.html").len() as f64 / 1e3);
     let _ = std::fs::remove_file(&stripped); let _ = std::fs::remove_dir_all(DIR);
     let mut child = Command::new(bin).args(["serve", DIR, "--ui", UI, "--tcp", TCP, "--token", TOKEN]).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
     wait_port(UI); wait_port(TCP); std::thread::sleep(Duration::from_millis(500));
-    let (rss0, th0) = rss_mb(child.id()); println!("idle `sqweezdb serve --ui --tcp`, empty database: {rss0:.1} MB resident, {th0} threads");
+    let (rss0, th0) = rss_mb(child.id()); println!("idle `sqzdb serve --ui --tcp`, empty database: {rss0:.1} MB resident, {th0} threads");
     let mut c = Client::connect_tcp(TCP, TOKEN).unwrap();
     c.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, score DOUBLE, country INT, name VARCHAR(32), placed_at TIMESTAMP)", &[]).unwrap();
     let t = Instant::now();

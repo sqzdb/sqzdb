@@ -158,7 +158,7 @@ impl Sql {
     pub fn files_gc_start(self: &Arc<Self>) {
         if self.files.gc.swap(true, Ordering::AcqRel) { return; }
         let weak = Arc::downgrade(self);
-        std::thread::Builder::new().name("sqweezdb-files".into()).spawn(move || {
+        std::thread::Builder::new().name("sqzdb-files".into()).spawn(move || {
             let mut since = HashMap::new(); let mut next = std::time::Instant::now() + Duration::from_secs(60);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -251,7 +251,7 @@ impl FilesBackup {
     pub fn start_with(db: Arc<Database>, cfg: CloudConfig, store: Arc<dyn ObjectStore>, health: Arc<CloudStats>) -> FilesBackup {
         let (q, stop, stats) = (Arc::new((Mutex::new(Queue::default()), Condvar::new())), Arc::new(AtomicBool::new(false)), Arc::new(FilesStats::default()));
         let (q2, stop2, st2) = (q.clone(), stop.clone(), stats.clone());
-        let thread = std::thread::Builder::new().name("sqweezdb-files-backup".into()).spawn(move || backup_files(&db, &cfg, &*store, &q2, &stop2, &st2, &health)).expect("a thread");
+        let thread = std::thread::Builder::new().name("sqzdb-files-backup".into()).spawn(move || backup_files(&db, &cfg, &*store, &q2, &stop2, &st2, &health)).expect("a thread");
         FilesBackup { q, stop, thread: Some(thread), stats }
     }
     /// Upload a new file; with `wait`, the receiver hears once it is in the bucket.
@@ -371,7 +371,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::sql::error_code;
-    fn tmp(n: &str) -> PathBuf { let d = std::env::temp_dir().join(format!("sqweezdb-files-{}-{n}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
+    fn tmp(n: &str) -> PathBuf { let d = std::env::temp_dir().join(format!("sqzdb-files-{}-{n}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
     fn q(s: &Sql, sess: &mut Session, sql: &str, p: &[Value]) -> Result<Vec<Vec<Value>>, String> { s.exec_s(sess, sql, p) }
     fn app(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn setup(s: &Sql) {

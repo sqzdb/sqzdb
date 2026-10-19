@@ -2991,8 +2991,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqweezdb"
-version = "0.9.0"
+name = "sqzdb"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "argon2",

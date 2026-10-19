@@ -1,6 +1,6 @@
 //! Experiment 12 (H20): memory footprint for the same 2M rows. Each configuration in its own process; RSS and peak RSS from /proc.
-use sqweezdb::engine::*;
-use sqweezdb::util::Rng;
+use sqzdb::engine::*;
+use sqzdb::util::Rng;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

@@ -1,6 +1,7 @@
 # Push a tag that matches Cargo.toml's version (v0.1.0 for version = "0.1.0") to publish a release with prebuilt
-# binaries and SHA256SUMS; install.sh downloads from it. Run it by hand (workflow_dispatch) to build the artifacts
-# without publishing.
+# binaries and SHA256SUMS; install.sh downloads from it. The same builds make the Node package's engines, published to
+# npm when the repository has an NPM_TOKEN secret. Run it by hand (workflow_dispatch) to build the artifacts without
+# publishing.
 name: release
 
 on:
@@ -37,15 +38,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          workspaces: |
+            . -> target
+            bindings/node -> target
       - name: Build and package
         run: make dist TARGET=${{ matrix.target }} GLIBC=${{ matrix.glibc }} CARGO_BUILD="${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}"
       - name: Smoke test (native targets)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
-        run: target/${{ matrix.target }}/dist/sqweezdb version
+        run: target/${{ matrix.target }}/dist/sqzdb version
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
+      # the Node package's engine for this target: @sqzdb/<platform> (bindings/node/scripts/npm-platform.mjs)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Node engine
+        run: make node-dist TARGET=${{ matrix.target }} GLIBC=${{ matrix.glibc }} CARGO_BUILD="${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}"
+      - name: Node smoke test (installed from the packed packages, as a user would)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        run: |
+          v=$(make -s version)
+          (cd bindings/node && npm pack --pack-destination ../../dist-npm)
+          for d in dist-npm/*/; do (cd "$d" && npm pack --pack-destination ..); done
+          plat=$(ls dist-npm/sqzdb-*-"$v".tgz)
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            docker run --rm -v "$PWD":/w -w /w node:20-alpine sh bindings/node/scripts/smoke.sh "dist-npm/sqzdb-$v.tgz" "$plat"
+          else
+            sh bindings/node/scripts/smoke.sh "dist-npm/sqzdb-$v.tgz" "$plat"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.target }}
+          path: |
+            dist-npm
+            !dist-npm/*.tgz
 
   publish:
     name: publish the release
@@ -72,5 +100,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp install.sh dist/
-          gh release create "${GITHUB_REF_NAME}" dist/* --title "sqweezdb ${GITHUB_REF_NAME}" --generate-notes \
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "sqzdb ${GITHUB_REF_NAME}" --generate-notes \
             --notes "Install: curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh"
+
+  npm:
+    name: publish to npm
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # provenance: npm shows which workflow run built each package
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-npm
+          pattern: npm-*
+          merge-multiple: true
+      - name: The engines first, then the package that depends on them
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::notice::no NPM_TOKEN secret: the npm packages were built (the npm-* artifacts) but not published"; exit 0; fi
+          v=$(make -s version)
+          publish() {
+            name=$(node -p "require('./$1/package.json').name")
+            if npm view "$name@$v" version >/dev/null 2>&1; then echo "$name@$v is published already"; else npm publish "./$1" --access public --provenance; fi
+          }
+          for d in dist-npm/*/; do publish "${d%/}"; done
+          # the package asks for exactly this version of each engine
+          node -e "const f='bindings/node/package.json'; const p=require('./'+f); p.version='$v'; for (const k in p.optionalDependencies) p.optionalDependencies[k]='$v'; require('fs').writeFileSync(f, JSON.stringify(p, null, 2) + '\n')"
+          publish bindings/node

@@ -1,15 +1,15 @@
-# sqweezdb: build, install and package the `sqweezdb` command.
+# sqzdb: build, install and package the `sqzdb` command.
 #
-#   make                      build target/dist/sqweezdb for this machine
+#   make                      build target/dist/sqzdb for this machine
 #   make install              install to ~/.local/bin (or /usr/local/bin as root); PREFIX=/opt/x to change
 #   make uninstall            remove it again (same PREFIX)
 #   make test                 unit tests
-#   make dist                 dist/sqweezdb-<target>.tar.gz + .sha256 (what a release ships)
+#   make dist                 dist/sqzdb-<target>.tar.gz + .sha256 (what a release ships)
 #   make dist TARGET=x86_64-unknown-linux-gnu GLIBC=2.17 CARGO_BUILD="cargo zigbuild"   (runs on glibc >= 2.17)
 #   make lab                  every experiment, including the ones that race SQLite and Turso
 #   make bindings             the Node, Python and Go bindings
 
-BIN         := sqweezdb
+BIN         := sqzdb
 VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 CARGO       ?= cargo
 CARGO_BUILD ?= $(CARGO) build
@@ -23,7 +23,7 @@ BINDIR      ?= $(PREFIX)/bin
 DESTDIR     ?=
 INSTALLED   := $(DESTDIR)$(BINDIR)/$(BIN)
 
-.PHONY: all build install uninstall test dist lab bindings node python go clean help version
+.PHONY: all build install uninstall test dist node-dist lab bindings node python go clean help version
 all: build
 
 build:
@@ -51,14 +51,21 @@ dist: build
 	cd dist && (sha256sum "$(BIN)-$(TRIPLE).tar.gz" 2>/dev/null || shasum -a 256 "$(BIN)-$(TRIPLE).tar.gz") > "$(BIN)-$(TRIPLE).tar.gz.sha256"
 	@echo "dist/$(BIN)-$(TRIPLE).tar.gz"; cat "dist/$(BIN)-$(TRIPLE).tar.gz.sha256"
 
+# The npm package with the engine for TARGET (or this machine): dist-npm/<platform>/ (see bindings/node/scripts).
+# musl needs a dynamic libc for a library Node loads, hence -crt-static.
+NODE_LIB    := $(if $(findstring apple,$(TRIPLE)),libsqzdb_node.dylib,libsqzdb_node.so)
+node-dist:
+	cd bindings/node && $(if $(findstring musl,$(TRIPLE)),RUSTFLAGS="-C target-feature=-crt-static") $(CARGO_BUILD) --release $(if $(TARGET),--target $(TARGET)$(if $(GLIBC),.$(GLIBC)))
+	node bindings/node/scripts/npm-platform.mjs $(TRIPLE) bindings/node/target/$(if $(TARGET),$(TARGET)/)release/$(NODE_LIB) dist-npm $(VERSION)
+
 lab:
 	$(CARGO) build --release --features lab --bins
 
 bindings: node python go
 node:
-	cd bindings/node && $(CARGO) build --release && cp target/release/libsqweezdb_node.so sqweezdb.node
+	cd bindings/node && $(CARGO) build --release && cp target/release/libsqzdb_node.so sqzdb.node
 python:
-	cd bindings/python && $(CARGO) build --release && cp target/release/libsqweezdb_py.so sqweezdb.so
+	cd bindings/python && $(CARGO) build --release && cp target/release/libsqzdb_py.so sqzdb.so
 go:
 	$(CARGO) build --release --lib
 	cd bindings/go && go build ./...

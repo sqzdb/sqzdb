@@ -1,10 +1,10 @@
 //! Experiment 42: configuration at open. (a) restart time against the log tail a snapshot policy allows, to pick the
 //! default; (b) a new node bootstrapping itself from the bucket; (c) the write-path cost of a configured backup and of
 //! the snapshot policy firing; (d) follower mode from one config line. Local rclone S3 server on 127.0.0.1:9000.
-use sqweezdb::cloud::clear_prefix;
-use sqweezdb::config::{Backup, Config, Follow, SnapshotPolicy};
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::{GLog, Value};
+use sqzdb::cloud::clear_prefix;
+use sqzdb::config::{Backup, Config, Follow, SnapshotPolicy};
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::{GLog, Value};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 const ROOT: &str = "data/nocow/e42"; const STORE: &str = "data/nocow/s3store"; const S3: &str = "127.0.0.1:9000";
 fn row(id: i64) -> Vec<Value> { vec![Value::Int(id), Value::Float(id as f64), Value::Int(id % 20), Value::Int(18 + id % 60), Value::Text(format!("u{id}@example.com")), Value::Bytes(vec![7; 64])] }
-fn backup(prefix: &str, bootstrap: bool) -> Backup { Backup { endpoint: format!("http://{S3}"), bucket: "sqweezdb".into(), prefix: prefix.into(), region: "us-east-1".into(), access_key: "minioadmin".into(), secret_key: "minioadmin".into(), passphrase: Some("e42-passphrase".into()), interval: Duration::from_millis(500), compress: true, compact_after: Duration::from_secs(60), compact_every: Duration::from_secs(30), bootstrap } }
+fn backup(prefix: &str, bootstrap: bool) -> Backup { Backup { endpoint: format!("http://{S3}"), bucket: "sqzdb".into(), prefix: prefix.into(), region: "us-east-1".into(), access_key: "minioadmin".into(), secret_key: "minioadmin".into(), passphrase: Some("e42-passphrase".into()), interval: Duration::from_millis(500), compress: true, compact_after: Duration::from_secs(60), compact_every: Duration::from_secs(30), bootstrap } }
 fn no_policy() -> SnapshotPolicy { SnapshotPolicy { log_bytes: None, idle_after: None } }
 fn fresh(name: &str) -> PathBuf { let p = Path::new(ROOT).join(name); let _ = std::fs::remove_dir_all(&p); p }
 fn tail_mb(dir: &Path) -> f64 { GLog::list_segments(dir).iter().map(|s| std::fs::metadata(GLog::seg_path_in(dir, *s)).map(|m| m.len()).unwrap_or(0)).sum::<u64>() as f64 / 1e6 }
@@ -22,7 +22,7 @@ fn count(sql: &Sql) -> i64 { let mut s = Session::default(); match sql.exec_s(&m
 fn pct(v: &mut Vec<f64>, p: f64) -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[((v.len() as f64 - 1.0) * p) as usize] }
 fn s3_server() -> Option<Child> {
     if TcpStream::connect(S3).is_ok() { return None; }
-    std::fs::create_dir_all(format!("{STORE}/sqweezdb")).unwrap();
+    std::fs::create_dir_all(format!("{STORE}/sqzdb")).unwrap();
     let child = Command::new("tools/rclone").args(["serve", "s3", "--addr", S3, "--auth-key", "minioadmin,minioadmin", "--dir-cache-time", "1s", STORE]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("tools/rclone");
     for _ in 0..100 { if TcpStream::connect(S3).is_ok() { return Some(child); } std::thread::sleep(Duration::from_millis(100)); }
     panic!("rclone did not come up");

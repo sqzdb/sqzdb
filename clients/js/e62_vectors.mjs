@@ -7,7 +7,7 @@ import { connect } from './index.js';
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs'; import assert from 'node:assert/strict'; import net from 'node:net'; import http from 'node:http';
 
-const BIN = new URL('../../target/release/sqweezdb', import.meta.url).pathname;
+const BIN = new URL('../../target/release/sqzdb', import.meta.url).pathname;
 const dir = new URL('../../data/nocow/e62', import.meta.url).pathname; fs.rmSync(dir, { recursive: true, force: true });
 const free = () => new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
 const ms = (t) => Number(process.hrtime.bigint() - t) / 1e6;

@@ -1,6 +1,6 @@
-// Load test for the boards demo: the same workloads against the sqweezdb server and PocketBase, through their HTTP APIs.
+// Load test for the boards demo: the same workloads against the sqzdb server and PocketBase, through their HTTP APIs.
 //
-//	go run ./bench -target sqweezdb -url http://127.0.0.1:8070 -pid <server pid>
+//	go run ./bench -target sqzdb -url http://127.0.0.1:8070 -pid <server pid>
 //	go run ./bench -target pocketbase -url http://127.0.0.1:8090 -pid <pocketbase pid> -setup   # creates collections, rules, data
 package main
 
@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	target   = flag.String("target", "sqweezdb", "sqweezdb or pocketbase")
+	target   = flag.String("target", "sqzdb", "sqzdb or pocketbase")
 	base     = flag.String("url", "http://127.0.0.1:8070", "server URL")
 	pid      = flag.Int("pid", 0, "server process id, for its memory")
 	setup    = flag.Bool("setup", false, "pocketbase: create collections, rules and the load-test data first")
@@ -442,7 +442,7 @@ func main() {
 	}
 }
 
-// ---- PocketBase: collections, rules and data equivalent to the sqweezdb server's -bench-seed
+// ---- PocketBase: collections, rules and data equivalent to the sqzdb server's -bench-seed
 func setupPocketBase() error {
 	var su struct{ Token string }
 	if err := call("POST", "/api/collections/_superusers/auth-with-password", "", map[string]string{"identity": "admin@bench.test", "password": password}, &su); err != nil {

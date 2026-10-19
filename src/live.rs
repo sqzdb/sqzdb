@@ -230,7 +230,7 @@ mod tests {
     /// A write is in the log (where the reactor reads it) a moment before its row is visible. A re-run in that moment
     /// sees the old result; the live query must not count as fresh then, or the write never reaches it.
     #[test] fn a_live_query_sees_a_write_whose_row_appears_after_its_log_record() {
-        let d = std::env::temp_dir().join(format!("sqweezdb-live-{}-settle", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-live-{}-settle", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let mut cfg = Config::default(); cfg.live.debounce = Duration::ZERO;
         let s = Sql::open_with(&d, cfg).unwrap(); let mut sess = Session::default();
         s.exec_s(&mut sess, "CREATE TABLE t (id INT PRIMARY KEY, v INT)", &[]).unwrap();

@@ -84,13 +84,17 @@ fn send_back(url: &str, params: &[(&str, &str)], cookies: &[String]) -> Vec<u8> 
 /// native app gets a port when it starts).
 fn redirect_matches(registered: &str, asked: &str) -> bool {
     if registered == asked { return true; }
-    let loopback = |u: &str| -> Option<(String, String)> {
-        let rest = u.strip_prefix("http://")?; let (auth, path) = rest.split_once('/').map(|(a, p)| (a, format!("/{p}"))).unwrap_or((rest, String::new()));
-        let host = if auth.starts_with('[') { auth.split_inclusive(']').next()?.to_string() } else { auth.split(':').next()?.to_string() };
-        matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]").then_some((host, path))
-    };
+    // strictly: the authority is the host, or the host, a colon and digits; nothing else (no user@, no stray colon)
+    fn loopback(u: &str) -> Option<(&'static str, &str)> {
+        if !redirect_ok(u) { return None; }
+        let rest = u.strip_prefix("http://")?; let cut = rest.find(['/', '?']).unwrap_or(rest.len()); let (auth, path) = rest.split_at(cut);
+        let host = ["localhost", "127.0.0.1", "[::1]"].into_iter().find(|h| auth.strip_prefix(h).is_some_and(|p| p.is_empty() || p.strip_prefix(':').is_some_and(|d| !d.is_empty() && d.len() <= 5 && d.bytes().all(|b| b.is_ascii_digit()))))?;
+        Some((host, path))
+    }
     matches!((loopback(registered), loopback(asked)), (Some(a), Some(b)) if a == b)
 }
+/// An address as the per-address limits count it: an IPv6 client by its /64 (a host has a whole one to choose from).
+fn per_address(ip: IpAddr) -> IpAddr { match ip { IpAddr::V6(v) if v.to_ipv4_mapped().is_none() => { let s = v.segments(); IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } ip => ip } }
 /// A name as an agent gave it, made safe to show: no control or format characters (bidi overrides, zero-width).
 fn clean_name(n: &str) -> String {
     n.chars().filter(|c| !c.is_control() && !matches!(*c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2069 | 0xFEFF)).take(100).collect::<String>().trim().to_string()
@@ -175,6 +179,7 @@ fn authorize(sql: &Sql, st: &McpState, ip: IpAddr, req: &Req) -> Vec<u8> {
     if q.get("code_challenge_method").map(String::as_str) != Some("S256") || !crate::app::is_challenge(&challenge) { return back("invalid_request", "PKCE is required: code_challenge (S256) and code_challenge_method=S256"); }
     if let Some(r) = q.get("resource") { if !resource_ok(sql, r) { return back("invalid_target", "resource must be this server's MCP endpoint"); } }
     let (id, binding) = (random_hex(16), random_hex(32));
+    let ip = per_address(ip);
     let p = Pending { client, name, redirect, state, challenge, user: None, binding, ip, at: Instant::now() };
     let shown = with_cookie(sign_in_page(sql, &id, &p, None), &binding_cookie(sql, &id, &p.binding, PENDING_TTL.as_secs()));
     let mut all = st.pending.lock().unwrap(); all.retain(|_, p| p.at.elapsed() < PENDING_TTL);
@@ -346,7 +351,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
         "initialize" => {
             let asked = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
             Ok(json!({ "protocolVersion": if PROTOCOLS.contains(&asked) { asked } else { PROTOCOLS[0] }, "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "sqweezdb", "title": host_of(&b), "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "sqzdb", "title": host_of(&b), "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "A SQL database you act on as the user who connected you. Start with describe: it lists the tables you may use, their columns, and who you are (SESSION values that row policies compare with). Then query (SELECT) and execute (INSERT, UPDATE, DELETE). Use ? placeholders and pass values in params." }))
         }
         "ping" => Ok(json!({})),
@@ -453,7 +458,7 @@ mod tests {
     }
     #[test] fn an_agents_access_ends_with_the_users_sessions() {
         use crate::table::Value;
-        let d = std::env::temp_dir().join(format!("sqweezdb-mcp-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-mcp-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, crate::config::Config::default()).unwrap();
         for q in ["CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member')", "CREATE ROLE member", "ALTER TABLE users ENABLE AUTH (ROLE FROM role)"] { s.exec_s(&mut Session::default(), q, &[]).unwrap(); }
         let si = s.sign_up("users", &[("email".into(), Value::Text("ann@x".into()))], "the password 1").unwrap();
@@ -488,6 +493,9 @@ mod tests {
         assert!(!redirect_matches("http://127.0.0.1/callback", "http://127.0.0.1:53682/other"));
         assert!(!redirect_matches("http://127.0.0.1/cb", "http://localhost/cb"));
         assert!(!redirect_matches("https://a.test/cb", "https://a.test:8443/cb"), "any port only on this machine");
+        for sneaky in ["http://localhost:@evil.example/callback", "http://localhost:80@evil.example/callback", "http://localhost:x@evil.example/callback", "http://127.0.0.1:/callback", "http://localhost.evil.example/callback", "http://127.0.0.1:99999999/callback"] {
+            assert!(!redirect_matches("http://localhost/callback", sneaky) && !redirect_matches("http://127.0.0.1/callback", sneaky), "{sneaky}");
+        }
         assert_eq!(clean_name("Cla\u{202E}ude\u{200B} \u{7}"), "Claude");
     }
     #[test] fn pages_escape_what_an_agent_names_itself() {

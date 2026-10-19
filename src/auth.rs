@@ -565,7 +565,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::sql::error_code;
-    fn tmp(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqweezdb-auth-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
+    fn tmp(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqzdb-auth-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
     fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn qs(s: &Sql, sess: &mut Session, sql: &str) -> Result<Vec<Vec<Value>>, String> { s.exec_s(sess, sql, &[]) }
     fn text(v: &str) -> Value { Value::Text(v.into()) }

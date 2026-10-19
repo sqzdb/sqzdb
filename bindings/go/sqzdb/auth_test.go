@@ -1,4 +1,4 @@
-package sqweezdb
+package sqzdb
 
 import (
 	"os"

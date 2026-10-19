@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iluxav/sqweezdb/bindings/go/sqweezdb"
+	"github.com/sqzdb/sqzdb/bindings/go/sqzdb"
 )
 
 func main() {
 	os.RemoveAll("../../data/nocow/sse")
-	db, err := sqweezdb.Open("../../data/nocow/sse", false)
+	db, err := sqzdb.Open("../../data/nocow/sse", false)
 	if err != nil {
 		panic(err)
 	}

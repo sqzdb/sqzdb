@@ -1,13 +1,13 @@
-//! Experiment 54: the SQL feature matrix. Each probe is a short script run on a fresh database in sqweezdb, SQLite
+//! Experiment 54: the SQL feature matrix. Each probe is a short script run on a fresh database in sqzdb, SQLite
 //! (system library) and Turso 0.8.3. A probe has one or more variants (the same feature in another dialect, or behind
 //! a setting); the first variant that gives the expected answer marks the feature as working, with its label. A probe
 //! that runs but answers differently is "wrong"; one where a statement fails is "missing", with the error. Turso is
 //! retried with its experimental features switched on when the default build refuses. Output: one tab-separated row
 //! per probe (category, feature, then a cell per engine), for the matrix in results/e54_features.md.
 use rusqlite::types::ValueRef;
-use sqweezdb::config::Config;
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::config::Config;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -340,7 +340,7 @@ fn cell_text(c: &Cell) -> String {
 fn extras() {
     const MARK: &str = "PLAINTEXT-MARKER-7f3a";
     let has_mark = |dir: &PathBuf| -> bool { std::fs::read_dir(dir).unwrap().flatten().any(|e| e.path().is_file() && std::fs::read(e.path()).map(|b| b.windows(MARK.len()).any(|w| w == MARK.as_bytes())).unwrap_or(false)) };
-    println!("category\tfeature\tsqweezdb\tsqlite\tturso");
+    println!("category\tfeature\tsqzdb\tsqlite\tturso");
     // encryption at rest
     let ours = { let d = fresh_dir(); { let s = Sql::open_with(&d.join("db"), Config::default()).unwrap(); let mut se = Session::default(); s.exec_s(&mut se, "CREATE TABLE t (id INTEGER PRIMARY KEY, s VARCHAR(40))", &[]).unwrap(); s.exec_s(&mut se, &format!("INSERT INTO t VALUES (1, '{MARK}')"), &[]).unwrap(); s.snapshot(); }
         if has_mark(&d.join("db")) { "no: the log and snapshot are plaintext; backups are encrypted with AES-256-GCM (E35)".to_string() } else { "yes".into() } };
@@ -376,7 +376,7 @@ fn extras() {
         rt.block_on(async { let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap(); let c = db.connect().unwrap(); c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)", ()).await.unwrap(); c.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')", ()).await.unwrap(); });
         let n: Result<i64, String> = rusqlite::Connection::open(&path).map_err(|e| e.to_string()).and_then(|c| c.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).map_err(|e| e.to_string()));
         match n { Ok(2) => "yes: SQLite opens the file Turso wrote".to_string(), other => format!("no: {other:?}") } };
-    println!("Operations\tData readable by other tools\tno: its own log and snapshot format; read it through sqweezdb (shell, console, bindings)\tyes: the most widely supported file format\t{turso}");
+    println!("Operations\tData readable by other tools\tno: its own log and snapshot format; read it through sqzdb (shell, console, bindings)\tyes: the most widely supported file format\t{turso}");
     let _ = std::fs::remove_dir_all("data/nocow/e54");
 }
 
@@ -384,7 +384,7 @@ fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     if std::env::args().nth(1).as_deref() == Some("extras") { let _ = std::fs::remove_dir_all("data/nocow/e54"); return extras(); }
     let _ = std::fs::remove_dir_all("data/nocow/e54");
-    println!("category\tfeature\tsqweezdb\tsqlite\tturso");
+    println!("category\tfeature\tsqzdb\tsqlite\tturso");
     for p in PROBES {
         let ours = probe(Engine::Ours, p); let lite = probe(Engine::Sqlite, p);
         let turso = match probe(Engine::Turso, p) { Cell::Works(l) => Cell::Works(l), other => match probe(Engine::TursoExperimental, p) { Cell::Works(l) => Cell::Works(if l.is_empty() { "experimental flag".into() } else { format!("{l} (experimental flag)") }), _ => other } };

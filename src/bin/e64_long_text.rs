@@ -1,10 +1,10 @@
 //! Experiment 64: TEXT of any length. Writes and reads of 2 KB, 256 KB and 4 MB values against SQLite (WAL,
-//! synchronous=NORMAL: the fsync follows, as sqweezdb's default does); an update of another column of a row holding a
+//! synchronous=NORMAL: the fsync follows, as sqzdb's default does); an update of another column of a row holding a
 //! 256 KB value (and the log it writes); memory per row for short text and for 1 KB values; a restart with 500 MB of
 //! values; replaced values freed.
-use sqweezdb::config::{Config, SnapshotPolicy};
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::config::{Config, SnapshotPolicy};
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,7 @@ fn main() {
 
     // ---- (a) write, then read back by key
     println!("(a) one at a time, in this process: write a row, then read its value back by key");
-    println!("    {:<8} {:>6}   {:>22}   {:>22}", "value", "rows", "sqweezdb write / read", "SQLite write / read");
+    println!("    {:<8} {:>6}   {:>22}   {:>22}", "value", "rows", "sqzdb write / read", "SQLite write / read");
     for (label, size, rows) in [("2 KB", 2 << 10, 20_000usize), ("256 KB", 256 << 10, 2_000), ("4 MB", 4 << 20, 100)] {
         let vals: Vec<String> = (0..16).map(|s| text(size, s)).collect();
         let d = fresh(&format!("a-{size}")); let sql = open(&d); app(&sql, "CREATE TABLE t (id INT PRIMARY KEY, n INT, body TEXT)", &[]);
@@ -82,7 +82,7 @@ fn main() {
     let st = sql.db.table("t").unwrap().schema.columns[1].store.clone().unwrap();
     let upd = sql.prepare("UPDATE t SET body = ? WHERE id = ?").unwrap(); let before = st.bytes();
     let t = Instant::now(); for i in 0..2_000 { sql.execute_s(&mut s, &upd, &[Value::Text(vals[(i + 1) % 16].clone()), Value::Int(i as i64)]).unwrap(); } let tu = t.elapsed();
-    let peak = st.bytes(); let t = Instant::now(); while st.bytes() > before + (1 << 20) && t.elapsed() < Duration::from_secs(10) { std::thread::sleep(Duration::from_millis(20)); sqweezdb::table::reclaim(); }
+    let peak = st.bytes(); let t = Instant::now(); while st.bytes() > before + (1 << 20) && t.elapsed() < Duration::from_secs(10) { std::thread::sleep(Duration::from_millis(20)); sqzdb::table::reclaim(); }
     println!("(e) each value replaced ({:.0} µs per UPDATE): values held {:.0} MB -> {:.0} MB at most -> {:.0} MB {:.1} s later (freed once no reader can hold them)", us(tu, 2_000), before as f64 / 1e6, peak as f64 / 1e6, st.bytes() as f64 / 1e6, t.elapsed().as_secs_f64());
     drop(st); drop(sql);
     let _ = std::fs::remove_dir_all(ROOT);

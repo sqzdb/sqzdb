@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Boards · sqweezdb demo</title>
+<title>Boards · sqzdb demo</title>
 <style>
 :root { --bg:#141518; --panel:#1b1d21; --raised:#212429; --hover:#272a30; --line:#2b2e34; --line-2:#383c43; --text:#e8eaed; --text-2:#b0b5bd; --text-3:#858b94;
   --ok:#5cc98f; --ok-bg:rgba(92,201,143,.12); --warn:#e8b55c; --bad:#ff7070; --sans:system-ui,-apple-system,"Segoe UI","Helvetica Neue",sans-serif; --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace; color-scheme:dark }
@@ -68,13 +68,13 @@ main { padding:20px; display:flex; flex-direction:column; gap:16px; height:calc(
 <div class="gate" id="gate">
   <div class="box">
     <h1>Boards</h1>
-    <p>A multi-tenant task board on sqweezdb. Each organization only ever sees its own cards: the rule lives in the database. Open two windows as members of the same org to watch changes arrive live, and one from another org to see nothing cross over.</p>
+    <p>A multi-tenant task board on sqzdb. Each organization only ever sees its own cards: the rule lives in the database. Open two windows as members of the same org to watch changes arrive live, and one from another org to see nothing cross over.</p>
     <div class="orgs" id="orgs"></div>
   </div>
 </div>
 <div id="app" class="hidden" style="height:100%">
   <header class="top">
-    <div class="brand">sqweez<span>db</span></div><div class="sep"></div>
+    <div class="brand">sqz<span>db</span></div><div class="sep"></div>
     <div class="orgname" id="orgname"></div>
     <span class="live" id="live"><span class="dot"></span><span id="livetext">connecting</span></span>
     <div class="faces" id="faces"></div>

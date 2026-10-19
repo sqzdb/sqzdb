@@ -1,7 +1,7 @@
-// Load test for the agents demo: agent memory through HTTP, on the sqweezdb demo (a database per agent) and on
+// Load test for the agents demo: agent memory through HTTP, on the sqzdb demo (a database per agent) and on
 // PocketBase the way one would build it there (one shared memories collection, a field and an index per agent).
 //
-//	go run ./bench -target sqweezdb -url http://127.0.0.1:8071 -pid <server pid> -dir <agents dir>
+//	go run ./bench -target sqzdb -url http://127.0.0.1:8071 -pid <server pid> -dir <agents dir>
 //	go run ./bench -target pocketbase -url http://127.0.0.1:8090 -pid <pocketbase pid> -dir <pb_data> -setup
 package main
 
@@ -25,7 +25,7 @@ import (
 )
 
 var (
-	target   = flag.String("target", "sqweezdb", "sqweezdb or pocketbase")
+	target   = flag.String("target", "sqzdb", "sqzdb or pocketbase")
 	base     = flag.String("url", "http://127.0.0.1:8071", "server URL")
 	pid      = flag.Int("pid", 0, "server process id, for its memory and CPU")
 	dataDir  = flag.String("dir", "", "server data directory, for disk use")

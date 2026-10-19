@@ -1,9 +1,9 @@
 //! Experiment 47: which unpredictable id is fastest here? Sequential INT keys (the baseline), random 63-bit and
 //! JavaScript-safe random 53-bit INT keys (unpredictable, but on the native integer key path), and a public id made by
 //! a keyed permutation of the sequential key (unpredictable outside, sequential inside, no extra index).
-use sqweezdb::config::{Config, SnapshotPolicy};
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::{uuid_v4, Value};
+use sqzdb::config::{Config, SnapshotPolicy};
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::{uuid_v4, Value};
 use std::time::Instant;
 
 const N: usize = 1_000_000; const ROOT: &str = "data/nocow/e47";

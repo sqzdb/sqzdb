@@ -1,4 +1,4 @@
-# Boards: a multi-tenant task board on sqweezdb
+# Boards: a multi-tenant task board on sqzdb
 
 A small Trello-style app in Go. Organizations sign in, each sees only its own boards and cards, and
 changes show up live in every browser of the same organization.
@@ -19,7 +19,7 @@ over server-sent events. The subscription runs under the same identity, so it ca
 ## Run it
 
 ```sh
-cargo build --release                       # builds target/release/libsqweezdb.so, which the Go binding links
+cargo build --release                       # builds target/release/libsqzdb.so, which the Go binding links
 cd demos/boards
 go run . -dir ./data -addr 127.0.0.1:8070   # then open http://127.0.0.1:8070
 ```
@@ -39,7 +39,7 @@ way: collections, `org = @request.auth.org` rules, indexes, 10 organizations × 
 ```sh
 go build -o /tmp/boards . && go build -o /tmp/boards-bench ./bench
 /tmp/boards -dir /tmp/boards-data -bench-seed 10,20 &
-/tmp/boards-bench -target sqweezdb -url http://127.0.0.1:8070 -pid $!      # -pid: the server, for its memory and CPU
+/tmp/boards-bench -target sqzdb -url http://127.0.0.1:8070 -pid $!      # -pid: the server, for its memory and CPU
 
 pocketbase superuser upsert admin@bench.test benchpass123 --dir /tmp/pb_data
 pocketbase serve --http 127.0.0.1:8090 --dir /tmp/pb_data &
@@ -53,7 +53,7 @@ Results on the lab machine (Ryzen 5 9600X, NVMe under btrfs). Each server ran tw
 directory, and PocketBase also ran twice with its request log off. Neither server fsyncs each commit.
 The full output is in [`results/e52_boards_vs_pocketbase.txt`](../../results/e52_boards_vs_pocketbase.txt).
 
-| | sqweezdb | PocketBase | PocketBase, request log off |
+| | sqzdb | PocketBase | PocketBase, request log off |
 |---|---:|---:|---:|
 | Add a card, 1 client | 21,500/s | 2,900–3,000/s | 3,130–3,170/s |
 | Add a card, 64 clients | 100,300–100,700/s, p99 3.2 ms | 7,970–8,070/s, p99 35 ms | 9,070–9,190/s, p99 30–32 ms |
@@ -70,13 +70,13 @@ organization's card.
 
 What to keep in mind when reading this:
 
-- The sqweezdb side is a hand-written Go server with prepared statements. PocketBase is a whole
+- The sqzdb side is a hand-written Go server with prepared statements. PocketBase is a whole
   framework (rule engine, request log, admin UI, generic REST), and that framework is part of what
   you measure.
 - The live fan-out differs by design: one database subscription per organization here, against a rule
   check per connected client in PocketBase. That design difference is a large part of the gap.
 - PocketBase's disk is smaller once its request log is off: 45 MB of SQLite data against 63 MB for the
-  sqweezdb snapshot.
-- Something PocketBase does that sqweezdb does not yet: a rule can follow a relation
-  (`board.org = @request.auth.org`). A sqweezdb policy compares a row's own columns with the session,
+  sqzdb snapshot.
+- Something PocketBase does that sqzdb does not yet: a rule can follow a relation
+  (`board.org = @request.auth.org`). A sqzdb policy compares a row's own columns with the session,
   so this server checks that the board is visible to the member before it inserts a card.

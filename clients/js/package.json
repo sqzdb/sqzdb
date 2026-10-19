@@ -1,13 +1,23 @@
 {
-  "name": "sqweezdb-client",
-  "version": "0.9.0",
-  "description": "Sign in and run SQL with live queries against a sqweezdb app API, from a browser, React Native or Node",
+  "name": "sqzdb-client",
+  "version": "0.10.0",
+  "description": "Sign in and run SQL with live queries against a sqzdb app API, from a browser, React Native or Node",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
-  "exports": { ".": { "types": "./index.d.ts", "default": "./index.js" } },
-  "files": ["index.js", "index.d.ts"],
-  "engines": { "node": ">=22" },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "license": "MIT",
   "private": true
 }

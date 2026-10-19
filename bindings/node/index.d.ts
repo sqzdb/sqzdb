@@ -102,7 +102,7 @@ export class Auth {
   signOutEverywhere(key: Value): void;
 }
 
-export class SqweezError extends Error {
+export class SqzError extends Error {
   /** CONFLICT, DUPLICATE, FOREIGN_KEY, DENIED, NOT_FOUND, TYPE, ARGUMENTS, TRANSACTION, SYNTAX, SCHEMA, CONFIG, PATH (the path is a file,
    *  a non-empty directory that is not a database, or a database from a newer format), CLOSED or ERROR. */
   code: string;
@@ -114,6 +114,19 @@ export class RunResult { changes: number; seq: number; lastInsertId?: number | s
 export type DurationLike = string | number;
 /** A size: '256MB', '1GB', or bytes. 0 turns a policy off. */
 export type SizeLike = string | number;
+export interface AppOptions {
+  /** Web origins whose pages may call the API, besides its own ('*': any). */
+  origins?: string[];
+  /** The address clients reach the API at (needed for provider sign-in and MCP). */
+  publicUrl?: string;
+  /** Tables clients may make accounts in, and the columns they may set. */
+  signUp?: Record<string, string[]>;
+  anonymousRole?: string; maxRows?: number; staticDir?: string; maxRequest?: SizeLike;
+  files?: { maxSize?: SizeLike; linkTtl?: DurationLike };
+  tls?: { domains?: string[]; email?: string; cert?: string; key?: string; acme?: string; acmeRoot?: string; dir?: string; redirect?: string };
+  /** Serve MCP at /mcp: agents sign their user in through this API's own OAuth server. */
+  mcp?: { users?: string; tokenTtl?: DurationLike; grantTtl?: DurationLike; maxRows?: number };
+}
 export interface BackupOptions {
   endpoint: string; bucket: string; prefix?: string; region?: string; accessKey: string; secretKey: string;
   /** AES-256-GCM under a key derived from this passphrase; omit for plaintext (still compressed). */
@@ -138,7 +151,12 @@ export interface OpenOptions {
    * Doors for other processes: a Unix socket path, a TCP address, and `http`, the web console served from this process
    * (e.g. '127.0.0.1:7780'). TCP and the console need `token`. Closing the database closes them and frees the ports.
    */
-  listen?: { socket?: string; tcp?: string; http?: string; token?: string };
+  listen?: { socket?: string; tcp?: string; http?: string; token?: string; /** The app API (`app`), e.g. '0.0.0.0:8081'. */ app?: string };
+  /** Browsers, phones and agents (MCP) straight to this database, served from this process at `listen.app`. */
+  app?: AppOptions;
+  auth?: { sessionTtl?: DurationLike; passwordMin?: number; oauth?: Record<string, { clientId: string; clientSecret: string; kind?: 'oidc'; authUrl?: string; tokenUrl?: string; jwksUrl?: string; issuer?: string; scopes?: string[] }> };
+  /** An OpenAI-compatible embeddings endpoint, for generated VECTOR columns and embed(). */
+  embed?: { url: string; model: string; apiKey?: string; dimensions?: number; batch?: number };
   live?: { debounce?: DurationLike; queue?: number };
   log?: { threadsIdleAfter?: DurationLike };
   /** How rows become objects (this binding only). */

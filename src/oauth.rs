@@ -47,7 +47,7 @@ fn http<T: Send, F, Fut>(f: F) -> Result<T, String> where F: FnOnce(reqwest::Cli
 pub(crate) fn http_with<T: Send, F, Fut>(timeout: Duration, f: F) -> Result<T, String> where F: FnOnce(reqwest::Client) -> Fut + Send, Fut: std::future::Future<Output = Result<T, String>> {
     std::thread::scope(|s| s.spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-        let client = reqwest::Client::builder().timeout(timeout).user_agent(concat!("sqweezdb/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
+        let client = reqwest::Client::builder().timeout(timeout).user_agent(concat!("sqzdb/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
         rt.block_on(f(client))
     }).join().map_err(|_| "the HTTP thread panicked".to_string())?)
 }
@@ -252,7 +252,7 @@ mod tests {
         q["state"].clone()
     }
     fn setup(s: &Sql) { for st in ["CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member')", "CREATE ROLE member", "CREATE TABLE notes (id SERIAL PRIMARY KEY, owner INT, body TEXT)", "GRANT SELECT ON notes TO member", "CREATE POLICY own ON notes FOR ALL TO member USING (owner = SESSION.id)", "ALTER TABLE users ENABLE AUTH (ROLE FROM role)"] { s.exec_s(&mut crate::sql::Session::default(), st, &[]).unwrap(); } }
-    fn tmp(n: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqweezdb-oauth-{}-{n}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
+    fn tmp(n: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqzdb-oauth-{}-{n}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
     const REDIRECT: &str = "http://127.0.0.1:3000/auth/callback";
 
     #[test] fn google_sign_in_makes_then_finds_the_user() {

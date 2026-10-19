@@ -128,8 +128,8 @@ pub fn probe(cfg: &CloudConfig) -> Vec<(&'static str, bool, f64, String)> {
     let rt = rt(); let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now(); let r = rt.block_on(store.list_with_delimiter(Some(&cfg.key(""))));
     let ok = r.is_ok(); out.push(("list", ok, ms(t), r.err().map(|e| e.to_string()).unwrap_or_default())); if !ok { return out; }
-    let key = cfg.key(&format!(".sqweezdb-probe-{}", now_ms()));
-    let t = Instant::now(); let r = rt.block_on(store.put(&key, PutPayload::from(b"sqweezdb connection check".to_vec())));
+    let key = cfg.key(&format!(".sqzdb-probe-{}", now_ms()));
+    let t = Instant::now(); let r = rt.block_on(store.put(&key, PutPayload::from(b"sqzdb connection check".to_vec())));
     let ok = r.is_ok(); out.push(("write", ok, ms(t), r.err().map(|e| e.to_string()).unwrap_or_default())); if !ok { return out; }
     let t = Instant::now(); let r = rt.block_on(store.delete(&key));
     out.push(("delete", r.is_ok(), ms(t), r.err().map(|e| e.to_string()).unwrap_or_default()));
@@ -514,7 +514,7 @@ mod file_tests {
     use super::*;
     use object_store::memory::InMemory;
     fn cfg(pass: Option<&str>) -> CloudConfig { let c = CloudConfig::local("b", "db"); match pass { Some(p) => c.with_passphrase(p), None => c } }
-    fn tmp(n: &str) -> PathBuf { let d = std::env::temp_dir().join(format!("sqweezdb-cloudfiles-{}-{n}", std::process::id())); let _ = fs::remove_dir_all(&d); fs::create_dir_all(&d).unwrap(); d }
+    fn tmp(n: &str) -> PathBuf { let d = std::env::temp_dir().join(format!("sqzdb-cloudfiles-{}-{n}", std::process::id())); let _ = fs::remove_dir_all(&d); fs::create_dir_all(&d).unwrap(); d }
     fn noise(n: usize) -> Vec<u8> { let mut v = vec![0u8; n]; getrandom::fill(&mut v).unwrap(); v }
     const ID: &str = "0123abcd-89ab-4def-8123-456789abcdef";
 

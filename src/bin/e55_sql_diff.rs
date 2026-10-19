@@ -1,12 +1,12 @@
-//! Experiment 55: differential test of everyday SQL. The same schema, rows and queries run on sqweezdb and on SQLite
+//! Experiment 55: differential test of everyday SQL. The same schema, rows and queries run on sqzdb and on SQLite
 //! (system library); every result is compared: in order when the query has ORDER BY, as sorted rows otherwise. Integers
-//! and floats compare as numbers, booleans as 0 and 1. A query sqweezdb refuses is reported as such, not as a mismatch.
+//! and floats compare as numbers, booleans as 0 and 1. A query sqzdb refuses is reported as such, not as a mismatch.
 //!
 //!     cargo run --release --features lab --bin e55_sql_diff [filter]
 use rusqlite::types::ValueRef;
-use sqweezdb::config::Config;
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::config::Config;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 
 const SETUP: &[&str] = &[
     "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40), age INT, grp INT, city VARCHAR(40), score DOUBLE)",
@@ -259,7 +259,7 @@ fn main() {
         let mut l: Vec<Vec<String>> = { let mut st = lite.prepare(q).unwrap(); let n = st.column_count(); let mut rows = st.query([]).unwrap(); let mut out = vec![]; while let Some(r) = rows.next().unwrap() { out.push((0..n).map(|i| lite_norm(r.get_ref(i).unwrap())).collect()); } out };
         let mut o: Vec<Vec<String>> = match ours.exec_s(&mut Session::default(), q, &[]) { Ok(rows) => rows.iter().map(|r| r.iter().map(norm).collect()).collect(), Err(e) => { refused += 1; println!("REFUSED  {q}\n         {e}"); continue; } };
         if !ordered { l.sort(); o.sort(); }
-        if l == o { same += 1; } else { differ += 1; println!("DIFFER   {q}\n  sqlite   {l:?}\n  sqweezdb {o:?}"); }
+        if l == o { same += 1; } else { differ += 1; println!("DIFFER   {q}\n  sqlite   {l:?}\n  sqzdb {o:?}"); }
     }
     println!("{same} same, {differ} differ, {refused} refused");
     drop(ours); let _ = std::fs::remove_dir_all(&dir);

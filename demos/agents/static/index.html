@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agents · sqweezdb demo</title>
+<title>Agents · sqzdb demo</title>
 <style>
 :root { --bg:#141518; --panel:#1b1d21; --raised:#212429; --hover:#272a30; --line:#2b2e34; --line-2:#383c43; --text:#e8eaed; --text-2:#b0b5bd; --text-3:#858b94;
   --ok:#5cc98f; --ok-bg:rgba(92,201,143,.12); --warn:#e8b55c; --warn-bg:rgba(232,181,92,.12); --bad:#ff7070; --bad-bg:rgba(255,112,112,.10); --info:#8fb3ff; --info-bg:rgba(143,179,255,.12);
@@ -85,7 +85,7 @@ textarea { width:100%; min-height:64px; resize:vertical; padding:9px 11px; borde
 <body>
 <div class="app">
   <header class="top">
-    <div class="brand">Agents <span>· a database per agent on sqweezdb</span></div>
+    <div class="brand">Agents <span>· a database per agent on sqzdb</span></div>
     <div class="stats" id="stats">
       <div class="stat"><b id="s-agents">–</b><small>agents on disk</small></div>
       <div class="stat"><b id="s-open">–</b><small>open right now</small></div>
@@ -113,7 +113,7 @@ textarea { width:100%; min-height:64px; resize:vertical; padding:9px 11px; borde
 <template id="intro">
   <section class="intro">
     <h1>Every agent gets its own database.</h1>
-    <p>Each agent here is a directory with its own sqweezdb database: created in a fraction of a millisecond, closed when idle, opened again from disk when the agent wakes up. Forgetting an agent deletes its directory, so nothing about it is left in a shared table.</p>
+    <p>Each agent here is a directory with its own sqzdb database: created in a fraction of a millisecond, closed when idle, opened again from disk when the agent wakes up. Forgetting an agent deletes its directory, so nothing about it is left in a shared table.</p>
     <div class="facts">
       <div class="fact"><b id="f-create">–</b><span>to create an agent</span></div>
       <div class="fact"><b id="f-open">–</b><span>to open a sleeping one</span></div>

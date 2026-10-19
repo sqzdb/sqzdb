@@ -5,7 +5,7 @@ export type Row = Record<string, Value | FileValue>;
 /** A parameter: a value, a File or Blob (uploaded first, then its id), or a file a query returned (its id). */
 export type Param = Value | FileValue | Blob;
 
-export class SqweezError extends Error {
+export class SqzError extends Error {
   /** AUTH, DENIED, TYPE, SYNTAX, SCHEMA, DUPLICATE, FOREIGN_KEY, CONFLICT, NOT_FOUND, TRANSACTION, ARGUMENTS, RATE_LIMITED, CLOSED, ERROR */
   readonly code: string;
 }
@@ -47,8 +47,8 @@ export interface Client {
   readonly ready: Promise<void>;
   sql(sql: string, params?: Param[]): Promise<Row[] & { lastInsertId?: Value }>;
   batch(statements: Array<[string, Param[]?] | { sql: string; params?: Param[] }>): Promise<Row[][]>;
-  live(sql: string, params: Array<Value | FileValue>, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqweezError) => void): Live;
-  live(sql: string, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqweezError) => void): Live;
+  live(sql: string, params: Array<Value | FileValue>, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqzError) => void): Live;
+  live(sql: string, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqzError) => void): Live;
   close(): void;
 }
 

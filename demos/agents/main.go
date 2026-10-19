@@ -1,4 +1,4 @@
-// Agents: a database per AI agent on sqweezdb. Each agent's memory is its own database directory, created on first use,
+// Agents: a database per AI agent on sqzdb. Each agent's memory is its own database directory, created on first use,
 // kept open while the agent is busy and closed when it goes idle or when too many are open; reopening a closed agent maps
 // its files back in about a millisecond. Forgetting an agent is deleting its directory. A memory is a row; recall is the
 // newest N, or the newest N that mention a word.
@@ -30,13 +30,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/iluxav/sqweezdb/bindings/go/sqweezdb"
+	"github.com/sqzdb/sqzdb/bindings/go/sqzdb"
 )
 
 //go:embed static
 var static embed.FS
 
-// The body's maximum length is fixed when an agent is created: sqweezdb rows are fixed width, so every memory takes
+// The body's maximum length is fixed when an agent is created: sqzdb rows are fixed width, so every memory takes
 // the full maximum in memory and in the log whatever its length (-body-max).
 var bodyMax = 2000
 
@@ -53,9 +53,9 @@ var errBusy = errors.New("agent is busy; try again")
 
 type agent struct {
 	name         string
-	db           *sqweezdb.DB
-	ins, scan, n *sqweezdb.Stmt
-	recent       [3]*sqweezdb.Stmt // newest 10, 50 and 200: LIMIT takes a literal
+	db           *sqzdb.DB
+	ins, scan, n *sqzdb.Stmt
+	recent       [3]*sqzdb.Stmt // newest 10, 50 and 200: LIMIT takes a literal
 	refs         int
 	last         time.Time
 	elem         *list.Element
@@ -287,7 +287,7 @@ func (p *pool) closeEverything() {
 func (a *agent) load(dir string, fresh bool) error {
 	// Log threads leave after 300 ms without writes, and one fsync per second covers an agent's writes: thousands of
 	// agents share the disk, and a crash of the machine (not of this process) can lose at most the last second.
-	db, err := sqweezdb.OpenWith(dir, sqweezdb.Options{Log: &sqweezdb.Log{ThreadsIdleAfter: "300ms", SyncDelay: "1s"}})
+	db, err := sqzdb.OpenWith(dir, sqzdb.Options{Log: &sqzdb.Log{ThreadsIdleAfter: "300ms", SyncDelay: "1s"}})
 	if err != nil {
 		return err
 	}
@@ -304,7 +304,7 @@ func (a *agent) load(dir string, fresh bool) error {
 		}
 	}
 	for _, x := range []struct {
-		st **sqweezdb.Stmt
+		st **sqzdb.Stmt
 		q  string
 	}{
 		{&a.ins, "INSERT INTO memories (kind, body) VALUES (?, ?) RETURNING id, kind, body, at"},
@@ -326,7 +326,7 @@ func (a *agent) close() {
 	if a.db == nil {
 		return
 	}
-	for _, st := range []*sqweezdb.Stmt{a.ins, a.recent[0], a.recent[1], a.recent[2], a.scan, a.n} {
+	for _, st := range []*sqzdb.Stmt{a.ins, a.recent[0], a.recent[1], a.recent[2], a.scan, a.n} {
 		if st != nil {
 			st.Close()
 		}
@@ -347,7 +347,7 @@ func (a *agent) remember(kind, body string) (map[string]any, error) {
 	return table(memCols, rows)[0], nil
 }
 
-// recall returns the newest n memories, or the newest n that contain q (case-insensitive). sqweezdb has no LIKE or full
+// recall returns the newest n memories, or the newest n that contain q (case-insensitive). sqzdb has no LIKE or full
 // text search yet, so the word match runs here over the agent's newest 5,000 memories: one agent's memory is small.
 func (a *agent) recall(n int, q string) ([]map[string]any, error) {
 	s := a.db.Session()

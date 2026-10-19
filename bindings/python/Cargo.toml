@@ -1,15 +1,15 @@
 [package]
-name = "sqweezdb-python"
-version = "0.9.0"
+name = "sqzdb-python"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
 
 [lib]
-name = "sqweezdb_py"
+name = "sqzdb_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-sqweezdb = { path = "../.." }   # includes the web console (off until listen.http is set)
+sqzdb = { path = "../.." }   # includes the web console (off until listen.http is set)
 pyo3 = { version = "0.28", features = ["extension-module"] }
 
 [profile.release]

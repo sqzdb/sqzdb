@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 const K_LOGIN: u8 = 1; const K_EXEC: u8 = 2; const K_BATCH: u8 = 3; const K_SHM: u8 = 4; const K_SUB: u8 = 5; const K_AUTH: u8 = 6;
 /// Where a local client may place its shared-memory ring; the server refuses any other path (it writes into that file).
-const SHM_DIR: &str = "/dev/shm/"; const SHM_PREFIX: &str = "sqweezdb-ring-";
+const SHM_DIR: &str = "/dev/shm/"; const SHM_PREFIX: &str = "sqzdb-ring-";
 pub fn same_secret(a: &[u8], b: &[u8]) -> bool { let mut d = (a.len() != b.len()) as u8; for i in 0..a.len().min(b.len()) { d |= a[i] ^ b[i]; } d == 0 }
 // shared-memory ring: one outstanding request per connection, both sides spin briefly then back off
 const SHM_SIZE: usize = 2 << 20; const REQ_OFF: usize = 64; const REQ_CAP: usize = 1 << 20; const RESP_OFF: usize = REQ_OFF + REQ_CAP; const RESP_CAP: usize = SHM_SIZE - RESP_OFF;
@@ -184,7 +184,7 @@ impl Server {
                 // the client created a ring file under SHM_DIR; serve it from a dedicated thread, the socket stays for shutdown
                 let path = String::from_utf8_lossy(&req[1..]).into_owned();
                 let allowed = !remote && path.starts_with(SHM_DIR) && path[SHM_DIR.len()..].starts_with(SHM_PREFIX) && !path[SHM_DIR.len()..].contains('/') && !path.contains("..");
-                let r: Result<Vec<Vec<Value>>, String> = match if allowed { Ring::open(Path::new(&path), false) } else { Err(std::io::Error::other(if remote { "shared memory is for local clients" } else { "ring files must be /dev/shm/sqweezdb-ring-*" })) } {
+                let r: Result<Vec<Vec<Value>>, String> = match if allowed { Ring::open(Path::new(&path), false) } else { Err(std::io::Error::other(if remote { "shared memory is for local clients" } else { "ring files must be /dev/shm/sqzdb-ring-*" })) } {
                     Ok(ring) => { let closer = Arc::new(std::sync::atomic::AtomicBool::new(false)); ring_closer = Some(closer.clone()); let w2 = weak.clone(); std::thread::spawn(move || Self::serve_ring(w2, ring, closer)); Ok(vec![]) }
                     Err(e) => Err(e.to_string()),
                 };
@@ -295,7 +295,7 @@ mod tests {
     use super::*;
     #[test]
     fn ring_refuses_symlinks_and_odd_files() {
-        let dir = std::env::temp_dir().join(format!("sqweezdb-ring-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sqzdb-ring-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real"); std::fs::File::create(&real).unwrap().set_len(SHM_SIZE as u64).unwrap();
         let link = dir.join("link"); std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -307,9 +307,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
     /// Requests and results larger than the ring's areas (1 MB) go through it in pieces, in the same session.
-    #[test]
+    /// (Rings are files in /dev/shm: Linux only.)
+    #[test] #[cfg(target_os = "linux")]
     fn large_values_go_through_the_ring_in_pieces() {
-        let dir = std::env::temp_dir().join(format!("sqweezdb-ring-big-{}", std::process::id())); let _ = std::fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("sqzdb-ring-big-{}", std::process::id())); let _ = std::fs::remove_dir_all(&dir);
         let sql = Sql::open_with(&dir.join("db"), crate::config::Config::default()).unwrap();
         let sock = dir.join("db.sock"); let l = Server::start(sql.clone(), &sock).unwrap();
         let mut c = Client::connect_shm(&sock, std::path::Path::new("/dev/shm")).unwrap();

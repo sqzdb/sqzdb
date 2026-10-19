@@ -1,7 +1,7 @@
 //! Experiment 18 (H27 + H28): non-unique indexes (rematch of J4 and the Q5 shape) and the monomorphized scan path (re-measure E13/E15 queries).
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
-use sqweezdb::util::Rng;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
+use sqzdb::util::Rng;
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::PathBuf;

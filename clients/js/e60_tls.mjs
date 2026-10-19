@@ -11,7 +11,7 @@ import { connect } from './index.js';
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs'; import assert from 'node:assert/strict'; import net from 'node:net'; import http from 'node:http'; import https from 'node:https'; import tls from 'node:tls';
 
-const BIN = new URL('../../target/release/sqweezdb', import.meta.url).pathname;
+const BIN = new URL('../../target/release/sqzdb', import.meta.url).pathname;
 const SCHEMA = new URL('../../demos/notes/schema.sql', import.meta.url).pathname;
 const WORK = new URL('../../data/nocow/e60', import.meta.url).pathname;
 const freePort = () => new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
@@ -30,7 +30,7 @@ if (!process.env.E60_CERT) {
   const code = await new Promise((r) => child.on('exit', r)); fs.rmSync(WORK, { recursive: true, force: true }); process.exit(code);
 }
 
-/** Start `sqweezdb serve` on a fresh copy of the notes schema; resolves once it prints its app API line. */
+/** Start `sqzdb serve` on a fresh copy of the notes schema; resolves once it prints its app API line. */
 async function serve(dir, port, toml, { fresh = true } = {}) {
   if (fresh) { fs.rmSync(dir, { recursive: true, force: true }); execFileSync(BIN, ['shell', dir], { input: fs.readFileSync(SCHEMA), stdio: ['pipe', 'ignore', 'inherit'] }); }
   fs.writeFileSync(`${dir}.toml`, toml);

@@ -1,8 +1,8 @@
 //! Experiment 17 (H25 + H29): crash recovery for the SQL storage. kill -9 a process writing through SQL (autocommit inserts,
 //! multi-row transactions, snapshots every 700 ms, roles and policies defined), reopen, verify every acknowledged write and the ACL.
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
-use sqweezdb::util::Rng;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
+use sqzdb::util::Rng;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

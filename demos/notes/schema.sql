@@ -1,5 +1,5 @@
 -- The notes app's whole backend: its tables, who may do what, and sign-in. Load it once:
---   sqweezdb shell ./data < schema.sql
+--   sqzdb shell ./data < schema.sql
 CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, name TEXT, role TEXT DEFAULT 'member');
 CREATE TABLE notes (id SERIAL PRIMARY KEY, owner INT NOT NULL, body VARCHAR(1000) NOT NULL, pinned BOOL DEFAULT false, created TIMESTAMP DEFAULT now(), attachment FILE);
 CREATE INDEX notes_owner ON notes (owner);

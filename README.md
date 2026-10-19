@@ -1,13 +1,15 @@
 <div align="center">
 
-# sqweezdb
+# sqzdb
 
 **An embedded SQL database for applications that outgrow SQLite.**<br>
 Concurrent writers, strict types, row-level security, live queries and continuous backup,<br>
 in a library inside your process, or as the whole backend of a web or mobile app.
 
-[![CI](https://github.com/iluxav/sqweezdb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/iluxav/sqweezdb/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/iluxav/sqweezdb?sort=semver)](https://github.com/iluxav/sqweezdb/releases/latest)
+[sqzdb.dev](https://sqzdb.dev)
+
+[![CI](https://github.com/sqzdb/sqzdb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sqzdb/sqzdb/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sqzdb/sqzdb?sort=semver)](https://github.com/sqzdb/sqzdb/releases/latest)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](#building-from-source)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-blue)](#installation)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -19,7 +21,7 @@ in a library inside your process, or as the whole backend of a web or mobile app
 
 ---
 
-sqweezdb keeps SQLite's deployment model: no server to run, one directory per database, opened by the
+sqzdb keeps SQLite's deployment model: no server to run, one directory per database, opened by the
 library in your process. It is written in Rust and adds what SQLite leaves to the application: many
 writers at once, enforced column types, access control inside the engine, subscriptions to changes,
 schema changes without downtime, and backup to any S3-compatible bucket.
@@ -52,15 +54,15 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 | **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`. |
 | **Backup and replication** | Continuous backup to S3-compatible storage, compressed and encrypted; point-in-time restore; read-only followers. |
 | **Fast restart** | The snapshot is the table image and is memory-mapped, not loaded. After a snapshot, a million-row table reopens in under a millisecond; each secondary index adds about 30 ms per million rows. |
-| **Tooling** | A `sqweezdb` command with a server, a SQL shell and a web console, plus bindings for Node, Python, Go, C and Rust. |
+| **Tooling** | A `sqzdb` command with a server, a SQL shell and a web console, plus bindings for Node, Python, Go, C and Rust. |
 
 ## Performance
 
 The same statements and the same data on each engine, 1 million rows, each engine in its own process:
 SQLite 3.53 (the system library, WAL mode), Turso 0.8.3 (its MVCC mode with `BEGIN CONCURRENT`) and
-sqweezdb. All three returned identical results, to the cent and to the row.
+sqzdb. All three returned identical results, to the cent and to the row.
 
-| Workload | SQLite | Turso | sqweezdb |
+| Workload | SQLite | Turso | sqzdb |
 |---|---:|---:|---:|
 | Durable commits per second, 1 writer | 2,197–2,220 | 2,288–2,362 | 2,287–2,351 |
 | Durable commits per second, 64 writers | 2,264–2,306 | 53,017–59,845 | 50,823–55,315 |
@@ -79,13 +81,13 @@ sqweezdb. All three returned identical results, to the cent and to the row.
 The durable rows insert single rows into a fresh table and wait for an fsync on every engine, so one
 writer is bound by the disk on all three; their ranges come from two runs with the engines in opposite
 orders. The transaction row does not wait
-for the disk. sqweezdb keeps tables in memory, so it uses the most memory
+for the disk. sqzdb keeps tables in memory, so it uses the most memory
 after a large load; after a restart that maps the snapshot, it owns about 2 MB and the operating
 system's page cache holds the rest.
 
 Compared with the tools usually paired with SQLite:
 
-| Workload | SQLite with its usual tool | sqweezdb |
+| Workload | SQLite with its usual tool | sqzdb |
 |---|---:|---:|
 | Node: point read returned as an object | 1.38 µs (better-sqlite3) | **0.98 µs** |
 | Node: 1,000 rows returned as objects | 111 µs (better-sqlite3) | **66 µs** |
@@ -96,7 +98,7 @@ Compared with the tools usually paired with SQLite:
 As the backend of a browser app, against PocketBase 0.40.5 running the same notes app with the same
 rules ([`demos/notes`](demos/notes); PocketBase's range is with and without its request log):
 
-| Workload | PocketBase | sqweezdb |
+| Workload | PocketBase | sqzdb |
 |---|---:|---:|
 | Notes created per second, 32 users writing at once | 4,972–5,761 | **47,548** |
 | Read one note over HTTP, p50 | 0.105–0.112 ms | **0.026 ms** |
@@ -106,10 +108,10 @@ rules ([`demos/notes`](demos/notes); PocketBase's range is with and without its 
 | Server memory with 1,000 devices connected | 160–247 MB | **48 MB** |
 | Writes per second while they are connected | 205–211 | **22,431** |
 
-Where the others are ahead or even: Turso matches sqweezdb on durable commits up to about 64 writers;
+Where the others are ahead or even: Turso matches sqzdb on durable commits up to about 64 writers;
 SQLite reopens slightly faster, uses far less memory after a load, bulk-loads faster one row
 per call through a language binding, and finishes `ALTER TABLE` changes that only touch metadata
-instantly, where sqweezdb copies the table in the background.
+instantly, where sqzdb copies the table in the background.
 
 Measured on one machine, an AMD Ryzen 5 9600X with NVMe storage and btrfs; the numbers describe that
 machine, not yours. Every benchmark is a program in [`src/bin/`](src/bin/) that you can run, and its
@@ -122,7 +124,7 @@ raw output is in [`results/`](results/).
 Prebuilt for Linux and macOS on x86_64 and arm64:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/iluxav/sqweezdb/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sqzdb/sqzdb/main/install.sh | sh
 ```
 
 The installer verifies the download against the release's `SHA256SUMS` and installs to `~/.local/bin`,
@@ -131,9 +133,9 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.9.0` | Install a specific release instead of the latest. |
-| `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
-| `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
+| `SQZDB_VERSION=v0.10.0` | Install a specific release instead of the latest. |
+| `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
+| `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
 To remove it, run `sh install.sh --uninstall`. From a checkout, `make install` and `make uninstall`
 do the same with a local build.
@@ -147,16 +149,16 @@ as described in [Building from source](#building-from-source).
 |---|---|---|
 | Node.js 20+ | Native addon (N-API), synchronous calls with promises where work waits | `bindings/node` |
 | Python 3.11+ | Extension module (PyO3), releases the GIL while the engine works | `bindings/python` |
-| Go 1.24+ | cgo package over the C ABI | `bindings/go/sqweezdb` |
-| C | Shared library `libsqweezdb.so` | `src/capi.rs` |
-| Rust | The `sqweezdb` crate | `src/` |
+| Go 1.24+ | cgo package over the C ABI | `bindings/go/sqzdb` |
+| C | Shared library `libsqzdb.so` | `src/capi.rs` |
+| Rust | The `sqzdb` crate | `src/` |
 
 ## Quick start
 
 ### Node.js
 
 ```js
-import { open } from 'sqweezdb'
+import { open } from 'sqzdb'
 
 const db = open('./data/shop')   // creates the database, or reopens it
 
@@ -198,9 +200,9 @@ microsecond. Promises appear only where something waits: `run().durable`, subscr
 <summary><b>Python</b></summary>
 
 ```python
-import sqweezdb
+import sqzdb
 
-db = sqweezdb.Database("./data/shop")                 # Database(path, durable=False, **options)
+db = sqzdb.Database("./data/shop")                 # Database(path, durable=False, **options)
 s = db.session()
 s.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name VARCHAR(32), at TIMESTAMP)")
 ins = db.prepare("INSERT INTO t VALUES (?, ?, ?)")
@@ -220,9 +222,9 @@ thread can block on `next()` without stalling the rest of the program.
 <summary><b>Go</b></summary>
 
 ```go
-import "github.com/iluxav/sqweezdb/bindings/go/sqweezdb"
+import "github.com/sqzdb/sqzdb/bindings/go/sqzdb"
 
-db, err := sqweezdb.Open("./data/shop", false)
+db, err := sqzdb.Open("./data/shop", false)
 s := db.Session()
 s.ExecText("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INT, amount DOUBLE)")
 ins, _ := db.Prepare("INSERT INTO orders VALUES (?, ?, ?)")
@@ -242,9 +244,9 @@ the database and streams a filtered subscription to browsers as Server-Sent Even
 <summary><b>Rust</b></summary>
 
 ```rust
-use sqweezdb::config::Config;
-use sqweezdb::sql::{Session, Sql};
-use sqweezdb::table::Value;
+use sqzdb::config::Config;
+use sqzdb::sql::{Session, Sql};
+use sqzdb::table::Value;
 
 let sql = Sql::open_with(std::path::Path::new("./data/shop"), Config::default())?;
 let mut s = Session::default();
@@ -254,8 +256,8 @@ sql.execute_s(&mut s, &ins, &[Value::Int(1), Value::Text("alice".into())])?;
 let rows = sql.exec_s(&mut s, "SELECT * FROM t WHERE id = ?", &[Value::Int(1)])?;
 ```
 
-Other processes reach the owning process through `sqweezdb::net::Client`, over a Unix socket, a
-shared-memory ring or TCP. `sqweezdb::tenants::TenantHost` runs thousands of databases in one process,
+Other processes reach the owning process through `sqzdb::net::Client`, over a Unix socket, a
+shared-memory ring or TCP. `sqzdb::tenants::TenantHost` runs thousands of databases in one process,
 at about 90 µs to create one and about 100 KB each; it is Rust-only for now.
 
 </details>
@@ -263,9 +265,9 @@ at about 90 µs to create one and about 100 KB each; it is Rust-only for now.
 <details>
 <summary><b>C</b></summary>
 
-`libsqweezdb.so` exports a small C ABI: `sqweezdb_open_with`, `sqweezdb_prepare`, `sqweezdb_exec`,
-`sqweezdb_rows_all`, `sqweezdb_subscribe`, `sqweezdb_assume` and more. The declarations live in the
-cgo preamble of [`bindings/go/sqweezdb/sqweezdb.go`](bindings/go/sqweezdb/sqweezdb.go), which also
+`libsqzdb.so` exports a small C ABI: `sqzdb_open_with`, `sqzdb_prepare`, `sqzdb_exec`,
+`sqzdb_rows_all`, `sqzdb_subscribe`, `sqzdb_assume` and more. The declarations live in the
+cgo preamble of [`bindings/go/sqzdb/sqzdb.go`](bindings/go/sqzdb/sqzdb.go), which also
 serves as the reference for using them.
 
 </details>
@@ -280,7 +282,7 @@ a whole.
 
 ```
 data/orders/
-  sqweezdb.meta   marks the directory as a database and records its format version
+  sqzdb.meta   marks the directory as a database and records its format version
   snap            the table image, memory-mapped at startup
   log.000…        the change log, in segments; old segments are removed after a snapshot
   .lock           held while the database is open
@@ -288,7 +290,7 @@ data/orders/
 
 Opening a path follows four rules, checked before anything is written:
 
-- A directory with `sqweezdb.meta` opens, unless it was written by a newer, incompatible format.
+- A directory with `sqzdb.meta` opens, unless it was written by a newer, incompatible format.
 - A missing or empty directory becomes a new database, unless `create: false` is set. Hidden files and
   `.toml` files don't count, so a configuration file can live there.
 - A directory with database files but no marker, as written by 0.1.0, is adopted and gets a marker.
@@ -576,7 +578,7 @@ app needs no server code of its own. Any `SELECT` can be live, joins and aggrega
 gets its rows at once and again whenever they change.
 
 ```sh
-sqweezdb serve ./data --app 0.0.0.0:8080 --config app.toml
+sqzdb serve ./data --app 0.0.0.0:8080 --config app.toml
 ```
 
 ```toml
@@ -690,8 +692,8 @@ Give the app API its domain and it serves https and wss with a certificate from 
 automatically, the way Caddy does. No proxy is needed in front.
 
 ```sh
-sudo setcap cap_net_bind_service=+ep "$(command -v sqweezdb)"   # once: bind port 443 without root
-sqweezdb serve ./data --app 0.0.0.0:443 --domain api.example.com --email ops@example.com
+sudo setcap cap_net_bind_service=+ep "$(command -v sqzdb)"   # once: bind port 443 without root
+sqzdb serve ./data --app 0.0.0.0:443 --domain api.example.com --email ops@example.com
 ```
 
 ```toml
@@ -798,11 +800,11 @@ Everything is built on the change log, so backups never pause the database.
 ### Web console and command line
 
 ```sh
-sqweezdb serve ./data/shop --ui 127.0.0.1:7780 --tcp 0.0.0.0:7781   # own a database, serve it
-sqweezdb serve ./data/shop --app 0.0.0.0:8080 --config app.toml     # … to browsers and mobile apps
-sqweezdb serve ./data/shop --app 0.0.0.0:443 --domain api.shop.com   # … over https, certificate from Let's Encrypt
-sqweezdb shell ./data/shop                                          # SQL in the terminal
-sqweezdb shell db.internal:7781 --token …                           # the same against a running server
+sqzdb serve ./data/shop --ui 127.0.0.1:7780 --tcp 0.0.0.0:7781   # own a database, serve it
+sqzdb serve ./data/shop --app 0.0.0.0:8080 --config app.toml     # … to browsers and mobile apps
+sqzdb serve ./data/shop --app 0.0.0.0:443 --domain api.shop.com   # … over https, certificate from Let's Encrypt
+sqzdb shell ./data/shop                                          # SQL in the terminal
+sqzdb shell db.internal:7781 --token …                           # the same against a running server
 ```
 
 `serve` owns a directory and starts what you ask for: a Unix socket, TCP, backup, the snapshot policy,
@@ -834,19 +836,19 @@ errors, so a typo never silently disables anything.
 
 ```js
 const db = open('./data/orders', {
-  configFile: '/etc/sqweezdb/orders.toml',
+  configFile: '/etc/sqzdb/orders.toml',
   durable: true,
   backup: {
     endpoint: 'https://s3.eu-central-1.amazonaws.com', bucket: 'acme-prod', prefix: 'orders/',
     region: 'eu-central-1', accessKey: process.env.S3_KEY, secretKey: process.env.S3_SECRET,
     passphrase: process.env.DB_PASSPHRASE,
   },
-  listen: { socket: '/run/sqweezdb/orders.sock', http: '127.0.0.1:7780', token: process.env.DB_TOKEN },
+  listen: { socket: '/run/sqzdb/orders.sock', http: '127.0.0.1:7780', token: process.env.DB_TOKEN },
 })
 ```
 
-Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup={...})`. Go takes
-`sqweezdb.OpenWith(path, sqweezdb.Options{...})`, and C takes a JSON string in `sqweezdb_open_with`.
+Python takes the same keys as keyword arguments, `sqzdb.Database(path, backup={...})`. Go takes
+`sqzdb.OpenWith(path, sqzdb.Options{...})`, and C takes a JSON string in `sqzdb_open_with`.
 
 | Key | Default | Description |
 |---|---|---|
@@ -866,7 +868,7 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `snapshot.logBytes` | `64MB` | Snapshot once the log since the last snapshot exceeds this size, or that snapshot's own size if larger. |
 | `snapshot.idleAfter` | `30s` | Snapshot after this long without writes. |
 | `listen.socket` / `tcp` / `http` | none | A Unix socket, a TCP listener, and the web console. |
-| `listen.token` | none | The shared secret for TCP and the console; required when either is on. The `sqweezdb` command generates one if you don't pass `--token`. |
+| `listen.token` | none | The shared secret for TCP and the console; required when either is on. The `sqzdb` command generates one if you don't pass `--token`. |
 | `listen.app` | none | The app API for browsers and mobile apps (`--app`). Users sign in; no shared token. See [the app API](#the-app-api-sql-from-the-browser). |
 | `app.origins` | `[]` | Web origins whose pages may call the app API, besides its own. `"*"` allows any. |
 | `app.publicUrl` | none | The URL the app API is reached at. Needed for provider sign-in. |
@@ -907,7 +909,7 @@ The same settings as a file, for operators. Strings may reference environment va
 an unset variable is an error.
 
 ```toml
-# /etc/sqweezdb/orders.toml
+# /etc/sqzdb/orders.toml
 durable = true
 
 [backup]
@@ -1003,7 +1005,7 @@ accepted and then ignored.
 
 ### Error codes
 
-Every binding reports errors with a stable code. In Node it is `err.code` on a `SqweezError`.
+Every binding reports errors with a stable code. In Node it is `err.code` on a `SqzError`.
 
 | Code | Meaning |
 |---|---|
@@ -1062,16 +1064,16 @@ Three apps, each benchmarked against the same app on PocketBase 0.40.5:
 Requirements: Rust 1.85 or newer, and for the bindings Node 20+, Python 3.11+ or Go 1.24+.
 
 ```sh
-make                 # the sqweezdb command, in target/dist/sqweezdb
+make                 # the sqzdb command, in target/dist/sqzdb
 make test            # the test suite
 make install         # build and install the command to ~/.local/bin (PREFIX=… to change)
-make node            # bindings/node/sqweezdb.node
-make python          # bindings/python/sqweezdb.so
+make node            # bindings/node/sqzdb.node
+make python          # bindings/python/sqzdb.so
 make go              # the C library, then the Go package
 make dist            # a release tarball and its checksum
 ```
 
-`cargo build --release` builds the engine and the C library, `target/release/libsqweezdb.so`. The web
+`cargo build --release` builds the engine and the C library, `target/release/libsqzdb.so`. The web
 console is the default `ui` feature; build with `--no-default-features` for the smallest library.
 
 ## Contributing
@@ -1086,29 +1088,29 @@ console is the default `ui` feature; build with `--no-default-features` for the 
 - `src/net.rs`: the socket, shared-memory ring and TCP server
 - `src/config.rs`: options, configuration files and validation
 - `src/ui.rs`, `src/ui/index.html`: the web console
-- `src/main.rs`: the `sqweezdb` command
+- `src/main.rs`: the `sqzdb` command
 - `src/capi.rs`: the C ABI
 - `src/tenants.rs`: many databases in one process
 - `bindings/`: Node, Python and Go
 - `clients/js`: the JavaScript client for the app API
 - `demos/`: example apps, each with a benchmark against PocketBase
 
-Design decisions are made with benchmarks. The programs in `src/bin/` race sqweezdb against SQLite and
+Design decisions are made with benchmarks. The programs in `src/bin/` race sqzdb against SQLite and
 Turso on the same machine, one question each; their outputs are in `results/`. They need the `lab`
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.9.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.10.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 
 ## Project status
 
-sqweezdb is experimental and pre-1.0. Expect breaking changes to the file format and the APIs before
+sqzdb is experimental and pre-1.0. Expect breaking changes to the file format and the APIs before
 1.0, and keep backups of anything that matters.
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-sqweezdb is released under the [MIT License](LICENSE).
+sqzdb is released under the [MIT License](LICENSE).

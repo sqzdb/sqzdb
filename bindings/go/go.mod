@@ -1,4 +1,4 @@
-module github.com/iluxav/sqweezdb/bindings/go
+module github.com/sqzdb/sqzdb/bindings/go
 
 go 1.24
 

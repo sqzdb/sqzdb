@@ -86,7 +86,7 @@ impl Sql {
     pub fn vectors_start(self: &Arc<Self>) {
         if self.cfg.embed.is_none() || self.vectors.started.swap(true, Ordering::AcqRel) { return; }
         let weak = Arc::downgrade(self);
-        std::thread::Builder::new().name("sqweezdb-embed".into()).spawn(move || {
+        std::thread::Builder::new().name("sqzdb-embed".into()).spawn(move || {
             let mut wait = Duration::from_secs(5);
             loop {
                 let Some(sql) = weak.upgrade() else { return };
@@ -153,7 +153,7 @@ mod tests {
     use crate::config::Config;
     use crate::sql::{error_code, Session};
     use std::io::{Read, Write};
-    fn tmp(n: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqweezdb-vector-{}-{n}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
+    fn tmp(n: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqzdb-vector-{}-{n}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
     fn app(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
     fn f(v: &Value) -> f64 { match v { Value::Float(x) => *x, v => panic!("{v:?}") } }
     /// An OpenAI-style embeddings endpoint whose vectors count a text's words in `dims` buckets (so texts sharing
@@ -250,7 +250,7 @@ mod timing {
     use crate::sql::Session;
     /// Where an exact search's time goes (run with --ignored --nocapture).
     #[test] #[ignore] fn search_costs() {
-        let d = std::env::temp_dir().join(format!("sqweezdb-vector-timing-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let d = std::env::temp_dir().join(format!("sqzdb-vector-timing-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap(); let mut a = Session::default();
         s.exec_s(&mut a, "CREATE TABLE docs (id SERIAL PRIMARY KEY, e VECTOR(384))", &[]).unwrap();
         let mut r = 1u64; let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; (r % 1000) as f64 / 1000.0 - 0.5 };
