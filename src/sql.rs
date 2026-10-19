@@ -278,7 +278,7 @@ fn literal_tok(t: &str) -> Result<Value, String> {
     match t.to_uppercase().as_str() { "TRUE" => Ok(Value::Bool(true)), "FALSE" => Ok(Value::Bool(false)), _ => Err(format!("bad literal {t}")) }
 }
 fn priv_of(t: &str) -> Result<u8, String> { match t.to_uppercase().as_str() { "SELECT" => Ok(P_SELECT), "INSERT" => Ok(P_INSERT), "UPDATE" => Ok(P_UPDATE), "DELETE" => Ok(P_DELETE), "ALL" => Ok(P_SELECT | P_INSERT | P_UPDATE | P_DELETE), x => Err(format!("unknown privilege {x}")) } }
-pub fn is_admin_stmt(sql: &str) -> bool { let u = sql.trim_start().to_uppercase(); (u.starts_with("ALTER TABLE ") && (u.contains(" ENABLE AUTH") || u.contains(" DISABLE AUTH"))) || u.starts_with("CREATE ROLE ") || u.starts_with("CREATE USER ") || u.starts_with("GRANT ") || u.starts_with("CREATE POLICY ") || u.starts_with("CREATE INDEX ") }
+pub fn is_admin_stmt(sql: &str) -> bool { let u = sql.trim_start().to_uppercase(); (u.starts_with("ALTER TABLE ") && (u.contains(" ENABLE AUTH") || u.contains(" DISABLE AUTH"))) || u.starts_with("CREATE ROLE ") || u.starts_with("CREATE USER ") || u.starts_with("GRANT ") || u.starts_with("CREATE POLICY ") || u.starts_with("CREATE INDEX ") || u.starts_with(crate::functions::FUNCTIONS_META) }
 
 fn obj_name(n: &ObjectName) -> String { n.0.iter().map(|p| match p { ObjectNamePart::Identifier(i) => i.value.clone(), other => format!("{other}") }).collect::<Vec<_>>().join(".") }
 /// A column default: a constant, or a generator evaluated per row. A constant is checked against the column type now.
@@ -391,14 +391,42 @@ fn plan_tables(sp: &SelectPlan, out: &mut Vec<Arc<Table>>) {
     for p in preds { expr_tables(&p.rhs, out); }
     for (q, _) in &sp.subs { plan_tables(q, out); }
     for x in sp.exprs.iter().chain(&sp.filters) { sexpr_tables(x, out); }
+    if let Some(p) = &sp.post { for (_, x) in &p.exprs { sexpr_tables(x, out); } if let Some(h) = &p.having { sexpr_tables(h, out); } }
 }
-/// A read inside a transaction sees committed data only, so reading a table the transaction has written would miss its
-/// own rows (E54): refused until reads see the transaction's writes.
-fn written_and_read(t: &Txn, sp: &SelectPlan) -> Option<String> {
-    if t.writes.is_empty() { return None; }
-    let mut read = vec![]; plan_tables(sp, &mut read);
-    if sp.join.is_none() && matches!(sp.access, Access::Pk(_)) { read.remove(0); }   // a lookup by primary key reads through the transaction (txn_get)
-    written_among(t, &read)
+/// What a statement reads inside a transaction: (tables it reads through the transaction's own view, `drive` and
+/// `matching_keys`; tables it reads committed rows of only: joins, subqueries, INSERT … SELECT). Reads by primary key
+/// are left out: they go through the transaction (`txn_get`) and are validated row by row.
+fn txn_reads(plan: &Plan) -> (Vec<Arc<Table>>, Vec<Arc<Table>>) {
+    let (mut own, mut committed) = (vec![], vec![]);
+    match plan {
+        Plan::Select(sp) => { plan_tables(sp, &mut committed); let main = committed.remove(0); if sp.join.is_some() { committed.insert(0, main); } else if !matches!(sp.access, Access::Pk(_)) { own.push(main); } }
+        Plan::Const { exprs, .. } => for x in exprs { sexpr_tables(x, &mut committed); },
+        Plan::Insert { table, rows, from, conflict, .. } => {
+            for r in rows { for e in r { expr_tables(e, &mut committed); } }
+            if let Some(f) = from { if let Plan::Select(sp) = &*f.plan { plan_tables(sp, &mut committed); } }
+            if !matches!(conflict, Conflict::None) { own.push(table.clone()); }   // an upsert looks its rows up (a UNIQUE value: committed)
+        }
+        Plan::Update { table, sets, at, .. } => {
+            for (_, v) in sets { match v { SetVal::Value(e) => expr_tables(e, &mut committed), SetVal::Row(x) => sexpr_tables(x, &mut committed) } }
+            match at { UpdWhere::Pk(e) => expr_tables(e, &mut committed), UpdWhere::Rows { access, preds, filters } => { if !matches!(access, Access::Pk(_)) { own.push(table.clone()); } for p in preds { expr_tables(&p.rhs, &mut committed); } for x in filters { sexpr_tables(x, &mut committed); } } }
+        }
+        Plan::Delete { table, access, preds, filters } => { if !matches!(access, Access::Pk(_)) { own.push(table.clone()); } for p in preds { expr_tables(&p.rhs, &mut committed); } for x in filters { sexpr_tables(x, &mut committed); } }
+        _ => {}
+    }
+    (own, committed)
+}
+/// What an access path reaches, for rows no index holds yet (a transaction's own): every row, one key, one UNIQUE
+/// value, a range of keys, or one value of an indexed column. The same tests `with_unique` and `index_lookup` make.
+enum Reach { All, Key(crate::table::Key), Unique(usize, Vec<u8>), Range(i128, i128), Index(usize, crate::table::Key) }
+impl Reach {
+    fn holds(&self, schema: &Schema, row: &[u8]) -> bool {
+        match self {
+            Reach::All => true, Reach::Key(k) => schema.key_of(row) == *k,
+            Reach::Unique(c, k) => crate::table::col_key(schema, row, *c) == Some(&k[..]),
+            Reach::Range(a, b) => (*a..=*b).contains(&schema.key_of(row)),
+            Reach::Index(c, k) => crate::table::col_key128(schema, row, *c) == Some(*k),
+        }
+    }
 }
 fn written_among(t: &Txn, read: &[Arc<Table>]) -> Option<String> {
     t.writes.iter().map(|w| match w { TxnWrite::Insert { table, .. } | TxnWrite::Update { table, .. } | TxnWrite::Delete { table, .. } => table }).find(|w| read.iter().any(|r| Arc::ptr_eq(r, w))).map(|t| t.schema.name.clone())
@@ -1629,11 +1657,13 @@ pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Pre
     pub(crate) files: crate::files::FilesState,
     /// VECTOR columns: the embedder and its caches (see `vector.rs`).
     pub(crate) vectors: crate::vector::VectorState,
+    /// The application's functions: the deploy in use and its QuickJS instances (see `functions.rs`).
+    pub(crate) functions: crate::functions::FunctionsState,
     /// `<dir>/.lock`, held while open. Declared last: fields drop in order, so the lock is released only after `db`
     /// (and with it the log threads) has gone.
     dir_lock: Mutex<Option<std::fs::File>> }
 /// Background work `open_with` started for this database; stopped by `close` (or when the last handle drops).
-#[derive(Default)] pub struct Services { pub uploader: Option<crate::cloud::Uploader>, pub files_backup: Option<crate::files::FilesBackup>, pub puller: Option<crate::cloud::BucketPuller>, pub follower: Option<Follower>, snapshotter: Option<(Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>, listeners: Vec<crate::net::Listener>, pub snapshots: Arc<std::sync::atomic::AtomicU64> }
+#[derive(Default)] pub struct Services { pub uploader: Option<crate::cloud::Uploader>, pub files_backup: Option<crate::files::FilesBackup>, pub puller: Option<crate::cloud::BucketPuller>, pub follower: Option<Follower>, functions_watch: Option<crate::functions::Watcher>, snapshotter: Option<(Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>, listeners: Vec<crate::net::Listener>, pub snapshots: Arc<std::sync::atomic::AtomicU64> }
 impl Drop for Sql { fn drop(&mut self) { self.close(); } }
 impl Sql { /// The reactive layer for this database (started on first use).
     pub fn reactor(self: &Arc<Self>) -> Arc<crate::live::Reactor> { self.live.get_or_init(|| crate::live::Reactor::start(self.clone())).clone() } }
@@ -1694,7 +1724,7 @@ pub struct Follower { pub applied: Arc<std::sync::atomic::AtomicU64>, stop: Arc<
 impl Follower { pub fn applied(&self) -> u64 { self.applied.load(std::sync::atomic::Ordering::Acquire) } }
 impl Drop for Follower { fn drop(&mut self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); if let Some(h) = self.thread.take() { h.join().ok(); } } }
 impl Sql {
-    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), files: Default::default(), vectors: Default::default(), dir_lock: Mutex::new(None) } }
+    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), files: Default::default(), vectors: Default::default(), functions: Default::default(), dir_lock: Mutex::new(None) } }
     /// Build the new schema and the old-row -> new-row converter for a list of ALTER operations.
     fn alter_schema(old: &Schema, ops: &[AlterOp]) -> Result<(Schema, Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>), String> {
         // working list: (column, source: Some(old index) | None, default, retyped from old type)
@@ -1806,6 +1836,12 @@ impl Sql {
         for (name, _) in sql.db.tables_with_shadow() { sql.resume_copy(name); }   // resume an interrupted ALTER
         *sql.dir_lock.lock().unwrap() = Some(lock);
         let mut sv = Services::default();
+        // the app's functions, before any listener: no request finds them missing
+        if let Some(d) = &cfg.functions.dir {
+            let seen = crate::functions::fingerprint(d);
+            sql.deploy_functions_from(d).map_err(|e| format!("functions: {e}"))?;
+            if cfg.functions.watch { sv.functions_watch = Some(crate::functions::Watcher::start(&sql, d.clone(), seen)); }
+        }
         if let Some(b) = &cfg.backup {
             let up = crate::cloud::start_uploader(b.cloud(), dir.to_path_buf(), db.log.clone());
             if cfg.durable == Durability::Cloud { db.log.set_cloud_wait(true, Some(up.kick.clone())); }
@@ -1847,7 +1883,7 @@ impl Sql {
             sv.listeners.clear();
             if let Some((stop, h)) = sv.snapshotter.take() { stop.store(true, std::sync::atomic::Ordering::Relaxed); h.thread().unpark(); if h.thread().id() != std::thread::current().id() { h.join().ok(); } }
             self.db.log.set_cloud_wait(false, None);
-            sv.files_backup.take(); sv.uploader.take(); sv.puller.take(); sv.follower.take();
+            sv.functions_watch.take(); sv.files_backup.take(); sv.uploader.take(); sv.puller.take(); sv.follower.take();
         }
         if let Some(r) = self.live.get() { r.shutdown(); }
     }
@@ -1934,6 +1970,7 @@ impl Sql {
     /// Execute a catalog statement (DDL or ACL) without logging it.
     fn apply_meta(&self, text: &str) -> Result<(), String> {
         if text == LONG_TEXT_ERA { self.db.long_era.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
+        if let Some(j) = text.strip_prefix(crate::functions::FUNCTIONS_META) { self.functions_from_catalog(j); return Ok(()); }
         let legacy = !self.db.long_era.load(std::sync::atomic::Ordering::Acquire);
         LEGACY_TEXT.with(|l| l.set(legacy)); let r = self.apply_meta_in(text); LEGACY_TEXT.with(|l| l.set(false)); r
     }
@@ -1966,10 +2003,14 @@ impl Sql {
         let Plan::CreateTable(schema, _) = pl.plan(&stmts[0])? else { return Err("not a CREATE TABLE".into()) };
         self.db.create_table(schema)?; self.log_meta(ddl); self.cache.lock().unwrap().clear(); Ok(())
     }
-    fn log_meta(&self, text: &str) {
+    fn log_meta(&self, text: &str) { self.log_meta_as(text, None) }
+    /// A catalog statement that takes the place of every earlier one starting with `prefix` (a deploy of functions:
+    /// snapshots keep only the latest).
+    pub(crate) fn log_meta_replacing(&self, prefix: &str, text: &str) { self.log_meta_as(text, Some(prefix)) }
+    fn log_meta_as(&self, text: &str, replaces: Option<&str>) {
         // the first catalog statement this version logs in a database: say first that TEXT means any length from here on
         if !self.db.long_era.swap(true, std::sync::atomic::Ordering::AcqRel) { self.db.log.append_meta(LONG_TEXT_ERA); }
-        let seq = self.db.log.append_meta(text); if self.db.durable { self.db.log.wait_durable(seq); }
+        let seq = self.db.log.append_meta_replacing(text, replaces); if self.db.durable { self.db.log.wait_durable(seq); }
     }
     /// Bind a session to a named user (roles and attributes are copied in). A session without a user is the embedding
     /// application itself and is unrestricted.
@@ -2101,7 +2142,7 @@ impl Sql {
         Ok(p)
     }
     pub fn exec(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { let p = self.prepare(sql)?; self.execute(&p, params) }
-    pub fn exec_s(&self, sess: &mut Session, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { if is_admin_stmt(sql) { if let Some(n) = tokens(sql).iter().find(|x| crate::auth::is_system(x)) { return Err(format!("{n} is a system table")); } self.admin(sess, sql)?; self.log_meta(sql); return Ok(vec![]); } let p = self.prepare(sql)?; self.execute_s(sess, &p, params) }
+    pub fn exec_s(&self, sess: &mut Session, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { if let Some(j) = sql.trim_start().get(..crate::functions::FUNCTIONS_META.len()).filter(|p| p.eq_ignore_ascii_case(crate::functions::FUNCTIONS_META)).map(|p| &sql.trim_start()[p.len()..]) { return self.deploy_statement(sess, j); } if is_admin_stmt(sql) { if let Some(n) = tokens(sql).iter().find(|x| crate::auth::is_system(x)) { return Err(format!("{n} is a system table")); } self.admin(sess, sql)?; self.log_meta(sql); return Ok(vec![]); } let p = self.prepare(sql)?; self.execute_s(sess, &p, params) }
     pub fn execute(&self, p: &Prepared, params: &[Value]) -> Result<Vec<Vec<Value>>, String> { let mut s = Session::default(); self.execute_s(&mut s, p, params) }
 
     fn resolve(&self, sess: &Session, e: &Expr, params: &[Value]) -> Result<Value, String> {
@@ -2183,13 +2224,20 @@ impl Sql {
         self.check_identity(sess)?;
         if params.len() < p.nparams { return Err(format!("statement needs {} parameters, got {}", p.nparams, params.len())); }
         if p.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire) { let p2 = self.prepare(&p.text)?; return self.execute_s(sess, &p2, params); }  // a schema change swapped the table under this plan
+        // inside a transaction: what it reads of committed rows only must not be a table it has written (it would miss
+        // its own rows, E54), and every table it reads other than by key is checked again at its commit
+        if let Some(t) = sess.txn.as_mut() {
+            let (own, committed) = txn_reads(&p.plan);
+            if let Some(n) = written_among(t, &committed) { return Err(own_writes(&n)); }
+            for x in own.iter().chain(&committed) { t.scanned(x); }
+        }
         match &p.plan {
             Plan::Alter { table, ops } => { if sess.user.is_some() { return Err("permission denied: only the application session can alter tables".into()); } self.alter(&p.text, table, ops, true)?; Ok(vec![]) }
             Plan::CreateTable(s, if_not_exists) => { if sess.user.is_some() { return Err("permission denied: only the application session can create tables".into()); } if crate::auth::is_system(&s.name) { return Err(format!("{}: names starting with _auth_ or _sqz_ are reserved for the engine", s.name)); } if *if_not_exists && self.db.table(&s.name).is_some() { return Ok(vec![]); } self.db.create_table(s.clone())?; self.log_meta(&p.text); Ok(vec![]) }
             Plan::Const { exprs, .. } => { let xs = self.bind(sess, exprs, params)?; Ok(vec![xs.iter().map(|x| x.eval(&|_| Value::Null)).collect::<Result<Vec<_>, _>>()?]) }
             Plan::Begin => { if sess.txn.is_some() { return Err("already in a transaction".into()); } sess.txn = Some(Txn::new()); Ok(vec![]) }
             Plan::Rollback => { sess.txn = None; Ok(vec![]) }
-            Plan::Commit => { let t = sess.txn.take().ok_or("not in a transaction")?; sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; Ok(vec![]) }
+            Plan::Commit => { let t = sess.txn.take().ok_or("not in a transaction")?; if let Some(e) = &t.doomed { return Err(e.clone()); } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; Ok(vec![]) }
             Plan::Insert { table, rows, returning, from, conflict } => {
                 let policy = self.guard(sess, table, P_INSERT)?;
                 let schema = &table.schema; let mut encoded = Vec::with_capacity(rows.len()); let mut last_id = 0; let mut last_key: Option<Value> = None;
@@ -2215,7 +2263,7 @@ impl Sql {
                 if !plain { for exprs in rows { all.push(exprs.iter().map(|e| fill_value(e)).collect::<Result<Vec<_>, _>>()?); } }
                 if let Some(f) = from {
                     let src = match &*f.plan {
-                        Plan::Select(sp) => { if let Some(t) = &sess.txn { if let Some(n) = written_and_read(t, sp) { return Err(own_writes(&n)); } } self.run_select(sess, sp, params)? }
+                        Plan::Select(sp) => self.run_select(sess, sp, params)?,
                         Plan::Const { exprs, .. } => { let xs = self.bind(sess, exprs, params)?; vec![xs.iter().map(|x| x.eval(&|_| Value::Null)).collect::<Result<Vec<_>, _>>()?] }
                         _ => unreachable!(),
                     };
@@ -2251,12 +2299,6 @@ impl Sql {
                 Ok(match returning { None => vec![], Some(cols) => encoded.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() })
             }
             Plan::Update { table, sets, at, returning } => {
-                if let Some(t) = &sess.txn {
-                    // by primary key an update reads through the transaction; any other condition reads committed rows only
-                    let mut read = vec![]; for (_, v) in sets { match v { SetVal::Value(e) => expr_tables(e, &mut read), SetVal::Row(x) => sexpr_tables(x, &mut read) } }
-                    match at { UpdWhere::Pk(e) => expr_tables(e, &mut read), UpdWhere::Rows { access, preds, filters } => { if !matches!(access, Access::Pk(_)) { read.push(table.clone()); } for p in preds { expr_tables(&p.rhs, &mut read); } for x in filters { sexpr_tables(x, &mut read); } } }
-                    if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); }
-                }
                 let policy = self.guard(sess, table, P_UPDATE)?;
                 // reading the rows' values (a WHERE beyond the key, a SET over the row, RETURNING) needs SELECT, as in
                 // PostgreSQL, and reaches only rows the SELECT policy shows; otherwise RETURNING or the count would
@@ -2305,11 +2347,6 @@ impl Sql {
                 Ok(changed.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect())
             }
             Plan::Delete { table, access, preds, filters } => {
-                if let Some(t) = &sess.txn {
-                    // by primary key a delete finds the transaction's own rows; any other condition reads committed rows only
-                    let mut read = vec![]; if !matches!(access, Access::Pk(_)) { read.push(table.clone()); } for p in preds { expr_tables(&p.rhs, &mut read); } for x in filters { sexpr_tables(x, &mut read); }
-                    if let Some(n) = written_among(t, &read) { return Err(own_writes(&n)); }
-                }
                 let mut policy = self.guard(sess, table, P_DELETE)?;
                 // a condition beyond `key = value` reads the rows: SELECT, and its policy, as for UPDATE
                 if !(matches!(access, Access::Pk(_)) && preds.is_empty() && filters.is_empty()) { policy.append(&mut self.guard(sess, table, P_SELECT)?); }
@@ -2324,7 +2361,7 @@ impl Sql {
                 }
                 Ok(vec![vec![Value::Int(n as i64)]])
             }
-            Plan::Select(s) => { if let Some(t) = &sess.txn { if let Some(name) = written_and_read(t, s) { return Err(own_writes(&name)); } } let pol = match &s.join { Some(j) => { let mut v = vec![self.guard(sess, &j.probe, P_SELECT)?]; for st in &j.steps { v.push(self.guard(sess, &st.build, P_SELECT)?); } v }, None => vec![self.guard(sess, &s.table, P_SELECT)?] }; let (txn, sref) = (sess.txn.take(), &*sess); let r = { let mut txn = txn; let r = self.select(sref, s, params, txn.as_mut(), pol); (r, txn) }; sess.txn = r.1; r.0 }
+            Plan::Select(s) => { let pol = match &s.join { Some(j) => { let mut v = vec![self.guard(sess, &j.probe, P_SELECT)?]; for st in &j.steps { v.push(self.guard(sess, &st.build, P_SELECT)?); } v }, None => vec![self.guard(sess, &s.table, P_SELECT)?] }; let (txn, sref) = (sess.txn.take(), &*sess); let r = { let mut txn = txn; let r = self.select(sref, s, params, txn.as_mut(), pol); (r, txn) }; sess.txn = r.1; r.0 }
         }
     }
 
@@ -2398,17 +2435,47 @@ impl Sql {
         let mut sub = |q: &Arc<SelectPlan>| -> Result<Value, String> { Ok(self.run_select(sess, q, params)?.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null)) };
         xs.iter().map(|x| x.bind(params, &mut sub).and_then(|x| x.fold_vectors(&mut |t| self.embed_query(t)))).collect()
     }
-    /// Feed the rows of a single-table SELECT's access path to `visit` (stops when it returns false).
+    /// Feed the rows of a single-table SELECT's access path to `visit` (stops when it returns false). Inside a
+    /// transaction that wrote the table, the rows are its own view: committed rows it changed are skipped, and the rows
+    /// it wrote that the path reaches follow.
     #[inline(always)] fn drive<V: FnMut(&[u8]) -> bool>(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, visit: &mut V) -> Result<(), String> {
-        let (t, schema) = (&s.table, &s.schema);
-        match &s.access {
-            Access::Pk(e) => { let pk = t.schema.key_from_value(&self.resolve(sess, e, params)?)?; match txn { Some(tx) => { if let Some(row) = t.txn_get(tx, pk) { visit(&row); } } None => { t.with_pk(pk, |r| visit(r)); } } }
+        let t = &s.table;
+        if let Access::Pk(e) = &s.access {
+            let pk = t.schema.key_from_value(&self.resolve(sess, e, params)?)?;
+            match txn { Some(tx) => { if let Some(row) = t.txn_get(tx, pk) { visit(&row); } } None => { t.with_pk(pk, |r| visit(r)); } }
+            return Ok(());
+        }
+        match txn.map(|x| &*x).filter(|x| x.wrote(t)) {
+            None => self.reach(sess, t, &s.access, params, visit),
+            Some(tx) => {
+                let reached = self.reaches(sess, &t.schema, &s.access, params)?; let mut going = true;
+                self.reach(sess, t, &s.access, params, &mut |r: &[u8]| { if tx.shadows(t, t.schema.key_of(r)) { return true; } going = visit(r); going })?;
+                if going { for r in tx.own_rows(t) { if reached.holds(&t.schema, r) && !visit(r) { break; } } }
+                Ok(())
+            }
+        }
+    }
+    /// The committed rows an access path reaches.
+    #[inline(always)] fn reach<V: FnMut(&[u8]) -> bool>(&self, sess: &Session, t: &Arc<Table>, access: &Access, params: &[Value], visit: &mut V) -> Result<(), String> {
+        let schema = &t.schema;
+        match access {
+            Access::Pk(e) => { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; t.with_pk(pk, |r| visit(r)); }
             Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let key = crate::table::lookup_key(ty, &v)?; t.with_unique(&key, |r| visit(r)); }
             Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } t.range(a, b, visit); }
-            Access::Index(ix, e) => { let k = index_key(&t.schema, ix.col, &self.resolve(sess, e, params)?)?; t.index_lookup(ix, k, visit); }
+            Access::Index(ix, e) => { let k = index_key(schema, ix.col, &self.resolve(sess, e, params)?)?; t.index_lookup(ix, k, visit); }
             Access::Scan => t.scan(visit),
         }
         Ok(())
+    }
+    /// What an access path reaches, as a test on a row: for a transaction's own rows, which no index holds yet.
+    fn reaches(&self, sess: &Session, schema: &Schema, access: &Access, params: &[Value]) -> Result<Reach, String> {
+        Ok(match access {
+            Access::Pk(e) => Reach::Key(schema.key_from_value(&self.resolve(sess, e, params)?)?),
+            Access::Unique(e) => { let u = schema.unique.unwrap(); Reach::Unique(u, crate::table::lookup_key(&schema.columns[u].ty, &self.resolve(sess, e, params)?)?) }
+            Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } Reach::Range(a as i128, b as i128) }
+            Access::Index(ix, e) => Reach::Index(ix.col, index_key(schema, ix.col, &self.resolve(sess, e, params)?)?),
+            Access::Scan => Reach::All,
+        })
     }
     /// The keys of the rows a one-table write's WHERE selects: through its access path, then its compiled predicates
     /// (row policies included) and expression conditions. Inside a transaction a lookup by key sees its own writes.
@@ -2420,12 +2487,17 @@ impl Sql {
             for f in filters { match f.eval(&|c| decode_col(schema, row, c)).and_then(|v| crate::expr::truth(&v)) { Ok(Some(true)) => {} Ok(_) => return true, Err(e) => { ferr.get_or_insert(e); return false; } } }
             pks.push(schema.key_of(row)); true
         };
-        match access {
-            Access::Pk(e) => { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; match &mut sess.txn { Some(t) => { if let Some(r) = table.txn_get(t, pk) { collect(&r); } } None => { table.with_pk(pk, |r| collect(r)); } } }
-            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let key = crate::table::lookup_key(ty, &v)?; table.with_unique(&key, |r| collect(r)); }
-            Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } table.range(a, b, &mut collect); }
-            Access::Index(ix, e) => { let k = index_key(schema, ix.col, &self.resolve(sess, e, params)?)?; table.index_lookup(ix, k, &mut collect); }
-            Access::Scan => table.scan(&mut collect),
+        // inside a transaction: by key through it; otherwise its own view, as a SELECT's (`drive`)
+        if let (Access::Pk(e), true) = (access, sess.txn.is_some()) { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; if let Some(r) = sess.txn.as_mut().and_then(|t| table.txn_get(t, pk)) { collect(&r); } }
+        else {
+            match sess.txn.as_ref().filter(|t| t.wrote(table)) {
+                None => self.reach(sess, table, access, params, &mut collect)?,
+                Some(t) => {
+                    let reached = self.reaches(sess, schema, access, params)?; let mut going = true;
+                    self.reach(sess, table, access, params, &mut |r: &[u8]| { if t.shadows(table, schema.key_of(r)) { return true; } going = collect(r); going })?;
+                    if going { for r in t.own_rows(table) { if reached.holds(schema, r) && !collect(r) { break; } } }
+                }
+            }
         }
         match ferr { Some(e) => Err(e), None => Ok(pks) }
     }
@@ -2494,7 +2566,7 @@ impl Sql {
         if let Some(j) = &s.join { self.run_joins(sess, j, params, &preds, &mut sink, policies)?; if let Some(e) = sink.err.take() { return Err(e); } return Ok(sink.finish()); }
         preds.append(&mut policies.pop().unwrap_or_default());
         let t = &s.table;
-        let covering = preds.is_empty() && sink.count_only() && sink.group_by.is_none();
+        let covering = preds.is_empty() && sink.count_only() && sink.group_by.is_none() && !txn.as_deref().is_some_and(|x| x.wrote(t));
         if let (true, Access::Index(ix, e)) = (covering, &s.access) { if matches!(t.schema.columns[ix.col].ty, ColType::Int | ColType::Timestamp) { let k = index_key(&t.schema, ix.col, &self.resolve(sess, e, params)?)?; let n = ix.count(crate::table::fold_key(k)) as u64; sink.push_count(&[], n); return Ok(sink.finish()); } }
         // two loops, so a query without expression conditions pays nothing per row for them
         if sink.filters.is_empty() { let mut visit = |row: &[u8]| -> bool { for p in &preds { if !p.eval(row) { return true; } } sink.push(row) }; self.drive(sess, s, params, txn, &mut visit)?; }
@@ -3335,22 +3407,43 @@ mod unsupported_tests {
     }
     /// A read inside a transaction sees committed rows only, so reading a table the transaction wrote is refused; a
     /// delete by primary key finds the transaction's own rows and stays allowed.
-    #[test] fn a_transaction_does_not_silently_miss_its_own_writes() {
+    #[test] fn a_transaction_reads_its_own_writes() {
         let (s, d) = db("txn");
+        let q = |se: &mut Session, q: &str| s.exec_s(se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let col = |rows: Vec<Vec<Value>>| rows.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>();
+        let names = |v: &[&str]| v.iter().map(|n| Value::Text(n.to_string())).collect::<Vec<_>>();
         let mut se = Session::default();
-        s.exec_s(&mut se, "BEGIN", &[]).unwrap();
-        assert_eq!(s.exec_s(&mut se, "SELECT count(*) FROM users", &[]).unwrap()[0][0], Value::Int(3), "reads before writing are fine");
-        s.exec_s(&mut se, "INSERT INTO users VALUES (5, 'eve', 20, 1)", &[]).unwrap();
-        for q in ["SELECT count(*) FROM users", "SELECT count(*) FROM orders WHERE user_id IN (SELECT id FROM users)", "DELETE FROM users WHERE age < 22", "SELECT o.amount FROM orders o JOIN users u ON u.id = o.user_id"] {
-            let e = s.exec_s(&mut se, q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}")); assert_eq!(error_code(&e), "TRANSACTION", "{q}: {e}");
+        q(&mut se, "CREATE INDEX users_grp ON users (grp)"); q(&mut se, "CREATE TABLE tags (id SERIAL PRIMARY KEY, name TEXT UNIQUE)");
+        q(&mut se, "BEGIN");
+        assert_eq!(q(&mut se, "SELECT count(*) FROM users")[0][0], Value::Int(3), "reads before writing are fine");
+        q(&mut se, "INSERT INTO users VALUES (5, 'eve', 20, 1)");
+        q(&mut se, "UPDATE users SET age = 26 WHERE id = 2");
+        // a scan: bob once, as the transaction changed him; eve, whom it added
+        assert_eq!(q(&mut se, "SELECT count(*) FROM users")[0][0], Value::Int(4));
+        assert_eq!(col(q(&mut se, "SELECT name FROM users WHERE age < 27 ORDER BY id")), names(&["bob", "eve"]));
+        // an index (and its count, which would otherwise come from the index alone), a key range, a UNIQUE value
+        assert_eq!(q(&mut se, "SELECT count(*) FROM users WHERE grp = 1")[0][0], Value::Int(3));
+        assert_eq!(col(q(&mut se, "SELECT name FROM users WHERE grp = 1 ORDER BY id")), names(&["alice", "bob", "eve"]));
+        assert_eq!(col(q(&mut se, "SELECT name FROM users WHERE id >= 2 AND id <= 5 ORDER BY id")), names(&["bob", "carol", "eve"]));
+        q(&mut se, "INSERT INTO tags (name) VALUES ('a long enough tag name to be stored past the row, as long values are')");
+        assert_eq!(q(&mut se, "SELECT count(*) FROM tags WHERE name = 'a long enough tag name to be stored past the row, as long values are'")[0][0], Value::Int(1));
+        assert_eq!(col(q(&mut se, "SELECT name FROM users ORDER BY id LIMIT 1")), names(&["alice"]));
+        // writes find the transaction's rows too
+        q(&mut se, "DELETE FROM users WHERE age < 22");
+        assert_eq!(q(&mut se, "SELECT count(*) FROM users")[0][0], Value::Int(3), "eve, added and deleted");
+        assert!(q(&mut se, "SELECT name FROM users WHERE id = 5").is_empty());
+        q(&mut se, "UPDATE users SET grp = 3 WHERE grp = 1");
+        assert_eq!(q(&mut se, "SELECT count(*) FROM users WHERE grp = 3")[0][0], Value::Int(2));
+        // a join, a subquery (in WHERE, HAVING, the select list, a SELECT without FROM) or INSERT … SELECT still reads
+        // committed rows only: refused rather than wrong
+        for x in ["SELECT count(*) FROM orders WHERE user_id IN (SELECT id FROM users)", "SELECT o.amount FROM orders o JOIN users u ON u.id = o.user_id", "INSERT INTO orders (id, user_id, amount) SELECT id + 100, id, 1 FROM users",
+                  "SELECT grp, count(*) FROM users GROUP BY grp HAVING count(*) > (SELECT count(*) FROM users)", "SELECT count(*) - (SELECT count(*) FROM users) FROM users", "SELECT (SELECT count(*) FROM users)"] {
+            let e = s.exec_s(&mut se, x, &[]).err().unwrap_or_else(|| panic!("accepted: {x}")); assert_eq!(error_code(&e), "TRANSACTION", "{x}: {e}");
         }
-        assert_eq!(s.exec_s(&mut se, "SELECT count(*) FROM orders", &[]).unwrap()[0][0], Value::Int(2), "a table it did not write is fine");
-        assert_eq!(s.exec_s(&mut se, "SELECT name FROM users WHERE id = 5", &[]).unwrap()[0][0], Value::Text("eve".into()), "a lookup by primary key sees the transaction's own row");
-        s.exec_s(&mut se, "UPDATE users SET age = 21 WHERE id = 5", &[]).unwrap();
-        s.exec_s(&mut se, "DELETE FROM users WHERE id = 2", &[]).unwrap();
-        s.exec_s(&mut se, "COMMIT", &[]).unwrap();
-        let rows = s.exec_s(&mut Session::default(), "SELECT id FROM users ORDER BY id", &[]).unwrap();
-        assert_eq!(rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), vec![Value::Int(1), Value::Int(3), Value::Int(5)]);
+        assert_eq!(q(&mut se, "SELECT count(*) FROM orders")[0][0], Value::Int(2), "a table it did not write is fine");
+        q(&mut se, "COMMIT");
+        let rows = q(&mut Session::default(), "SELECT id, age, grp FROM users ORDER BY id");
+        assert_eq!(rows, vec![vec![Value::Int(1), Value::Int(30), Value::Int(3)], vec![Value::Int(2), Value::Int(26), Value::Int(3)], vec![Value::Int(3), Value::Int(35), Value::Int(2)]]);
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 }
@@ -3532,10 +3625,11 @@ mod insert_tests {
         assert_eq!(rows(&s, "SELECT count(*) FROM kv WHERE n = 107"), vec![vec![i(1)]]);
         assert_eq!(rows(&s, "UPDATE kv SET n = 0 WHERE n = 107"), vec![vec![i(1)]]);
         assert!(rows(&s, "SELECT k FROM kv WHERE n = 107").is_empty());
-        // in a transaction: rows chosen from committed data until the transaction writes the table
+        // in a transaction: rows chosen from what the transaction sees, its own writes included
         let mut se = Session::default();
         for q in ["BEGIN", "UPDATE kv SET n = 1 WHERE n >= 100"] { s.exec_s(&mut se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")); }
-        assert_eq!(error_code(&s.exec_s(&mut se, "UPDATE kv SET n = 2 WHERE n = 1", &[]).unwrap_err()), "TRANSACTION");
+        assert_eq!(s.exec_s(&mut se, "UPDATE kv SET n = 2 WHERE n = 1", &[]).unwrap(), vec![vec![i(4)]]);
+        assert_eq!(s.exec_s(&mut se, "UPDATE kv SET n = 1 WHERE n = 2", &[]).unwrap(), vec![vec![i(4)]]);
         s.exec_s(&mut se, "COMMIT", &[]).unwrap();
         assert_eq!(rows(&s, "SELECT count(*) FROM kv WHERE n = 1"), vec![vec![i(4)]]);
         // a row policy limits which rows an UPDATE reaches, and what they may become

@@ -47,7 +47,7 @@ impl Tls {
         let certs = Arc::new(Certs::default());
         let mut config = ServerConfig::builder_with_provider(Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions().map_err(|e| format!("app.tls: {e}"))?.with_no_client_auth().with_cert_resolver(certs.clone());
-        config.alpn_protocols = vec![b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];   // HTTP/2 where the browser offers it
         match (&p.cert, &p.key) {
             (Some(c), Some(k)) => {
                 let read = |f: &PathBuf| std::fs::read(f).map_err(|e| format!("app.tls: {}: {e}", f.display()));

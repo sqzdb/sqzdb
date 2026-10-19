@@ -152,6 +152,9 @@ class Database {
     /** How rows become objects: 'auto' (default: one row built in the addon, many rows as a packed frame decoded in JS), 'native' or 'packed'. */
     this.rowMode = info.rowMode || 'auto';
   }
+  /** The name of the session cookie a site sqzdb serves sets: `__Host-sqz_session` over https, `sqz_session` over
+   *  http. In Next.js: `db.session(cookies().get(db.sessionCookie)?.value)`. */
+  get sessionCookie() { try { return this._db.sessionCookie(); } catch (e) { throw wrap(e); } }
   _prep(sql) {
     let e = this._stmts.get(sql);
     if (!e) { try { e = new Entry(this._db.prepare(sql)); } catch (err) { throw wrap(err); } if (this._stmts.size >= 2000) this._stmts.clear(); this._stmts.set(sql, e); }
@@ -177,6 +180,9 @@ class Database {
   all(sql, params) { return this._all(this._prep(sql), norm(params)); }
   /** A write: returns { changes, seq, durable } where `durable` is a promise for the fsync. */
   run(sql, params) { return this._run(this._prep(sql), norm(params)); }
+  /** Call one of the app's functions (`functions` when opening, or `DEPLOY FUNCTIONS`) as this handle: the app itself,
+   *  or the identity of `as()` / `session()`. Returns what the function returned; throws SqzError with its code. */
+  call(name, args) { try { return JSON.parse(this._sess.call(name, JSON.stringify(args === undefined ? {} : args))); } catch (e) { throw wrap(e); } }
   /** Resolves once everything this database handle has committed so far is on disk. */
   flush() { const seq = this._sess.lastSeq(); return seq > 0 && !this.durable ? this._db.waitDurable(seq) : Promise.resolve(); }
   /**

@@ -1,0 +1,6 @@
+{
+  "name": "sqzdb-nextjs-demo",
+  "private": true,
+  "scripts": { "build": "next build", "start": "next start -H 127.0.0.1 -p 3000", "dev": "next dev -H 127.0.0.1 -p 3000" },
+  "dependencies": { "next": "^15.5.0", "react": "^19.0.0", "react-dom": "^19.0.0", "sqzdb": "^0.11.0" }
+}

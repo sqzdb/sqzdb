@@ -4,12 +4,15 @@
 set -e
 main=$(realpath "$1"); plat=$(realpath "$2"); dir=$(mktemp -d)
 cd "$dir" && npm init -y >/dev/null && npm install --no-audit --no-fund --loglevel=error "$plat" "$main" >/dev/null
+# a function in TypeScript: the engine strips its types and runs it (and sqzdb/functions resolves in Node too)
+mkdir -p "$dir/functions" && printf "import { fn } from 'sqzdb/functions'\nexport const add = fn({ args: { body: 'text' }, run: ({ db }, { body }): number => Number(db.run('INSERT INTO notes (body) VALUES (?)', [body]).lastInsertId) })\n" > "$dir/functions/notes.ts"
 node -e "
-const { open } = require('sqzdb');
-const db = open('$dir/data');
+const { open } = require('sqzdb'); const { fn } = require('sqzdb/functions');
+if (typeof fn !== 'function') throw new Error('sqzdb/functions');
+const db = open('$dir/data', { functions: '$dir/functions' });
 db.exec('CREATE TABLE notes (id SERIAL PRIMARY KEY, body TEXT)');
-db.run('INSERT INTO notes (body) VALUES (?)', ['x'.repeat(100000)]);
-const r = db.get('SELECT length(body) AS len FROM notes WHERE id = 1');
+const id = db.call('add', { body: 'x'.repeat(100000) });
+const r = db.get('SELECT length(body) AS len FROM notes WHERE id = ?', [id]);
 if (r.len !== 100000) throw new Error('unexpected ' + JSON.stringify(r));
 db.close(); console.log('sqzdb from npm: ok on', process.platform, process.arch);
 "

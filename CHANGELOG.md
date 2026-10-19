@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.11.0 — 2026-10-19
+
+**Functions: an app's rules in the database.** You write them in TypeScript or JavaScript, in a folder of your
+app. The database strips the types, keeps the code in its catalog, and runs it in QuickJS, one transaction per
+call, as the caller. Clients call a function by name:
+- `db.call` in Node, `call` in Python, Go and C;
+- `client.call` or `POST /api/fn/<name>` from a browser;
+- MCP, where each function is a tool.
+
+### Added
+- Functions (see the README's guide):
+  - **Deploying:** a folder deploys at open (the `functions` option, `[functions] dir`, `sqzdb serve
+    --functions`) and again whenever it changes. `sqzdb deploy <folder> <dir | host:port>` deploys from the
+    command line, and the application can send `DEPLOY FUNCTIONS` as a statement. A deploy replaces the one
+    before it and travels with the catalog: logs, snapshots, backups, followers.
+  - **Who acts:** `ctx.db` acts as the caller, under their grants and row policies. `ctx.admin` acts as the
+    app, in the same transaction, for rules a caller must not get around.
+  - **Checks:** arguments are checked against `args` before the function runs; `roles` says who may call;
+    `readOnly` allows reads only.
+  - **Errors** carry codes: the function's own, the database's, `LIMIT` and `FUNCTION`. A bug points at the
+    line of the TypeScript.
+  - **Limits:** `functions.timeout` (1 s), `functions.memory` (64 MB), `functions.instances`.
+  - **Types:** `sqzdb/functions` in the npm package gives `fn()`, with types that work out each function's
+    arguments from `args`.
+- `app.mcp.sql = false`: agents get the app's functions and no SQL tools.
+- **sqzdb in front of your app** (`app.proxy`, `sqzdb serve --proxy`): requests that aren't sqzdb's own go on to
+  your app's server, such as Next.js on 127.0.0.1. The proxy:
+  - streams bodies both ways;
+  - passes WebSocket upgrades through, and no other kind (no `h2c` tunnel around middleware);
+  - keeps a pool of connections to the app, with at most `app.proxy.connections` requests in flight;
+  - tells the app who asked: `X-Forwarded-*` and `X-Real-IP`, and for a signed-in visitor `X-Sqz-User`,
+    `X-Sqz-Table` and `X-Sqz-Roles` (a client's own `X-Sqz-*` headers are dropped);
+  - shows a 502 page while the app is down, and a 503 when it's busy.
+  `demos/nextjs` is a Next.js app with sqzdb embedded and in front of it.
+- **Sessions in a cookie**, for a site sqzdb serves: `__Host-sqz_session` over https (Secure, this host only),
+  `sqz_session` over http; HttpOnly and SameSite=Lax either way. Node's `db.sessionCookie` gives the name.
+  - the API takes the cookie wherever it takes a token, from the site's own origin or one `app.origins` names
+    (`"*"` doesn't count);
+  - sign-in, sign-up and the code exchange set it with `"cookie": true`, and a provider sign-in with `?cookie=1`;
+  - sqzdb serves its own sign-in and sign-out pages at `/_sqz/sign-in` and `/_sqz/sign-out`;
+  - the browser client has a cookie mode, `connect(location.origin, { cookies: true })`.
+- **Middleware and routes**, in the functions folder:
+  - `middleware({ match, run })` runs before requests to the paths it matches go on, and can answer them or
+    set their headers;
+  - `route({ method, path, run })` answers requests itself;
+  - both get the visitor and the database, one transaction per request, at most `functions.instances` at once;
+  - paths are matched decoded, as the app will resolve them, and `req.path` is that path (`req.rawPath` as
+    sent); dot segments and encoded slashes are refused;
+  - if the deployed functions don't load, everything but sqzdb's own paths gets a 503 until they do, so the
+    site is never served without its guards.
+- `app.trustProxy`: proxies of yours in front of sqzdb; from them, the client's address is the last one in
+  `X-Forwarded-For` that isn't theirs, so the sign-in limits count visitors, not the proxy. From anyone else
+  `X-Forwarded-For` isn't believed, and `Forwarded` is dropped.
+
+### Fixed
+- **A transaction's reads other than by key were never checked at commit.** Two transactions could each count
+  rows, write, and both commit, each acting on a count the other had changed. For example, two runs of a job
+  end together, each sees one still running, and the job never moves on. Updates read by a `UNIQUE` value could
+  also be lost. Now a table read by a scan, an index, a range or a `UNIQUE` value makes the commit fail with
+  `CONFLICT` if any other write to that table became visible since, or is on its way. Retry as for any
+  conflict: `db.transaction` in Node and functions do it themselves. The check is per table, so concurrent
+  writers to a table that transactions scan conflict more often than before.
+- A batch from the app API whose sign-in ended while it ran left its transaction open on a socket session.
+- In Python, a session's state is now marked busy, not the unrestricted application session, while a call on
+  it runs with the GIL released.
+
+### Changed
+- **The app API speaks HTTP/2** (over TLS, as the browser chooses; HTTP/1.1 stays). It now runs on hyper. It
+  answers a request body over `app.maxRequest` with 413 instead of closing the connection. A connection that
+  sends nothing for 10 s, has nothing in flight for 60 s, or stops reading for 60 s is closed.
+- **A transaction reads its own writes.** A query on one table, and the rows an `UPDATE` or `DELETE` picks,
+  now see what the transaction wrote. Before, any read of a written table other than by primary key failed with
+  `TRANSACTION`. Joins, subqueries and `INSERT … SELECT` over a written table still fail that way.
+- The command and the libraries are about 4 MB larger (QuickJS, and oxc to strip TypeScript).
+
 ## 0.10.0 — 2026-10-18
 
 **sqweezdb is now sqzdb** (https://sqzdb.dev, https://github.com/sqzdb/sqzdb). What changed:

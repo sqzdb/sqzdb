@@ -151,4 +151,12 @@ fn auth_status(db: &Db, r: Result<(), String>) -> c_int { match r { Ok(()) => 0,
     let db = unsafe { &*db }; auth_result(db, db.sql.oauth_finish(&unsafe { cstr(table) }, &unsafe { cstr(provider) }, &unsafe { cstr(code) }, &unsafe { cstr(state) }, &unsafe { cstr(cookie) }))
 }
 /// Free a string this library returned.
+/// Call one of the app's functions as session `s`: `args` a JSON object. Returns what it returned as a JSON string, to
+/// free with sqzdb_free_string, or null on error (sqzdb_last_error: "CODE: message").
+#[unsafe(no_mangle)] pub unsafe extern "C" fn sqzdb_call(db: *mut Db, s: *mut Sess, name: *const c_char, args: *const c_char) -> *mut c_char {
+    let (db, s) = unsafe { (&*db, &mut *s) };
+    let r = serde_json::from_str::<serde_json::Value>(&unsafe { cstr(args) }).map_err(|e| format!("ARGUMENTS: the arguments are not JSON: {e}"))
+        .and_then(|a| db.sql.call_function(&mut s.s, &unsafe { cstr(name) }, &a, false).map_err(|e| format!("{}: {}", e.code, e.message)));
+    match r { Ok(v) => CString::new(v.to_string()).unwrap_or_default().into_raw(), Err(e) => { set_err(db, e); std::ptr::null_mut() } }
+}
 #[unsafe(no_mangle)] pub unsafe extern "C" fn sqzdb_free_string(p: *mut c_char) { if !p.is_null() { drop(unsafe { CString::from_raw(p) }); } }

@@ -1,0 +1,17 @@
+functions: app.ts: park is for role member, which doesn't exist (yet)
+next start, until the API in front of it answers                 217 ms
+ ⨯ Error [SqzError]: a title of at least 3 characters
+    at n (.next/server/app/dashboard/page.js:1:736)
+    at async l (.next/server/app/dashboard/page.js:1:22355)
+    at async o (.next/server/app/dashboard/page.js:2:1862) {
+  code: 'TOO_SHORT'
+}
+ ⨯ Error [SqzError]: a title of at least 3 characters
+    at n (.next/server/app/dashboard/page.js:1:736)
+    at async l (.next/server/app/dashboard/page.js:1:22355)
+    at async o (.next/server/app/dashboard/page.js:2:1862) {
+  code: 'TOO_SHORT'
+}
+checks: guard, sign-up, the dashboard as the user, a server action, a route, Next.js files, HTTP/2, sign-out ok
+the home page (rendered on each request): from Next.js, through the API 1018 us, 1059 us
+a script file of Next.js: from Next.js, through the API          3051 us, 3086 us

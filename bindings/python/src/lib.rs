@@ -105,6 +105,9 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
     fn auth(&self, table: &str) -> PyAuth { PyAuth { sql: self.sql.clone(), table: table.to_string() } }
     fn snapshot(&self) -> u64 { self.sql.snapshot().rows }
 }
+/// What a session holds while its own state is away in a call that released the GIL: a sign-in that never checks
+/// out, so another thread using the same session meanwhile is refused (AUTH), never run as the application.
+fn busy() -> Session { Session { user: Some("(busy)".into()), token: Some((String::new(), u64::MAX)), ..Session::default() } }
 #[pymethods] impl PySess {
     /// Primary key of the last row this session inserted (an automatic id, or the one given); 0 before any insert.
     #[getter] fn last_insert_id<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> { match self.s.lock().unwrap().last_insert_key.clone() { Some(v) => to_py(py, &v), None => Ok(py.None().into_bound(py)) } }
@@ -127,7 +130,7 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
     fn execute<'py>(&self, py: Python<'py>, stmt: &PyStmt, params: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyList>> {
         let vals: Vec<Value> = match params { Some(p) => p.try_iter()?.map(|x| to_value(&x?)).collect::<PyResult<_>>()?, None => vec![] };
         let (sql, p) = (self.sql.clone(), stmt.p.clone());
-        let mut sess = std::mem::take(&mut *self.s.lock().unwrap());
+        let mut sess = std::mem::replace(&mut *self.s.lock().unwrap(), busy());
         let r = py.detach(|| sql.execute_s(&mut sess, &p, &vals)); *self.s.lock().unwrap() = sess;
         rows_to_py(py, r.map_err(pyo3::exceptions::PyRuntimeError::new_err)?)
     }
@@ -138,12 +141,29 @@ fn rows_to_py<'py>(py: Python<'py>, rows: Vec<Vec<Value>>) -> PyResult<Bound<'py
         let sess = std::mem::take(&mut *self.s.lock().unwrap()); let r = self.sql.reactor().subscribe(&sess, sql, &vals); *self.s.lock().unwrap() = sess;
         Ok(PySub { s: r.map_err(pyo3::exceptions::PyValueError::new_err)? })
     }
+    /// Call one of the app's functions as this session: `s.call("reportRun", {"runId": 7, "status": "failed"})`. Returns
+    /// what it returned. Raises PermissionError when the session may not call it, RuntimeError ("CODE: message") when
+    /// it fails.
+    #[pyo3(signature = (name, args = None))]
+    fn call<'py>(&self, py: Python<'py>, name: &str, args: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let json = py.import("json")?;
+        let text: String = match args { Some(a) => json.call_method1("dumps", (a,))?.extract()?, None => "{}".into() };
+        let args: serde_json::Value = serde_json::from_str(&text).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let (db, name) = (self.sql.clone(), name.to_string());
+        let mut sess = std::mem::replace(&mut *self.s.lock().unwrap(), busy());
+        let r = py.detach(|| db.call_function(&mut sess, &name, &args, false)); *self.s.lock().unwrap() = sess;
+        match r {
+            Ok(v) => json.call_method1("loads", (v.to_string(),)),
+            Err(e) if e.code == "DENIED" => Err(pyo3::exceptions::PyPermissionError::new_err(e.message)),
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{}: {}", e.code, e.message))),
+        }
+    }
     /// Execute SQL text (DDL, admin statements, one-off queries).
     #[pyo3(signature = (sql, params = None))]
     fn exec<'py>(&self, py: Python<'py>, sql: &str, params: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyList>> {
         let vals: Vec<Value> = match params { Some(p) => p.try_iter()?.map(|x| to_value(&x?)).collect::<PyResult<_>>()?, None => vec![] };
         let (db, text) = (self.sql.clone(), sql.to_string());
-        let mut sess = std::mem::take(&mut *self.s.lock().unwrap());
+        let mut sess = std::mem::replace(&mut *self.s.lock().unwrap(), busy());
         let r = py.detach(|| db.exec_s(&mut sess, &text, &vals)); *self.s.lock().unwrap() = sess;
         rows_to_py(py, r.map_err(pyo3::exceptions::PyRuntimeError::new_err)?)
     }

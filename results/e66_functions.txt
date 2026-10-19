@@ -1,0 +1,14 @@
+functions at start                                               4 from /home/iluxa/dblab/data/nocow/e66-functions (watched): myJobs, park, reportRun, startRun
+a wrong argument                                                 reportRun: status is one of "completed", "failed", not "kaput"
+ann updating runs herself                                        permission denied: user ann@x.test lacks UPDATE on runs
+part 1: app API and socket                                       ok
+MCP instructions                                                 A database you act on as the user who connected you, through its own tools: each carries out one operation, with its rules.
+a rule, as the agent sees it                                     a completed run needs an outcome
+part 2: MCP                                                      ok
+functions: deployed 5 from /home/iluxa/dblab/data/nocow/e66-functions: myJobs, park, ping, reportRun, startRun
+a new file in the folder, callable after                         1010 ms
+HTTP round trip, an empty function (ping)                        57.5 us
+HTTP round trip, SELECT 1 as /api/sql                            47.2 us
+HTTP round trip, read-only function myJobs (1 row)               57.8 us
+HTTP round trip, its SELECT as /api/sql                          52.5 us
+HTTP, park + startRun + reportRun (three calls, six writes)      233.2 us

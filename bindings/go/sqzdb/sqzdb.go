@@ -11,6 +11,7 @@ Db* sqzdb_open(const char* path, int durable); long long sqzdb_last_insert_id(Se
 Sess* sqzdb_session(Db*); void sqzdb_session_free(Sess*); int sqzdb_login(Db*, Sess*, const char*); int sqzdb_assume(Db*, Sess*, const char*);
 char* sqzdb_sign_up(Db*, const char*, const char*, const char*); char* sqzdb_sign_in(Db*, const char*, const char*, const char*); int sqzdb_sign_out(Db*, const char*);
 int sqzdb_set_password(Db*, const char*, const char*, const char*); int sqzdb_sign_out_everywhere(Db*, const char*, const char*); int sqzdb_use_token(Db*, Sess*, const char*); void sqzdb_free_string(char*);
+char* sqzdb_call(Db*, Sess*, const char*, const char*);
 char* sqzdb_oauth_start(Db*, const char*, const char*, const char*, const char*); char* sqzdb_oauth_finish(Db*, const char*, const char*, const char*, const char*, const char*);
 Stmt* sqzdb_prepare(Db*, const char*); void sqzdb_finalize(Stmt*);
 Rows* sqzdb_exec(Db*, Sess*, Stmt*, const CValue*, int); Rows* sqzdb_exec_text(Db*, Sess*, const char*, const CValue*, int);
@@ -23,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -46,6 +48,7 @@ type Options struct {
 	Live       *Live        `json:"live,omitempty"`
 	Log        *Log         `json:"log,omitempty"`
 	Auth       *AuthOptions `json:"auth,omitempty"`
+	Functions  any          `json:"functions,omitempty"` // the app's functions: a folder, or {"dir", "watch", "timeout", "memory", "instances"}
 }
 
 // AuthOptions configures sign-in: session length, the shortest password, and OAuth providers by name ("google",
@@ -198,6 +201,32 @@ type SignedIn struct {
 	Token   string
 	User    map[string]any
 	Created bool
+}
+
+// Call runs one of the app's functions (deployed from a folder of .ts/.js modules, see the README) as this session.
+// args is encoded as a JSON object (nil: none); the result is what the function returned, decoded from JSON with
+// numbers as json.Number. An error reads "CODE: message".
+func (s *Session) Call(name string, args any) (any, error) {
+	if args == nil {
+		args = map[string]any{}
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+	cn, ca := C.CString(name), C.CString(string(b))
+	defer C.free(unsafe.Pointer(cn))
+	defer C.free(unsafe.Pointer(ca))
+	p := C.sqzdb_call(s.db.p, s.p, cn, ca)
+	if p == nil {
+		return nil, s.db.lastError()
+	}
+	defer C.sqzdb_free_string(p)
+	d := json.NewDecoder(strings.NewReader(C.GoString(p)))
+	d.UseNumber()
+	var v any
+	err = d.Decode(&v)
+	return v, err
 }
 
 // Auth returns the sign-in functions for a table marked ALTER TABLE <table> ENABLE AUTH.

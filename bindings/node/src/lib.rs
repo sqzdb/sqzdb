@@ -109,6 +109,8 @@ pub fn open(path: String, options: Option<String>) -> Result<Db> {
     #[napi] pub fn session(&self) -> Result<Sess> { Ok(Sess { sql: Arc::downgrade(&self.sql()?), s: Arc::new(Mutex::new(Session::default())) }) }
     #[napi] pub fn close(&self) { if let Some(s) = self.sql.lock().unwrap().take() { s.close(); } }
     #[napi] pub fn is_durable(&self) -> bool { self.durable }
+    /// The session cookie's name: `__Host-sqz_session` over https, `sqz_session` over http.
+    #[napi] pub fn session_cookie(&self) -> Result<String> { Ok(sqzdb::signin::session_name(&*self.sql()?).to_string()) }
     #[napi] pub fn rows(&self) -> Result<f64> { Ok(self.sql()?.snapshot().rows as f64) }
     /// Resolves once commit `seq` is on disk.
     /// Sign-up, sign-in and password changes hash a password (milliseconds), so they run off the JavaScript thread.
@@ -151,6 +153,12 @@ pub fn open(path: String, options: Option<String>) -> Result<Db> {
         self.sql()?.assume(&mut self.s.lock().unwrap(), &roles, attrs).map_err(err)
     }
     #[napi] pub fn in_txn(&self) -> bool { self.s.lock().unwrap().txn.is_some() }
+    /// One of the app's functions, as this session; the arguments and the result as JSON text.
+    #[napi] pub fn call(&self, name: String, args: String) -> Result<String> {
+        let args: serde_json::Value = serde_json::from_str(&args).map_err(|e| err_code("ARGUMENTS", &format!("the arguments are not JSON: {e}")))?;
+        let r = self.sql()?.call_function(&mut self.s.lock().unwrap(), &name, &args, false).map_err(|e| err_code(&e.code, &e.message))?;
+        Ok(r.to_string())
+    }
     #[napi] pub fn last_seq(&self) -> f64 { self.s.lock().unwrap().last_seq as f64 }
     /// The key of the last inserted row: a number, or a UUID string for UUID-keyed tables.
     #[napi(ts_return_type = "number | string | null")] pub fn last_insert_id(&self, env: Env) -> Result<JsUnknown> { match self.s.lock().unwrap().last_insert_key.clone() { Some(v) => to_js(&env, &v, None), None => Ok(env.get_null()?.into_unknown()) } }

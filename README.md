@@ -47,6 +47,8 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 | **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
 | **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 20 KB. |
 | **Agents over MCP** | Claude, ChatGPT, Claude Code and other MCP clients connect to `/mcp`, sign their user in on the database's own OAuth page, and query and change data as that user, under the same grants and row policies. |
+| **Functions** | Your app's rules as TypeScript or JavaScript that runs inside the database, one transaction per call, as the caller. Each is an API endpoint and an MCP tool. Deploy a folder: on a server, a change to it deploys itself. |
+| **In front of your app** | Point sqzdb at a Next.js (or any) server and it serves the site: HTTPS and HTTP/2 to browsers, a streaming, pooled proxy to the app, sign-in pages with the session in a cookie, and middleware and routes in TypeScript that guard pages and answer webhooks, with the database at hand. |
 | **Files as a column** | A `FILE` column holds an uploaded file. A browser uploads it with the row, and whoever may read the row gets a signed link that an `<img>` can load, with caching and byte ranges. Files no row refers to are cleaned up. |
 | **Vectors and search by meaning** | A `VECTOR(n)` column, searched with `cosine_distance` under the same policies as everything else. A column can be the embedding of other columns, filled in the background by OpenAI, Ollama or any OpenAI-compatible model, and `embed(?)` embeds the search text. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
@@ -133,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.10.0` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.11.0` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -142,12 +144,19 @@ do the same with a local build.
 
 ### Libraries
 
-The packages are not published to npm, PyPI or crates.io yet. Build the binding you need from source,
-as described in [Building from source](#building-from-source).
+The Node package is on npm, with prebuilt engines for Linux (x64 and arm64, glibc and musl) and
+macOS (x64 and arm64):
+
+```sh
+npm install sqzdb
+```
+
+The other bindings are not published to PyPI or crates.io yet. Build them from source, as described in
+[Building from source](#building-from-source).
 
 | Language | Binding | Location |
 |---|---|---|
-| Node.js 20+ | Native addon (N-API), synchronous calls with promises where work waits | `bindings/node` |
+| Node.js 20+ | Native addon (N-API), synchronous calls with promises where work waits | `npm install sqzdb` (`bindings/node`) |
 | Python 3.11+ | Extension module (PyO3), releases the GIL while the engine works | `bindings/python` |
 | Go 1.24+ | cgo package over the C ABI | `bindings/go/sqzdb` |
 | C | Shared library `libsqzdb.so` | `src/capi.rs` |
@@ -346,9 +355,14 @@ an access check protects a row; an id that is hard to guess does not.
 
 `BEGIN`, `COMMIT` and `ROLLBACK` use optimistic concurrency: transactions run without locks, and a
 commit that conflicts with a concurrent one fails with `CONFLICT`. `db.transaction(fn)` in Node retries
-those automatically. Reads inside an open transaction see committed data. A lookup by primary key also
-sees the transaction's own writes; any other read of a table the transaction has written fails with
-`TRANSACTION` instead of returning rows without those writes.
+those automatically. Reads inside an open transaction see committed data plus the transaction's own
+writes: a query on one table (by key, index, range or scan, `count(*)` included) and the rows an `UPDATE`
+or `DELETE` picks. A join, a subquery or `INSERT … SELECT` over a table the transaction has written still
+reads committed data only, so it fails with `TRANSACTION` instead of returning rows without those writes.
+Every read is checked again at `COMMIT`. A row read by its key must be unchanged. A table read any other way
+(a scan, an index, a range, a `UNIQUE` value) must have had no other write become visible since, nor have
+one on its way. This check is per table, so it's coarse: a transaction that counts a table's rows conflicts
+with any concurrent write to that table, and retrying gives it the new count.
 
 | `durable` | A commit returns when | A crash can lose |
 |---|---|---|
@@ -606,6 +620,9 @@ The client (`clients/js`) runs in browsers, React Native and Node 22+. It keeps 
 `auth.signUp`, `signIn`, `signInWith`, `signOut`, `onChange` and `methods` (whether sign-up is open, and
 which providers are configured), then `sql(text, params)`, `batch([[text, params], …])` for one
 transaction, `live(text, params, fn)` and `close()`. [`demos/notes`](demos/notes) is a whole app built this way.
+On a page sqzdb serves itself (`app.staticDir`, or an app behind it), `connect(location.origin, { cookies: true })`
+keeps the session in an HttpOnly cookie instead, out of any script's reach (see
+[in front of your app](#in-front-of-your-app-nextjs-and-others)). The API speaks HTTP/1.1 and HTTP/2.
 
 - **Statements:** `SELECT`, `INSERT`, `UPDATE` and `DELETE`, up to 64 KB of SQL and 1,000 parameters
   each, in a request of at most `app.maxRequest` (8 MB). No DDL, no grants, no `BEGIN`: a transaction is a
@@ -722,8 +739,7 @@ redirect = "0.0.0.0:80"             # optional: send http:// visitors to https:/
 - Wildcard and IP-address certificates aren't supported: they need DNS challenges, or a CA profile this
   doesn't ask for.
 
-**Not built yet:** a trusted-proxy setting (behind a proxy, the sign-in rate limit sees every user as the
-proxy's address), HTTP/2, email verification and password reset.
+**Not built yet:** email verification and password reset.
 
 #### Agents over MCP: Claude, ChatGPT, Claude Code
 
@@ -747,11 +763,12 @@ claude mcp add --transport http myapp https://api.example.com/mcp   # Claude Cod
 
 In Claude and ChatGPT, add a custom connector with the same URL.
 
-- **What an agent can do:** three tools. `describe` lists the tables it may use (columns, types, keys, what
-  it may do with each, the policies that apply) and who it is. `query` runs one `SELECT`. `execute` runs
+- **What an agent can do:** the app's [functions](#functions-your-apps-rules-in-the-database) it may call,
+  one tool each, and three SQL tools. `describe` lists the tables it may use (columns, types, keys, what it
+  may do with each, the policies that apply) and who it is. `query` runs one `SELECT`. `execute` runs
   `INSERT`, `UPDATE` and `DELETE`, one statement or several in a transaction. The statement rules are
   those of `/api/sql`: no DDL and no grants. Rows come back as objects, at most `app.mcp.maxRows` (500) a
-  result.
+  result. With `app.mcp.sql = false`, an agent gets the functions only.
 - **Sign-in** follows the MCP authorization spec: protected-resource and authorization-server metadata,
   dynamic client registration (public clients, or ones with a secret), PKCE with S256 only, tokens bound
   to this server's `/mcp`. The page shows which app is asking and where it will send the user back. It
@@ -768,8 +785,285 @@ In Claude and ChatGPT, add a custom connector with the same URL.
 - The official TypeScript SDK's client (1.30) connects, signs in, lists the tools and calls them; a tool
   call takes about 0.3 ms over HTTP (E65). Claude, ChatGPT and Claude Code use the same flow but weren't
   tested here: they need the server on a public https address.
-- **Not built yet:** tools of an app's own (named operations with their own checks), Client ID Metadata
-  Documents (clients register dynamically instead), server-to-agent notifications, resources and prompts.
+- **Not built yet:** Client ID Metadata Documents (clients register dynamically instead), server-to-agent
+  notifications, resources and prompts.
+
+### Functions: your app's rules in the database
+
+A function is a piece of your app's server code, in TypeScript or JavaScript, that runs inside the
+database. Clients call it by name instead of sending SQL. A rule such as "a finished run can't change" then
+holds for the browser, a script and an agent alike, with no backend of your own to enforce it.
+
+```ts
+// functions/runs.ts
+import { fn } from 'sqzdb/functions'
+
+export const reportRun = fn({
+  description: 'Report how a run ended; when every run of its job has ended, the job moves to review',
+  args: { runId: 'int', status: ['completed', 'failed'], outcome: 'text?' },
+  roles: ['member'],
+  run({ db, admin }, { runId, status, outcome }) {
+    const run = db.get('SELECT id, job, status FROM runs WHERE id = ?', [runId])   // as the caller, under their policies
+    if (!run) throw Object.assign(new Error(`no run ${runId}`), { code: 'NO_RUN' })
+    if (run.status !== 'running') throw Object.assign(new Error('a finished run cannot change'), { code: 'ALREADY_FINISHED' })
+    if (status === 'completed' && !outcome) throw new Error('a completed run needs an outcome')
+    admin.run('UPDATE runs SET status = ?, outcome = ? WHERE id = ?', [status, outcome ?? null, runId])
+    const left = admin.get("SELECT count(*) AS n FROM runs WHERE job = ? AND status = 'running'", [run.job]).n
+    if (left === 0) admin.run("UPDATE jobs SET status = 'review' WHERE id = ?", [run.job])
+    return { status, jobStatus: left === 0 ? 'review' : 'running' }
+  },
+})
+```
+
+**Deploying.** You deploy a folder as a whole. It holds `.ts`, `.mts`, `.js` and `.mjs` files that import
+each other by relative path; `.d.ts`, `*.test.*`, `*.spec.*`, `node_modules` and hidden entries are skipped.
+The folder deploys when the database opens and, by default, again whenever it changes. On a server, a
+`git pull` is a deploy.
+
+```js
+const db = open('./data/app', { functions: './functions' })   // Node, embedded
+```
+
+```sh
+sqzdb serve ./data --app 0.0.0.0:443 --domain api.example.com --functions ./functions
+sqzdb deploy ./functions ./data                                 # to a database that isn't open
+sqzdb deploy ./functions db.internal:7781 --token "$DB_TOKEN"   # to a running server, over its TCP port
+```
+
+- A deploy replaces every function before it. The same files again change nothing.
+- A deploy is stored in the catalog, so it is logged, snapshotted, backed up and copied to followers with
+  the schema. A database restored from its bucket has its functions.
+- A deploy that fails changes nothing and names the file, line and column. It fails on a syntax error, an
+  import that isn't there, or two functions with one name.
+- Only the application deploys: in code, through the TCP port or socket with its token, or from the
+  console. A client of the app API or an agent can't.
+
+**Calling.** A call runs as the caller, under their grants and policies:
+
+- **Node:** `db.call('reportRun', { runId: 7, status: 'failed' })` on any handle: the app itself, `db.as(…)`
+  or `db.session(token)`. Python has `session.call(name, args)`, Go `Session.Call` and C `sqzdb_call`.
+- **The browser client:** `await client.call('reportRun', { … })`, over its socket. Over plain HTTP it's
+  `POST /api/fn/reportRun` with the arguments as the JSON body; the answer is `{"result": …}`.
+- **Agents over MCP:** each function is a tool. Its `description` and `args` become the tool's
+  description and input schema, and `readOnly` its read-only hint.
+
+**What a function gets.** `run(ctx, args)`, where `ctx` has:
+
+- `ctx.db` acts as the caller. `get(sql, params)` returns the first row or null, `all(sql, params)`
+  the rows, and `run(sql, params)` `{ changes, lastInsertId }`.
+- `ctx.admin` is the same, in the same transaction, without grants or policies. It does what the
+  caller may not. In the example, members have `SELECT` on `runs` but no `UPDATE`, so `reportRun`, with its
+  rules, is the only way they can change a run.
+- Both work only during the call that received them: a function that keeps one for later gets an error,
+  never another caller's identity.
+- Who is calling is checked again at each call. A signed-out session, or a user whose role changed, is
+  refused at once, even on a socket that stays open.
+- `ctx.user` is the caller's row, or the attributes `db.as` vouched for; null when the app calls.
+  `ctx.roles` lists the caller's roles.
+- Values are as in Node: `INT` is a number (BigInt past 2^53), `TIMESTAMP` a Date, `BYTES` a Uint8Array.
+- A function returns any JSON value. A Date becomes its ISO text, bytes 0x-prefixed hex.
+
+**The rules of a call:**
+
+- **Transaction:** a call is one transaction. It commits when `run` returns and rolls back when it throws.
+  A call inside an open transaction (`db.transaction` in Node) joins it. If the call fails there, that
+  transaction can't commit.
+- **Conflicts:** when another writer got there first, the whole call runs again, up to 50 times. Its reads
+  count as described under [transactions](#transactions-and-durability). Two calls that each update a run
+  and then count the job's running runs can't both see "one left".
+- **A failed write ends the call:** a statement that fails while writing may have written some of its rows,
+  so it ends the call's transaction even if the function catches the error. Catch it to change the error,
+  not to carry on. For a duplicate you expect, use `INSERT … ON CONFLICT DO NOTHING`. A failed read can be
+  caught and handled.
+- **Errors** reach the caller with a code:
+  - `NOT_FOUND`: no such function;
+  - `DENIED`: the caller lacks its `roles`;
+  - `ARGUMENTS`, or `LIMIT` for time or memory;
+  - `FUNCTION`: it threw;
+  - the code of a database error it let through;
+  - or the `code` of an Error it threw (`ALREADY_FINISHED` above: capitals, digits and `_`).
+
+  A `TypeError` and other bugs say where they happened, in the TypeScript's own lines.
+- **`roles`** says who may call. Without it, anyone signed in may; the anonymous role
+  (`app.anonymousRole`) only when it's listed.
+- **`readOnly: true`** allows `SELECT` only.
+
+**Arguments** are checked before the function runs:
+
+- a type: `'int'`, `'number'`, `'text'`, `'bool'`, `'uuid'` or `'json'` (any value);
+- `?` after the type when it may be left out or null;
+- a list of the texts it may be (`['completed', 'failed']`);
+- or `{ type, description, optional }`.
+
+Arguments the function doesn't take are refused. With `sqzdb/functions` from npm (`npm install -D
+sqzdb`), TypeScript infers `run`'s arguments from `args`. Above, `status` is `'completed' | 'failed'` and
+`outcome` is `string | null | undefined`.
+
+**The sandbox.** Functions run in QuickJS, inside the database's process:
+
+- no files, network, timers or processes;
+- no npm packages: imports are the folder's files and `sqzdb/functions`;
+- `functions.timeout` per call (1 s) and `functions.memory` per instance (64 MB). A function past either
+  fails with `LIMIT`, and the database carries on. The rows a query hands it and the result it returns
+  count toward the memory limit too;
+- a call waits for a free instance for at most four time limits (at least 5 s), then fails with `LIMIT`;
+- a promise that can't settle fails the call (there are no timers or I/O to wait for);
+- up to `functions.instances` calls run at once (the CPU count), each in its own instance. A module's
+  top-level variables live per instance, so don't keep state there;
+- `console.log` goes to the server's error output.
+
+**Costs (E66):**
+
+- In the process, a function that does nothing costs 3 µs, its transaction included.
+- One that returns 10 rows costs 16 µs, against 3 µs for its `SELECT` sent directly.
+- Over HTTP, a call costs 10 to 20 µs more than the same `SELECT`: about 70 to 90 µs a round trip.
+- QuickJS and the TypeScript stripper add about 4 MB to the binary.
+
+Middleware and routes, the same kind of code for HTTP requests, are under
+[in front of your app](#in-front-of-your-app-nextjs-and-others).
+
+**Not built yet:**
+
+- npm packages inside functions;
+- functions on a schedule;
+- functions that call out over HTTP (for now, a worker of yours does that and calls a function back);
+- an output schema for MCP;
+- read-only functions on followers.
+
+### In front of your app: Next.js and others
+
+sqzdb can serve the whole site. It answers what is its own and passes everything else on to your app's
+server, such as Next.js on 127.0.0.1:3000. One process then gives the site:
+- HTTPS, with certificates from Let's Encrypt, and HTTP/2;
+- sign-in, the database and live queries;
+- MCP for agents;
+- your app's rules.
+
+```sh
+sqzdb serve ./data --app 0.0.0.0:443 --domain tasks.example.com --proxy http://127.0.0.1:3000 --functions ./functions
+next start -H 127.0.0.1 -p 3000
+```
+
+Or with the database embedded in Next.js, as in [`demos/nextjs`](demos/nextjs):
+
+```js
+open('./data/app', { functions: './functions', listen: { app: '0.0.0.0:443' },
+                     app: { proxy: 'http://127.0.0.1:3000', tls: { domains: ['tasks.example.com'] } } })
+```
+
+Open it when the server starts (Next.js's `instrumentation.js`), so the front door is listening before
+anyone asks.
+
+**What goes where:**
+- **sqzdb's own paths** are answered as always:
+  - `/api/…`, matched endpoint by endpoint, so your app's own `/api` routes still reach it;
+  - `/mcp`, `/oauth/…` and `/.well-known/oauth-…`;
+  - its sign-in pages under `/_sqz/`.
+- **Everything else goes to the app**, after middleware and routes (below):
+  - bodies stream both ways, and a page that renders in pieces arrives in pieces;
+  - WebSocket upgrades are passed through, and no other kind: a client can't turn a connection into a
+    tunnel to the app that middleware never sees;
+  - connections to the app are kept in a pool, with at most `app.proxy.connections` (256) requests in
+    flight;
+  - if the app is down, visitors get a 502 page and the API carries on.
+- **The app learns who asked:**
+  - `X-Forwarded-For`, `-Proto` and `-Host`, and `X-Real-IP`;
+  - for a signed-in visitor, `X-Sqz-User` (their key), `X-Sqz-Table` (the table it is a key of) and
+    `X-Sqz-Roles`. A client's own `X-Sqz-…` headers never get through.
+
+  Let the app listen on 127.0.0.1 only, so nothing reaches it any other way.
+
+**Sessions in a cookie.** A page navigation carries cookies, not an `Authorization` header. So for a site
+sqzdb serves, the session lives in a cookie:
+- **The cookie:** `__Host-sqz_session` over https (`sqz_session` over http, in development). It is HttpOnly
+  (no script reads it), SameSite=Lax (no other site's form or fetch sends it), Secure, and a browser takes it
+  only from this very host, so a sibling subdomain can't plant one.
+- **Only from the site itself:** it counts when a request comes from the site's own origin or one
+  `app.origins` names. `"*"` lets other pages call the API, not act as its visitor.
+- **Who reads it:**
+  - the API takes it wherever it takes a token;
+  - the app can act as the visitor with it, as `db.session(cookies().get(db.sessionCookie)?.value)` in
+    Next.js.
+- **sqzdb's sign-in page,** `/_sqz/sign-in?return=/somewhere`:
+  - it signs in with a password or a provider of `auth.oauth`, and makes accounts where `app.signUp` lists
+    the table;
+  - it sets the cookie and goes back to `return`: a path on the site, or a page on `app.origins`, never
+    another site;
+  - `/_sqz/sign-out` ends the session.
+- **Or a page of your own:** the client in cookie mode, `connect(location.origin, { cookies: true })`, signs
+  in the same way, and `signInWith('google')` comes back signed in. No token ever reaches the page.
+- **Forged forms:** the pages' forms are bound to the browser that loaded them and to the site's own
+  origin, so another site can't sign a visitor in or out.
+
+**Middleware and routes.** They live in the same folder as
+[functions](#functions-your-apps-rules-in-the-database):
+
+```ts
+import { middleware, route, signIn } from 'sqzdb/functions'
+
+export const guard = middleware({
+  match: ['/dashboard/*', '/admin/*'],
+  run({ user, roles }, req) {
+    if (!user) return signIn(req)                      // to the sign-in page, and back here after
+    if (req.path.startsWith('/admin') && !roles.includes('admin')) return new Response('Forbidden', { status: 403 })
+    req.headers.set('x-plan', 'pro')                   // the app sees it
+  },
+})
+
+export const hooks = route({
+  method: 'POST', path: '/hooks/:source',
+  async run({ admin }, req) {
+    admin.run('INSERT INTO events (source, body) VALUES (?, ?)', [req.params.source, await req.text()])
+    return Response.json({ ok: true })
+  },
+})
+```
+
+- **Middleware:**
+  - it runs for the paths it `match`es, never sqzdb's own, in `order` and then by file and name;
+  - it returns a `Response` to answer, or nothing to let the request go on, with any headers it set or
+    removed;
+  - it gets the headers, not the body, which streams on untouched.
+- **Routes:**
+  - a route answers a `method` and `path` itself, with a `Response`, a value (sent as JSON), or nothing
+    (204);
+  - it gets the body (`req.text()`, `json()` or `bytes()`, up to `app.maxRequest`);
+  - of routes that match, the one with the most literal segments wins;
+  - `roles` limits who may call it.
+- **What both get:**
+  - `ctx` as functions do: `db` as the visitor, `admin`, `user` and `roles`;
+  - a request: `method`, `path` (decoded, as patterns matched it: check paths with this), `rawPath` and
+    `url` (as sent), `query`, `params` (`/jobs/:id` gives `req.params.id`, and a final `*` gives the rest),
+    `headers`, `cookies` and `ip`;
+  - each request is one transaction, with the functions' limits. At most `functions.instances` run at
+    once; the rest wait their turn, and get a 503 if none comes in time.
+- **If the deployed functions can't load** (say, after a change of configuration), everything that isn't
+  sqzdb's own gets a 503 until they can: the site is never served without its guards.
+- **Path matching** follows how the app will resolve the path:
+  - each segment is decoded (`/adm%69n` is `/admin`);
+  - Next.js's data route for a page (`/_next/data/<build>/admin.json`) counts as that page;
+  - dot segments and encoded slashes are refused (400). Browsers never send them, and they could reach the
+    app by a path a pattern never saw.
+- **`Response` and `Headers`** are global inside the database. In TypeScript, outside a project with DOM
+  types, import them from `sqzdb/functions`.
+
+**Behind proxies of yours.** With Caddy, nginx or a load balancer in front, name them in
+`app.trustProxy = ["127.0.0.1", "10.0.0.0/8"]`. From those addresses, the client's address is the last one in
+`X-Forwarded-For` (over all its headers) that isn't one of them, so the sign-in rate limits count each visitor,
+not the proxy. From anyone else, `X-Forwarded-For` is kept for the app but never believed, and `Forwarded` is
+dropped.
+
+**Costs (E67, E68):**
+- **A small page:** about 10 to 20 µs more through sqzdb than from the app directly (52 against 40 µs);
+- **with a middleware:** about 40 µs more again;
+- **a route sqzdb answers itself:** about 48 µs in all;
+- **a Next.js page that takes 1 ms to render:** 1.05 ms through sqzdb;
+- **connections:** 2,000 requests one after another used one connection to the app. 50 at once opened 49,
+  and the next 50 reused them;
+- **a 64 MB upload** streams through in about 100 ms.
+
+**Not built yet:** HTTP/3, compressing the app's responses (Next.js compresses its own by default), and
+caching.
 
 ### Backup, restore and replication
 
@@ -805,6 +1099,9 @@ sqzdb serve ./data/shop --app 0.0.0.0:8080 --config app.toml     # … to browse
 sqzdb serve ./data/shop --app 0.0.0.0:443 --domain api.shop.com   # … over https, certificate from Let's Encrypt
 sqzdb shell ./data/shop                                          # SQL in the terminal
 sqzdb shell db.internal:7781 --token …                           # the same against a running server
+sqzdb serve ./data/shop --app 0.0.0.0:8080 --functions ./functions   # with the app's functions, redeployed on change
+sqzdb deploy ./functions db.internal:7781 --token …               # deploy them to a running server
+sqzdb serve ./data --app 0.0.0.0:443 --domain shop.com --proxy http://127.0.0.1:3000   # in front of your app
 ```
 
 `serve` owns a directory and starts what you ask for: a Unix socket, TCP, backup, the snapshot policy,
@@ -882,6 +1179,10 @@ Python takes the same keys as keyword arguments, `sqzdb.Database(path, backup={.
 | `app.mcp.users` | the only `ENABLE AUTH` table | The table people sign in to when they connect an agent. |
 | `app.mcp.tokenTtl` / `grantTtl` | `1h` / `30d` | How long an agent's access token lasts, and how long its sign-in lasts unused (the agent refreshes on its own). |
 | `app.mcp.maxRows` | `500` | The most rows one result for an agent may have. |
+| `app.proxy` or `app.proxy.to` | none | The app sqzdb stands in front of (`--proxy`), such as `http://127.0.0.1:3000`: what isn't sqzdb's own goes on to it. See [in front of your app](#in-front-of-your-app-nextjs-and-others). |
+| `app.proxy.timeout` / `connections` | `60s` / `256` | How long the app may take to start answering, and how many requests may be in flight to it at once (the rest wait as long, then get a 503). |
+| `app.trustProxy` | `[]` | Proxies of yours in front of sqzdb (addresses or networks): from them, the client's address comes from `X-Forwarded-For`. |
+| `app.mcp.sql` | `true` | The SQL tools (`describe`, `query`, `execute`) besides the app's functions. `false`: agents get the functions only. |
 | `app.maxRequest` | `8MB` | The largest request body or WebSocket message a client may send, between `64KB` and `256MB`. A file upload streams instead (`app.files.maxSize`). |
 | `app.tls.domains` | none | Serve https with a certificate for these names from the CA (`--domain`), renewed automatically. See [HTTPS](#https-with-certificates-from-lets-encrypt). |
 | `app.tls.email` | none | The contact on the CA account, for its notices (`--email`). |
@@ -890,6 +1191,10 @@ Python takes the same keys as keyword arguments, `sqzdb.Database(path, backup={.
 | `app.tls.acmeRoot` | none | A root certificate (PEM) to trust for the CA's own connection: a private or test CA. |
 | `app.tls.dir` | `<database>/tls` | Where the account key and the certificate are kept. |
 | `app.tls.redirect` | none | An address, such as `0.0.0.0:80`, where plain HTTP is sent on to https. |
+| `functions` or `functions.dir` | none | A folder of the app's functions, deployed at open (`--functions`). See [functions](#functions-your-apps-rules-in-the-database). |
+| `functions.watch` | `true` | Deploy the folder again whenever it changes. |
+| `functions.timeout` / `memory` | `1s` / `64MB` | How long one call may run, and the memory of the instance it runs in. |
+| `functions.instances` | the CPU count | How many calls run at once, each in its own instance. |
 | `live.debounce` | `5ms` | The shortest time between two re-runs of a live query. A change re-runs it at once; more changes within this time are batched into one re-run. |
 | `live.queue` | `65536` | Events a subscriber may fall behind before it is dropped. |
 | `log.threadsIdleAfter` | off | Let log threads exit when idle; for many idle databases in one process. |
@@ -1017,12 +1322,14 @@ Every binding reports errors with a stable code. In Node it is `err.code` on a `
 | `DENIED` | The session lacks a grant, or a row falls outside its policy. |
 | `AUTH` | A wrong login or password, too many failed sign-ins, or a session token that is unknown, signed out, ended or expired. |
 | `CONFLICT` | A concurrent transaction changed the same rows; retry. |
-| `NOT_FOUND` | An `UPDATE` by primary key found no row. |
-| `TRANSACTION` | `BEGIN` inside a transaction, or `COMMIT` outside one. |
+| `NOT_FOUND` | An `UPDATE` by primary key found no row, or there is no function by that name. |
+| `TRANSACTION` | `BEGIN` inside a transaction, `COMMIT` outside one, or a join, subquery or `INSERT … SELECT` over a table the transaction has written. |
 | `ARGUMENTS` | Too few parameters for the statement, or a request the app API can't take: bad JSON, too large, or a result over `app.maxRows`. |
 | `PATH` | The path is a file, or a directory that isn't a database. |
 | `CONFIG` | An invalid or unknown option. |
 | `RATE_LIMITED` | The app API: too many sign-ins or sign-ups from one address; wait a few seconds. |
+| `LIMIT` | A function ran longer than `functions.timeout`, or used more than `functions.memory`. |
+| `FUNCTION` | A function threw (an Error with a `code` of its own gives that code instead). |
 | `CLOSED` | The JavaScript client: the connection closed with the request unanswered. |
 | `ERROR` | Anything else. |
 
@@ -1100,7 +1407,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.10.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.11.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

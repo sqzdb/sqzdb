@@ -6,8 +6,9 @@
 //!   - /oauth/authorize is a page: sign in (with a password, or a provider of `auth.oauth`), then allow or deny;
 //!   - /oauth/token turns a code into an access token (an MCP-only session, `app.mcp.tokenTtl`) and a refresh token (one
 //!     use; `app.mcp.grantTtl` unused). Both end with the user's sessions (a password change, a sign-out everywhere).
-//! The tools: `describe` (what the user may use), `query` (one SELECT) and `execute` (INSERT, UPDATE and DELETE, one or
-//! several in a transaction), with the statement rules of /api/sql.
+//! The tools: the app's functions the user may call (`functions.rs`, one tool each, their arguments as its schema), and
+//! (unless `app.mcp.sql` is off) `describe` (what the user may use), `query` (one SELECT) and `execute` (INSERT, UPDATE
+//! and DELETE, one or several in a transaction), with the statement rules of /api/sql.
 use crate::app::{respond, run, run_batch, Links, Req};
 use crate::sql::{Plan, Session, Sql, P_DELETE, P_INSERT, P_SELECT, P_UPDATE};
 use serde_json::{json, Value as J};
@@ -30,9 +31,9 @@ struct Pending { client: String, name: String, redirect: String, state: Option<S
 const PENDING_MAX: usize = 10_000; const PENDING_PER_IP: usize = 20;
 struct Code { client: String, redirect: String, challenge: String, user: String, at: Instant }
 
-fn random_hex(n: usize) -> String { let mut b = vec![0u8; n]; getrandom::fill(&mut b).expect("random"); b.iter().map(|x| format!("{x:02x}")).collect() }
-fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;") }
-fn host_of(url: &str) -> String { url.split_once("://").map(|(_, r)| r.split(['/', '?', '#']).next().unwrap_or("").to_string()).unwrap_or_else(|| url.split(':').next().unwrap_or("").to_string()) }
+pub(crate) fn random_hex(n: usize) -> String { let mut b = vec![0u8; n]; getrandom::fill(&mut b).expect("random"); b.iter().map(|x| format!("{x:02x}")).collect() }
+pub(crate) fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;") }
+pub(crate) fn host_of(url: &str) -> String { url.split_once("://").map(|(_, r)| r.split(['/', '?', '#']).next().unwrap_or("").to_string()).unwrap_or_else(|| url.split(':').next().unwrap_or("").to_string()) }
 fn base(sql: &Sql) -> String { sql.cfg.app.public_url.clone().unwrap_or_default() }
 /// The cookie that binds a sign-in in progress to its browser (one per request, so two tabs don't collide). Lax, so it
 /// comes back from a provider's sign-in.
@@ -52,8 +53,9 @@ fn form(req: &Req) -> HashMap<String, String> {
     if let Ok(J::Object(m)) = serde_json::from_slice::<J>(&req.body) { return m.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect(); }
     String::from_utf8_lossy(&req.body).split('&').filter(|s| !s.is_empty()).map(|kv| { let (k, v) = kv.split_once('=').unwrap_or((kv, "")); (crate::util::url_decode(k), crate::util::url_decode(v)) }).collect()
 }
-/// The table people sign in to: `app.mcp.users`, or the only table with ENABLE AUTH.
-fn users_table(sql: &Sql) -> Result<String, String> {
+/// The table people sign in to on the API's own pages (an agent's sign-in, `/_sqz/sign-in`): `app.mcp.users`, or the
+/// only table with ENABLE AUTH.
+pub(crate) fn users_table(sql: &Sql) -> Result<String, String> {
     if let Some(t) = sql.cfg.app.mcp.as_ref().and_then(|m| m.users.clone()) { return Ok(t); }
     let acl = sql.acl.read().unwrap(); let mut t: Vec<&String> = acl.auth.keys().collect(); t.sort();
     match t.as_slice() { [one] => Ok((*one).clone()), [] => Err("no table takes sign-ins yet (ALTER TABLE … ENABLE AUTH)".into()), _ => Err("several tables take sign-ins: set app.mcp.users to the one agents' users sign in to".into()) }
@@ -272,7 +274,7 @@ fn token(sql: &Sql, st: &McpState, mcp: &crate::config::McpPolicy, req: &Req) ->
 
 // ---- the pages (sign in, allow): no frames, no referrer, scripts only with this page's nonce
 
-fn page(status: u16, title: &str, body: &str, script: Option<&str>) -> Vec<u8> {
+pub(crate) fn page(status: u16, title: &str, body: &str, script: Option<&str>) -> Vec<u8> {
     let nonce = random_hex(16);
     let html = format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{t}</title><style>
 :root {{ --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --dim:#5b6570; --line:#dfe3e8; --acc:#2563eb; --bad:#b42318 }}
@@ -327,7 +329,7 @@ fn consent_page(sql: &Sql, id: &str, p: &Pending) -> Vec<u8> {
 <p class="small">Changing your password, or signing out everywhere, disconnects it.</p>"#, name = esc(&p.name), who = esc(&who), host = esc(&host_of(&base(sql))), back = esc(&host_of(&p.redirect)), id = esc(id));
     page(200, "Allow access", &body, None)
 }
-fn title_case(s: &str) -> String { let mut c = s.chars(); match c.next() { Some(f) => f.to_uppercase().collect::<String>() + c.as_str(), None => String::new() } }
+pub(crate) fn title_case(s: &str) -> String { let mut c = s.chars(); match c.next() { Some(f) => f.to_uppercase().collect::<String>() + c.as_str(), None => String::new() } }
 
 // ---- MCP: JSON-RPC over POST, one message per request
 
@@ -350,17 +352,26 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
     let result: Result<J, (i64, String)> = match method {
         "initialize" => {
             let asked = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
+            let has_fns = sql.function_defs().iter().any(|d| crate::functions::may_call(d, &sess, false));
+            let instructions = match (has_fns, mcp.sql) {
+                (true, true) => "A database you act on as the user who connected you. Its own tools carry out its operations with their rules: use them for what they cover. For anything else, describe lists the tables you may use, their columns and who you are (SESSION values that row policies compare with); then query (SELECT) and execute (INSERT, UPDATE, DELETE), with ? placeholders and values in params.",
+                (true, false) => "A database you act on as the user who connected you, through its own tools: each carries out one operation, with its rules.",
+                _ => "A SQL database you act on as the user who connected you. Start with describe: it lists the tables you may use, their columns, and who you are (SESSION values that row policies compare with). Then query (SELECT) and execute (INSERT, UPDATE, DELETE). Use ? placeholders and pass values in params.",
+            };
             Ok(json!({ "protocolVersion": if PROTOCOLS.contains(&asked) { asked } else { PROTOCOLS[0] }, "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "sqzdb", "title": host_of(&b), "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "A SQL database you act on as the user who connected you. Start with describe: it lists the tables you may use, their columns, and who you are (SESSION values that row policies compare with). Then query (SELECT) and execute (INSERT, UPDATE, DELETE). Use ? placeholders and pass values in params." }))
+                "serverInfo": {"name": "sqzdb", "title": host_of(&b), "version": env!("CARGO_PKG_VERSION")}, "instructions": instructions }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools()})),
+        "tools/list" => Ok(json!({"tools": tools(sql, &sess, mcp)})),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            if !matches!(name, "describe" | "query" | "execute") { return json_out(200, &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("no tool {name}")}})); }
-            Ok(match call(sql, links, mcp, &mut sess, name, &args) {
+            let out = if sql.function_defs().iter().any(|d| d.name == name) {
+                // a function's result is any JSON; structured content is an object
+                sql.call_function(&mut sess, name, &args, false).map(|v| if v.is_object() { v } else { json!({"result": v}) }).map_err(|e| e.message)
+            } else if mcp.sql && matches!(name, "describe" | "query" | "execute") { call(sql, links, mcp, &mut sess, name, &args) }
+            else { return json_out(200, &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("no tool {name}")}})); };
+            Ok(match out {
                 Ok(v) => json!({"content": [{"type": "text", "text": v.to_string()}], "structuredContent": v, "isError": false}),
                 Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
             })
@@ -369,7 +380,15 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
     };
     json_out(200, &match result { Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}), Err((code, m)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": m}}) })
 }
-fn tools() -> J {
+/// The app's functions `sess` may call, then (with `app.mcp.sql`) the SQL tools.
+fn tools(sql: &Sql, sess: &Session, mcp: &crate::config::McpPolicy) -> J {
+    let mut out: Vec<J> = sql.function_defs().iter().filter(|d| crate::functions::may_call(d, sess, false)).map(|d| json!({
+        "name": d.name, "title": title_case(&d.name), "description": d.description.clone().unwrap_or_else(|| format!("{} (from {})", d.name, d.file)),
+        "inputSchema": crate::functions::input_schema(d), "annotations": {"readOnlyHint": d.read_only} })).collect();
+    if mcp.sql { if let J::Array(t) = sql_tools() { out.extend(t); } }
+    J::Array(out)
+}
+fn sql_tools() -> J {
     let params = json!({"type": "array", "description": "values for the ? placeholders, in order", "items": {}});
     json!([
         {"name": "describe", "title": "Describe the database",

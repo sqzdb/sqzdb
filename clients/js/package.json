@@ -1,6 +1,6 @@
 {
   "name": "sqzdb-client",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Sign in and run SQL with live queries against a sqzdb app API, from a browser, React Native or Node",
   "type": "module",
   "main": "index.js",

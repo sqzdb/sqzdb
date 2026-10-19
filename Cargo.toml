@@ -1,6 +1,6 @@
 [package]
 name = "sqzdb"
-version = "0.10.0"
+version = "0.11.0"
 homepage = "https://sqzdb.dev"
 repository = "https://github.com/sqzdb/sqzdb"
 edition = "2024"
@@ -23,18 +23,34 @@ instant-acme = { version = "0.8.5", default-features = false, features = ["ring"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 object_store = { version = "0.13", features = ["aws"] }
 futures-util = "0.3"
+# the app API's HTTP/1.1 and HTTP/2 (app.rs), and its client to an upstream it proxies to (proxy.rs)
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "client-legacy", "tokio", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
 zstd = "0.13"
 aes-gcm = "0.10"
 sha2 = "0.10"
 libc = "0.2"
 getrandom = "0.3"   # UUIDs: the operating system's secure random source
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }   # a function's result keeps its keys in order
 toml = "0.8"
 argon2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 ring = "0.17"
 base64 = "0.22"
+# functions (functions.rs): an app's own TypeScript or JavaScript, run in QuickJS inside the database; oxc strips the
+# types (with a source map, so errors point at the TypeScript)
+rquickjs = { version = "0.14", features = ["std", "loader", "parallel"] }
+oxc_allocator = "0.154"
+oxc_parser = "0.154"
+oxc_span = "0.154"
+oxc_semantic = "0.154"
+oxc_transformer = "0.154"
+oxc_codegen = "0.154"
+oxc_sourcemap = "9"
+oxc_diagnostics = "0.154"
 
 # The static Linux builds use musl, whose allocator made the engine 2x slower (measured in E45); the command uses
 # mimalloc there. Library builds keep the host allocator.

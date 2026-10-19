@@ -1,7 +1,10 @@
-# Build output
+# Build output (and other target directories: a second build alongside, CARGO_TARGET_DIR=target-…)
 /target/
+/target-*/
 bindings/*/target/
 bindings/node/node_modules/
+demos/*/node_modules/
+demos/*/.next/
 
 # Compiled artifacts: rebuilt with `cargo build --release` in the crate that owns them
 *.so
@@ -17,10 +20,11 @@ demos/*/data/
 # Measurements ledger (kept out of the repo by the owner's choice; raw outputs in results/ are tracked)
 RESULTS.md
 
-# Editor and OS noise
+# Editor and OS noise, and logs
 .DS_Store
 *.swp
 *~
+*.log
 
 # release tarballs from `make dist`
 /dist/

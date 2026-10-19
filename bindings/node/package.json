@@ -1,6 +1,6 @@
 {
   "name": "sqzdb",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "An embedded SQL database for Node: concurrent writers, row policies, live queries, files, vectors, sign-in and MCP for agents",
   "keywords": [
     "database",
@@ -25,12 +25,20 @@
       "types": "./index.d.ts",
       "import": "./index.mjs",
       "require": "./index.js"
+    },
+    "./functions": {
+      "types": "./functions.d.ts",
+      "import": "./functions.mjs",
+      "require": "./functions.js"
     }
   },
   "files": [
     "index.js",
     "index.mjs",
     "index.d.ts",
+    "functions.js",
+    "functions.mjs",
+    "functions.d.ts",
     "README.md"
   ],
   "engines": {
@@ -41,11 +49,11 @@
     "darwin"
   ],
   "optionalDependencies": {
-    "@sqzdb/linux-x64-gnu": "0.10.0",
-    "@sqzdb/linux-x64-musl": "0.10.0",
-    "@sqzdb/linux-arm64-gnu": "0.10.0",
-    "@sqzdb/linux-arm64-musl": "0.10.0",
-    "@sqzdb/darwin-x64": "0.10.0",
-    "@sqzdb/darwin-arm64": "0.10.0"
+    "@sqzdb/linux-x64-gnu": "0.11.0",
+    "@sqzdb/linux-x64-musl": "0.11.0",
+    "@sqzdb/linux-arm64-gnu": "0.11.0",
+    "@sqzdb/linux-arm64-musl": "0.11.0",
+    "@sqzdb/darwin-x64": "0.11.0",
+    "@sqzdb/darwin-arm64": "0.11.0"
   }
 }

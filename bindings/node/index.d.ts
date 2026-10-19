@@ -51,6 +51,9 @@ export class Statement {
 export class Database {
   readonly path: string;
   readonly durable: boolean;
+  /** The session cookie's name for a site sqzdb serves (`app.proxy`): `__Host-sqz_session` over https, `sqz_session`
+   *  over http. In Next.js: `db.session(cookies().get(db.sessionCookie)?.value ?? '')`. */
+  readonly sessionCookie: string;
   /** The database user this handle acts as (`as('alice')`), or null. */
   readonly user: string | null;
   /** The identity this handle acts as (`as({ role, ...attributes })`), or null. */
@@ -65,6 +68,10 @@ export class Database {
   get(sql: string, params?: Params): Row | null;
   all(sql: string, params?: Params): Row[];
   run(sql: string, params?: Params): RunResult;
+  /** Call one of the app's functions (see `OpenOptions.functions`) as this handle: the app itself, or the identity of
+   *  `as()` / `session()`. Returns what it returned; throws SqzError with its code (NOT_FOUND, DENIED, ARGUMENTS,
+   *  LIMIT, FUNCTION, or the code its error carries). */
+  call<R = unknown>(name: string, args?: Record<string, unknown>): R;
   flush(): Promise<void>;
   transaction<A extends unknown[], R>(fn: (tx: Database, ...args: A) => R, opts?: { retries?: number }): (...args: A) => R;
   subscribe(sql: string, params?: Params): Subscription;
@@ -124,8 +131,14 @@ export interface AppOptions {
   anonymousRole?: string; maxRows?: number; staticDir?: string; maxRequest?: SizeLike;
   files?: { maxSize?: SizeLike; linkTtl?: DurationLike };
   tls?: { domains?: string[]; email?: string; cert?: string; key?: string; acme?: string; acmeRoot?: string; dir?: string; redirect?: string };
+  /** The app this API stands in front of, such as Next.js on 'http://127.0.0.1:3000': what isn't the API's own goes
+   *  on to it (streamed, over pooled connections), after the app's middleware and routes (`functions`). */
+  proxy?: string | { to: string; timeout?: DurationLike; connections?: number };
+  /** Proxies of yours in front of the API (addresses or networks): from them, the client's address comes from
+   *  X-Forwarded-For. */
+  trustProxy?: string[];
   /** Serve MCP at /mcp: agents sign their user in through this API's own OAuth server. */
-  mcp?: { users?: string; tokenTtl?: DurationLike; grantTtl?: DurationLike; maxRows?: number };
+  mcp?: { users?: string; tokenTtl?: DurationLike; grantTtl?: DurationLike; maxRows?: number; /** The SQL tools (describe, query, execute) besides the app's functions (default true); false: agents get the functions only. */ sql?: boolean };
 }
 export interface BackupOptions {
   endpoint: string; bucket: string; prefix?: string; region?: string; accessKey: string; secretKey: string;
@@ -161,6 +174,12 @@ export interface OpenOptions {
   log?: { threadsIdleAfter?: DurationLike };
   /** How rows become objects (this binding only). */
   rowMode?: 'auto' | 'native' | 'packed';
+  /**
+   * The app's functions (`import { fn } from 'sqzdb/functions'`): a folder of .ts and .js modules, deployed when the
+   * database opens and again whenever it changes (`watch`, default true). `timeout` per call (default '1s'), `memory`
+   * per instance (default '64MB'), and how many `instances` run calls at once (default: the CPU count).
+   */
+  functions?: string | { dir?: string; watch?: boolean; timeout?: DurationLike; memory?: SizeLike; instances?: number };
 }
 /** Open or create the database directory with these options (and the file `configFile` names, if any). */
 export function open(path: string, opts?: OpenOptions): Database;

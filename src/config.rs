@@ -35,13 +35,19 @@ pub struct Config {
     pub app: AppPolicy,
     /// Embeddings for generated VECTOR columns and `embed()` (`vector.rs`); none unless configured.
     pub embed: Option<EmbedPolicy>,
+    /// The application's functions (`functions.rs`): a folder to deploy at open, and the sandbox's limits.
+    pub functions: FunctionsPolicy,
 }
+/// `functions`: `dir`, a folder deployed at open (and again whenever it changes, with `watch`); how long one call may
+/// run, how much memory its instance may use, and how many calls run at once (each in its own instance).
+#[derive(Clone, Debug)] pub struct FunctionsPolicy { pub dir: Option<PathBuf>, pub watch: bool, pub timeout: Duration, pub memory: usize, pub instances: usize }
+impl Default for FunctionsPolicy { fn default() -> Self { FunctionsPolicy { dir: None, watch: true, timeout: Duration::from_secs(1), memory: 64 << 20, instances: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 64) } } }
 /// An OpenAI-compatible embeddings endpoint: `url` (such as https://api.openai.com/v1, or Ollama's
 /// http://localhost:11434/v1), its `model`, an `api_key`, the `dimensions` to ask for (for models that can shorten
 /// their vectors), and how many texts go in one request.
 #[derive(Clone, Debug)] pub struct EmbedPolicy { pub url: String, pub model: String, pub api_key: Option<String>, pub dimensions: Option<usize>, pub batch: usize }
 impl Default for Config {
-    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default(), embed: None } }
+    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default(), embed: None, functions: FunctionsPolicy::default() } }
 }
 impl Config {
     pub fn durable(mut self, d: Durability) -> Config { self.durable = d; self }
@@ -107,12 +113,20 @@ impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Dura
     /// FILE columns: the largest upload, and how long a link to a file that a query hands out works
     pub file_max: u64, pub file_link_ttl: Duration, /// the largest request body or WebSocket message (an upload streams instead)
     pub max_request: usize, /// agents over MCP, signed in through the API's own OAuth server (`mcp.rs`); off unless set
-    pub mcp: Option<McpPolicy> }
+    pub mcp: Option<McpPolicy>,
+    /// the app the API stands in front of: requests that aren't the API's own go on to it (`proxy.rs`)
+    pub proxy: Option<ProxyPolicy>,
+    /// proxies of yours in front of the API: from these, the client's address is taken from X-Forwarded-For
+    pub trust_proxy: Vec<crate::proxy::Net> }
+/// `app.proxy`: the app's address (`to`, http on this machine or a private network), how long it may take to start
+/// answering, and how many requests may be in flight to it at once (as many connections to it are kept).
+#[derive(Clone, Debug)] pub struct ProxyPolicy { pub to: String, pub timeout: Duration, pub connections: usize }
 /// `app.mcp`: which table people sign in to when they connect an agent, how long an access token lasts (refreshed by
 /// the agent on its own), how long a sign-in lasts unused, and the most rows a query hands an agent.
-#[derive(Clone, Debug)] pub struct McpPolicy { pub users: Option<String>, pub token_ttl: Duration, pub grant_ttl: Duration, pub max_rows: usize }
-impl Default for McpPolicy { fn default() -> McpPolicy { McpPolicy { users: None, token_ttl: Duration::from_secs(3600), grant_ttl: Duration::from_secs(30 * 86400), max_rows: 500 } } }
-impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None, file_max: 25 << 20, file_link_ttl: Duration::from_secs(3600), max_request: 8 << 20, mcp: None } } }
+#[derive(Clone, Debug)] pub struct McpPolicy { pub users: Option<String>, pub token_ttl: Duration, pub grant_ttl: Duration, pub max_rows: usize, /// the SQL tools (describe, query, execute) besides the functions; off: agents get the functions only
+    pub sql: bool }
+impl Default for McpPolicy { fn default() -> McpPolicy { McpPolicy { users: None, token_ttl: Duration::from_secs(3600), grant_ttl: Duration::from_secs(30 * 86400), max_rows: 500, sql: true } } }
+impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None, file_max: 25 << 20, file_link_ttl: Duration::from_secs(3600), max_request: 8 << 20, mcp: None, proxy: None, trust_proxy: vec![] } } }
 /// TLS for the app API (`app.tls`, see `tls.rs`): your own certificate (`cert` and `key`, PEM files), or one for
 /// `domains` from the ACME CA whose directory is `acme` (Let's Encrypt), kept in `dir` (the database's `tls/` when
 /// unset) under an account with `email` as its contact. `acme_root` is a root to trust for the CA itself (a private
@@ -162,16 +176,29 @@ pub struct ConfigFile {
     pub durable: Option<DurableIn>, pub create: Option<bool>,
     #[serde(alias = "recover_threads")] pub recover_threads: Option<usize>,
     pub backup: Option<BackupFile>, pub follow: Option<FollowFile>, pub snapshot: Option<SnapshotFile>, pub listen: Option<ListenFile>, pub live: Option<LiveFile>, pub log: Option<LogFile>, pub auth: Option<AuthFile>, pub app: Option<AppFile>, pub embed: Option<EmbedFile>,
+    pub functions: Option<FunctionsIn>,
 }
+/// `functions`: the folder alone, or the folder and the limits.
+#[derive(Deserialize, Debug, Clone)] #[serde(untagged)] pub enum FunctionsIn { Dir(String), Full(FunctionsFile) }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FunctionsFile { pub dir: Option<String>, pub watch: Option<bool>, pub timeout: Option<Dur>, pub memory: Option<Size>, pub instances: Option<usize> }
+impl FunctionsIn { fn full(self) -> FunctionsFile { match self { FunctionsIn::Dir(d) => FunctionsFile { dir: Some(d), ..Default::default() }, FunctionsIn::Full(f) => f } } }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EmbedFile { pub url: Option<String>, pub model: Option<String>, #[serde(alias = "api_key")] pub api_key: Option<String>, pub dimensions: Option<usize>, pub batch: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile>, pub files: Option<AppFilesFile>, #[serde(alias = "max_request")] pub max_request: Option<Size>, pub mcp: Option<McpFile> }
+pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile>, pub files: Option<AppFilesFile>, #[serde(alias = "max_request")] pub max_request: Option<Size>, pub mcp: Option<McpFile>, pub proxy: Option<ProxyIn>, #[serde(alias = "trust_proxy")] pub trust_proxy: Option<Vec<String>> }
+/// `app.proxy`: the app's address alone, or with its settings.
+#[derive(Deserialize, Debug, Clone)] #[serde(untagged)] pub enum ProxyIn { To(String), Full(ProxyFile) }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct McpFile { pub users: Option<String>, #[serde(alias = "token_ttl")] pub token_ttl: Option<Dur>, #[serde(alias = "grant_ttl")] pub grant_ttl: Option<Dur>, #[serde(alias = "max_rows")] pub max_rows: Option<usize> }
+pub struct ProxyFile { pub to: Option<String>, pub timeout: Option<Dur>, pub connections: Option<usize> }
+impl ProxyIn { fn full(self) -> ProxyFile { match self { ProxyIn::To(t) => ProxyFile { to: Some(t), ..Default::default() }, ProxyIn::Full(f) => f } } }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct McpFile { pub users: Option<String>, #[serde(alias = "token_ttl")] pub token_ttl: Option<Dur>, #[serde(alias = "grant_ttl")] pub grant_ttl: Option<Dur>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, pub sql: Option<bool> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AppFilesFile { #[serde(alias = "max_size")] pub max_size: Option<Size>, #[serde(alias = "link_ttl")] pub link_ttl: Option<Dur> }
@@ -249,10 +276,12 @@ impl ConfigFile {
             follow: nest(self.follow, o.follow, |a, b| FollowFile { dir: pick(a.dir, b.dir), bucket: nest(a.bucket, b.bucket, |x, y| x.overlay(y)), poll: pick(a.poll, b.poll) }),
             snapshot: nest(self.snapshot, o.snapshot, |a, b| SnapshotFile { log_bytes: pick(a.log_bytes, b.log_bytes), idle_after: pick(a.idle_after, b.idle_after) }),
             listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token), app: pick(a.app, b.app) }),
-            app: nest(self.app, o.app, |a, b| AppFile { origins: pick(a.origins, b.origins), public_url: pick(a.public_url, b.public_url), anonymous_role: pick(a.anonymous_role, b.anonymous_role), max_rows: pick(a.max_rows, b.max_rows), static_dir: pick(a.static_dir, b.static_dir), sign_up: pick(a.sign_up, b.sign_up), max_request: pick(a.max_request, b.max_request),
-                mcp: nest(a.mcp, b.mcp, |x, y| McpFile { users: pick(x.users, y.users), token_ttl: pick(x.token_ttl, y.token_ttl), grant_ttl: pick(x.grant_ttl, y.grant_ttl), max_rows: pick(x.max_rows, y.max_rows) }),
+            app: nest(self.app, o.app, |a, b| AppFile { origins: pick(a.origins, b.origins), public_url: pick(a.public_url, b.public_url), anonymous_role: pick(a.anonymous_role, b.anonymous_role), max_rows: pick(a.max_rows, b.max_rows), static_dir: pick(a.static_dir, b.static_dir), sign_up: pick(a.sign_up, b.sign_up), max_request: pick(a.max_request, b.max_request), trust_proxy: pick(a.trust_proxy, b.trust_proxy),
+                proxy: nest(a.proxy, b.proxy, |x, y| { let (x, y) = (x.full(), y.full()); ProxyIn::Full(ProxyFile { to: pick(x.to, y.to), timeout: pick(x.timeout, y.timeout), connections: pick(x.connections, y.connections) }) }),
+                mcp: nest(a.mcp, b.mcp, |x, y| McpFile { users: pick(x.users, y.users), token_ttl: pick(x.token_ttl, y.token_ttl), grant_ttl: pick(x.grant_ttl, y.grant_ttl), max_rows: pick(x.max_rows, y.max_rows), sql: pick(x.sql, y.sql) }),
                 files: nest(a.files, b.files, |x, y| AppFilesFile { max_size: pick(x.max_size, y.max_size), link_ttl: pick(x.link_ttl, y.link_ttl) }),
                 tls: nest(a.tls, b.tls, |x, y| TlsFile { domains: pick(x.domains, y.domains), email: pick(x.email, y.email), cert: pick(x.cert, y.cert), key: pick(x.key, y.key), acme: pick(x.acme, y.acme), acme_root: pick(x.acme_root, y.acme_root), dir: pick(x.dir, y.dir), redirect: pick(x.redirect, y.redirect) }) }),
+            functions: nest(self.functions, o.functions, |a, b| { let (a, b) = (a.full(), b.full()); FunctionsIn::Full(FunctionsFile { dir: pick(a.dir, b.dir), watch: pick(a.watch, b.watch), timeout: pick(a.timeout, b.timeout), memory: pick(a.memory, b.memory), instances: pick(a.instances, b.instances) }) }),
             embed: nest(self.embed, o.embed, |a, b| EmbedFile { url: pick(a.url, b.url), model: pick(a.model, b.model), api_key: pick(a.api_key, b.api_key), dimensions: pick(a.dimensions, b.dimensions), batch: pick(a.batch, b.batch) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
             log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
@@ -307,6 +336,17 @@ impl ConfigFile {
             if let Some(n) = a.max_rows { if n == 0 { return Err("app.maxRows: at least 1".into()); } c.app.max_rows = n; }
             if let Some(m) = a.max_request { let m = size_of(m, "app.maxRequest")?; if !(64 << 10..=256 << 20).contains(&m) { return Err("app.maxRequest: between 64KB and 256MB".into()); } c.app.max_request = m as usize; }
             c.app.static_dir = a.static_dir.filter(|d| !d.is_empty()).map(PathBuf::from);
+            if let Some(p) = a.proxy.map(ProxyIn::full) {
+                let to = p.to.filter(|t| !t.is_empty()).ok_or("app.proxy: the app's address, such as http://127.0.0.1:3000")?.trim_end_matches('/').to_string();
+                let rest = to.strip_prefix("http://").ok_or("app.proxy: an http:// address (the app on this machine or a private network; the API is what speaks https)")?;
+                if rest.is_empty() || rest.contains(['/', '?', '#', '@']) { return Err("app.proxy: scheme, host and port only, such as http://127.0.0.1:3000".into()); }
+                let timeout = match p.timeout { Some(t) => dur_of(t, "app.proxy.timeout")?, None => Duration::from_secs(60) };
+                if timeout < Duration::from_secs(1) { return Err("app.proxy.timeout: at least 1s".into()); }
+                let connections = p.connections.unwrap_or(256); if !(1..=100_000).contains(&connections) { return Err("app.proxy.connections: between 1 and 100,000".into()); }
+                if c.app.static_dir.is_some() { return Err("app.staticDir and app.proxy: one or the other (the app serves its own files)".into()); }
+                c.app.proxy = Some(ProxyPolicy { to, timeout, connections });
+            }
+            if let Some(t) = a.trust_proxy { c.app.trust_proxy = t.iter().map(|n| crate::proxy::Net::parse(n).map_err(|e| format!("app.trustProxy: {e}"))).collect::<Result<_, _>>()?; }
             if let Some(m) = a.sign_up { c.app.sign_up = m.into_iter().map(|(t, cols)| (t.to_ascii_lowercase(), cols.into_iter().map(|c| c.to_ascii_lowercase()).collect())).collect(); }
             if let Some(f) = a.files {
                 if let Some(m) = f.max_size { let m = size_of(m, "app.files.maxSize")?; if m == 0 { return Err("app.files.maxSize: at least 1 byte".into()); } c.app.file_max = m; }
@@ -334,6 +374,7 @@ impl ConfigFile {
                 if let Some(d) = m.token_ttl { let d = dur_of(d, "app.mcp.tokenTtl")?; if d < Duration::from_secs(300) || d > Duration::from_secs(86400) { return Err("app.mcp.tokenTtl: between 5m and 1d".into()); } p.token_ttl = d; }
                 if let Some(d) = m.grant_ttl { let d = dur_of(d, "app.mcp.grantTtl")?; if d < Duration::from_secs(3600) || d > Duration::from_secs(365 * 86400) { return Err("app.mcp.grantTtl: between 1h and 365d".into()); } p.grant_ttl = d; }
                 if let Some(n) = m.max_rows { if n == 0 { return Err("app.mcp.maxRows: at least 1".into()); } p.max_rows = n; }
+                if let Some(b) = m.sql { p.sql = b; }
                 // the issuer and the resource are absolute URLs agents check
                 if c.app.public_url.as_deref().is_none_or(|u| !u.starts_with("https://") && !(u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1") || u.starts_with("http://[::1]"))) {
                     return Err("app.mcp needs app.publicUrl, the https address agents reach this server at (or app.tls.domains); http only on this machine".into());
@@ -341,6 +382,13 @@ impl ConfigFile {
                 if c.app.public_url.as_deref().and_then(|u| u.split_once("://")).is_some_and(|(_, r)| r.contains('/')) { return Err("app.mcp: app.publicUrl is an origin, without a path (agents find the server at its /.well-known)".into()); }
                 c.app.mcp = Some(p);
             }
+        }
+        if let Some(f) = self.functions.map(FunctionsIn::full) {
+            c.functions.dir = f.dir.filter(|d| !d.is_empty()).map(PathBuf::from);
+            if let Some(w) = f.watch { c.functions.watch = w; }
+            if let Some(t) = f.timeout { let t = dur_of(t, "functions.timeout")?; if t < Duration::from_millis(10) || t > Duration::from_secs(300) { return Err("functions.timeout: between 10ms and 5m".into()); } c.functions.timeout = t; }
+            if let Some(m) = f.memory { let m = size_of(m, "functions.memory")?; if !(4 << 20..=4 << 30).contains(&m) { return Err("functions.memory: between 4MB and 4GB".into()); } c.functions.memory = m as usize; }
+            if let Some(n) = f.instances { if !(1..=1024).contains(&n) { return Err("functions.instances: between 1 and 1024".into()); } c.functions.instances = n; }
         }
         if let Some(a) = self.auth {
             if let Some(d) = a.session_ttl { let d = dur_of(d, "auth.sessionTtl")?; if d < Duration::from_secs(60) { return Err("auth.sessionTtl: at least 60s".into()); } c.auth.session_ttl = d; }

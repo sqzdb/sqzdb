@@ -10,7 +10,8 @@ export class SqzError extends Error {
   readonly code: string;
 }
 
-export interface SignedIn { token: string; user: Row; created: boolean; }
+/** `token` is absent in cookie mode: the session is the cookie. */
+export interface SignedIn { token?: string; user: Row; created: boolean; }
 
 export interface Auth {
   readonly table: string;
@@ -47,9 +48,13 @@ export interface Client {
   readonly ready: Promise<void>;
   sql(sql: string, params?: Param[]): Promise<Row[] & { lastInsertId?: Value }>;
   batch(statements: Array<[string, Param[]?] | { sql: string; params?: Param[] }>): Promise<Row[][]>;
+  /** Call one of the app's functions as the signed-in user; resolves to what it returned. */
+  call<R = unknown>(name: string, args?: Record<string, unknown>): Promise<R>;
   live(sql: string, params: Array<Value | FileValue>, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqzError) => void): Live;
   live(sql: string, fn: (rows: Row[], info: { initial: boolean }) => void, onError?: (e: SqzError) => void): Live;
   close(): void;
 }
 
-export function connect(url: string, opts?: { users?: string; storage?: Storage | null; fetch?: typeof fetch; WebSocket?: typeof WebSocket }): Client;
+/** `cookies`: keep the session in the API's HttpOnly cookie (a page the API serves itself: app.proxy or app.staticDir);
+ *  `url` then defaults to the page's own origin. */
+export function connect(url?: string, opts?: { users?: string; storage?: Storage | null; fetch?: typeof fetch; WebSocket?: typeof WebSocket; cookies?: boolean }): Client;

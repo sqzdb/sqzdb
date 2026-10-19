@@ -520,7 +520,10 @@ impl GLog {
     pub fn wait_feed(&self, last_seq: u64, durable_only: bool, timeout: std::time::Duration) -> u64 { let mut s = self.st.lock().unwrap(); if (if durable_only { s.durable } else { s.seq }) <= last_seq { self.feed_wake.store(true, Ordering::Release); let (g, _) = self.cv_feed.wait_timeout(s, timeout).unwrap(); s = g; self.feed_wake.store(false, Ordering::Release); } s.seq }
     /// A DDL or ACL statement: appended to the log and to the in-memory catalog under one lock, so a snapshot
     /// taken at sequence S sees exactly the statements with sequence <= S.
-    pub fn append_meta(self: &Arc<Self>, text: &str) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let restart = s.started && !s.running; if restart { s.running = true; } let seq = self.push_record(&mut s, OP_META, u16::MAX, text.as_bytes()); s.catalog.push(text.to_string()); drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
+    pub fn append_meta(self: &Arc<Self>, text: &str) -> u64 { self.append_meta_replacing(text, None) }
+    /// The same, taking the place in the catalog of every earlier statement that starts with `replaces` (the log keeps
+    /// them until the next snapshot drops it).
+    pub fn append_meta_replacing(self: &Arc<Self>, text: &str, replaces: Option<&str>) -> u64 { let mut s = self.st.lock().unwrap(); while s.buf.len() >= LOG_BUF_CAP { self.cv_batch.notify_one(); s = self.cv_space.wait(s).unwrap(); } let restart = s.started && !s.running; if restart { s.running = true; } let seq = self.push_record(&mut s, OP_META, u16::MAX, text.as_bytes()); if let Some(p) = replaces { s.catalog.retain(|c| !c.starts_with(p)); } s.catalog.push(text.to_string()); drop(s); if restart { self.spawn_threads(); } self.cv_batch.notify_one(); seq }
     /// Records after `last` from the in-memory ring, up to `upto` (durable position in durable mode). `false` when the
     /// ring no longer reaches back to `last + 1`: the caller must read the files to catch up.
     pub fn recent_after(&self, last: u64, durable_only: bool) -> (Vec<(u64, u8, u16, Arc<[u8]>)>, bool) {
@@ -744,6 +747,10 @@ pub struct Table {
     /// Bumped on every write, for tables sign-in depends on (the users table and the auth system tables): sessions
     /// built from a token check it before each statement (see `auth.rs`).
     pub watch: OnceLock<Arc<std::sync::atomic::AtomicU64>>,
+    /// Writes made visible (bumped after each publish), and transaction commits writing this table that are between
+    /// their validation and their publish: what a transaction that read the table other than by key checks at its
+    /// commit (`Txn::scans`).
+    pub(crate) commits: std::sync::atomic::AtomicU64, pub(crate) committing: std::sync::atomic::AtomicU64,
 }
 /// The target of an online ALTER TABLE: a table with the new schema and a row converter old -> new.
 #[derive(Clone)] pub struct Shadow { pub table: Arc<Table>, pub convert: Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync> }
@@ -751,13 +758,13 @@ impl Table { #[inline] fn base_is_some(&self) -> bool { self.base.get().is_some(
     /// Bump the watch counter (see `watch`). Called once a write is visible, never before: a session that checked its
     /// token between the log append and the publish would otherwise record the new count against the old rows and
     /// never check again.
-    #[inline] fn touched(&self) { if let Some(w) = self.watch.get() { w.fetch_add(1, Ordering::Release); } } }
+    #[inline] fn touched(&self) { self.commits.fetch_add(1, Ordering::SeqCst); if let Some(w) = self.watch.get() { w.fetch_add(1, Ordering::Release); } } }
 impl Table {
     pub fn new(id: u16, schema: Schema, log: Arc<GLog>, durable: bool) -> Table {
         let wide = schema.key16;
         let stride = 16 + schema.row_size;
         Table { id, schema, stride, chunks_: Lazy2::new(MAX_CHUNKS, 64, || RwLock::new(Chunk { data: None })), next_slot: AtomicU32::new(0),
-                pk_: Lazy2::new(PK_SHARDS, 64, if wide { pk_wide } else { pk_narrow }), sec_: Lazy2::new(SEC_SHARDS, 64, || RwLock::new(UniqShard::default())), indexes: RwLock::new(vec![]), log, durable, base: OnceLock::new(), map: OnceLock::new(), free: Mutex::new(vec![]), shadow: RwLock::new(None), retired: std::sync::atomic::AtomicBool::new(false), fks: RwLock::new(vec![]), children: RwLock::new(vec![]), owner_since: std::sync::atomic::AtomicU64::new(0), owner_until: std::sync::atomic::AtomicU64::new(u64::MAX) , next_id: Arc::new(std::sync::atomic::AtomicI64::new(0)), watch: OnceLock::new() }
+                pk_: Lazy2::new(PK_SHARDS, 64, if wide { pk_wide } else { pk_narrow }), sec_: Lazy2::new(SEC_SHARDS, 64, || RwLock::new(UniqShard::default())), indexes: RwLock::new(vec![]), log, durable, base: OnceLock::new(), map: OnceLock::new(), free: Mutex::new(vec![]), shadow: RwLock::new(None), retired: std::sync::atomic::AtomicBool::new(false), fks: RwLock::new(vec![]), children: RwLock::new(vec![]), owner_since: std::sync::atomic::AtomicU64::new(0), owner_until: std::sync::atomic::AtomicU64::new(u64::MAX) , next_id: Arc::new(std::sync::atomic::AtomicI64::new(0)), watch: OnceLock::new(), commits: Default::default(), committing: Default::default() }
     }
     /// Use another table's id sequence (the shadow of an online ALTER shares the original's).
     pub fn with_counter(mut self, c: Arc<std::sync::atomic::AtomicI64>) -> Table { self.next_id = c; self }
@@ -1217,6 +1224,13 @@ pub struct Database {
     pub long_era: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug, Default)] pub struct SnapStats { pub rows: u64, pub bytes: u64, pub low_water: u64, pub secs: f64, pub deleted_segments: usize }
+/// A catalog record read back at a restart: a deploy of functions takes the place of the ones before it, as when it was
+/// logged (`GLog::append_meta_replacing`).
+fn keep_latest(catalog: &mut Vec<String>, text: String) {
+    let p = crate::functions::FUNCTIONS_META;
+    if text.starts_with(p) { catalog.retain(|c| !c.starts_with(p)); }
+    catalog.push(text);
+}
 #[derive(Debug, Default)] pub struct RecStats { pub snap_rows: u64, pub snap_secs: f64, pub catalog: usize, pub replayed: u64, pub skipped: u64, pub replay_secs: f64, pub segments: usize, pub low_water: u64 }
 /// The file that marks a directory as one sqzdb database and records the layout version of its files.
 pub const META_FILE: &str = "sqzdb.meta";
@@ -1423,7 +1437,7 @@ impl Database {
             st.low_water = u64::from_le_bytes(h[8..16].try_into().unwrap());
             max_seq = u64::from_le_bytes(h[16..24].try_into().unwrap());  // the log position at the snapshot point: new sequences continue from here even if the last records were deletes
             let mut b4 = [0u8; 4]; f.read_exact(&mut b4).map_err(|e| e.to_string())?; let ncat = u32::from_le_bytes(b4) as usize;
-            for _ in 0..ncat { f.read_exact(&mut b4).map_err(|e| e.to_string())?; let l = u32::from_le_bytes(b4) as usize; let mut tb = vec![0u8; l]; f.read_exact(&mut tb).map_err(|e| e.to_string())?; let text = String::from_utf8_lossy(&tb).into_owned(); meta(&text)?; catalog.push(text); }
+            for _ in 0..ncat { f.read_exact(&mut b4).map_err(|e| e.to_string())?; let l = u32::from_le_bytes(b4) as usize; let mut tb = vec![0u8; l]; f.read_exact(&mut tb).map_err(|e| e.to_string())?; let text = String::from_utf8_lossy(&tb).into_owned(); meta(&text)?; keep_latest(&mut catalog, text); }
             let mut b2 = [0u8; 2]; f.read_exact(&mut b2).map_err(|e| e.to_string())?; let ntables = u16::from_le_bytes(b2) as usize;
             let mut dir = vec![0u8; SNAP_HDR * ntables]; f.read_exact(&mut dir).map_err(|e| e.to_string())?;
             // the rows stay in the file: map it privately (copy-on-write), point the chunks and the mapped indexes at it
@@ -1466,7 +1480,7 @@ impl Database {
                 if seq > upto { break; }
                 max_seq = max_seq.max(seq); st.replayed += 1;
                 if op == OP_META { self.log.st.lock().unwrap().seq = seq - 1; }  // so create/alter record the ownership interval at this sequence
-                if let Some(text) = self.apply_record(seq, op, table, &payload, meta)? { catalog.push(text); }
+                if let Some(text) = self.apply_record(seq, op, table, &payload, meta)? { keep_latest(&mut catalog, text); }
             }
             if max_seq >= upto { break; }
         }
@@ -1492,8 +1506,26 @@ impl TxnWrite {
     fn slot(&self) -> u32 { match self { TxnWrite::Insert { slot, .. } | TxnWrite::Update { slot, .. } | TxnWrite::Delete { slot, .. } => *slot } }
     fn op(&self) -> u8 { match self { TxnWrite::Insert { .. } => OP_INSERT, TxnWrite::Update { .. } => OP_UPDATE, TxnWrite::Delete { .. } => OP_DELETE } }
 }
-pub struct Txn { pub id: u64, pub writes: Vec<TxnWrite>, pub reads: Vec<(Arc<Table>, u32, u64)>, by_key: crate::util::TxnKeyMap }
-impl Txn { pub fn new() -> Txn { Txn { id: TXN_IDS.fetch_add(1, Ordering::Relaxed), writes: vec![], reads: vec![], by_key: Default::default() } } }
+pub struct Txn { pub id: u64, pub writes: Vec<TxnWrite>, pub reads: Vec<(Arc<Table>, u32, u64)>, by_key: crate::util::TxnKeyMap,
+    /// Tables read other than by key (a scan, an index, a range, a UNIQUE value, a subquery), with the table's
+    /// `commits` when first read: the commit fails with a conflict if any other write to one became visible since, or
+    /// is on its way. Per table, so it is coarse: any concurrent write to a table read that way conflicts.
+    pub scans: Vec<(Arc<Table>, u64)>,
+    /// Why this transaction may not commit (a function that failed inside it): COMMIT fails with this.
+    pub doomed: Option<String> }
+impl Txn {
+    pub fn new() -> Txn { Txn { id: TXN_IDS.fetch_add(1, Ordering::Relaxed), writes: vec![], reads: vec![], by_key: Default::default(), scans: vec![], doomed: None } }
+    /// Note a read of `table` other than by key (before its rows are read: see `scans`).
+    pub fn scanned(&mut self, table: &Arc<Table>) { if !self.scans.iter().any(|(t, _)| t.id == table.id) { self.scans.push((table.clone(), table.commits.load(Ordering::SeqCst))); } }
+    /// Whether this transaction has written `table`: its reads of it then see its own rows (`shadows`, `own_rows`).
+    pub fn wrote(&self, table: &Table) -> bool { self.writes.iter().any(|w| w.table().id == table.id) }
+    /// Whether this transaction wrote the row of `table` with key `pk`: the committed row is not the one it sees.
+    #[inline] pub fn shadows(&self, table: &Table, pk: Key) -> bool { self.by_key.contains_key(&(table.id, pk)) }
+    /// The rows of `table` as this transaction left them, one per key: inserted or updated, not deleted.
+    pub fn own_rows<'a>(&'a self, table: &'a Table) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.writes.iter().enumerate().filter(move |(i, w)| w.table().id == table.id && !matches!(w, TxnWrite::Delete { .. }) && !w.row().is_empty() && self.by_key.get(&(table.id, table.schema.key_of(w.row()))) == Some(i)).map(|(_, w)| w.row().as_slice())
+    }
+}
 impl Default for Txn { fn default() -> Self { Self::new() } }
 
 impl Table {
@@ -1642,6 +1674,12 @@ impl Database {
         }
         let undo = |txn: &Txn, n: usize| { for w in txn.writes[..n].iter().rev() { match w { TxnWrite::Insert { table, row, slot } => table.unclaim_insert(row, *slot), TxnWrite::Update { table, slot, row, old_key, .. } => table.unclaim_update(*slot, row, old_key.as_deref()), TxnWrite::Delete { table, slot, .. } => table.unclaim_delete(*slot) } } };
         if let Some(e) = err { undo(&txn, claimed); return Err(e); }
+        // in flight on each table it writes, from before its validation until its rows are visible: a transaction that
+        // scanned one of them and validates meanwhile conflicts (see `Txn::scans`)
+        let mut written: Vec<Arc<Table>> = vec![];
+        for w in &txn.writes { if !written.iter().any(|t| t.id == w.table().id) { written.push(w.table().clone()); } }
+        for t in &written { t.committing.fetch_add(1, Ordering::SeqCst); }
+        let landed = |written: &[Arc<Table>]| for t in written { t.committing.fetch_sub(1, Ordering::SeqCst); };
         // phase 2
         let mut locks: Vec<(u16, usize)> = txn.writes.iter().map(|w| (w.table().id, w.slot() as usize / CHUNK_ROWS)).collect();
         locks.extend(txn.reads.iter().map(|(t, s, _)| (t.id, *s as usize / CHUNK_ROWS)));
@@ -1656,7 +1694,13 @@ impl Database {
                 let i = idx(t.id, *slot as usize / CHUNK_ROWS);
                 let d = t.alloc_in(&mut guards[i]); let off = (*slot as usize % CHUNK_ROWS) * t.stride;
                 let (cv, cp) = Table::hdr_at(d, off);
-                if cv != *v || (cp != 0 && cp != mark) { drop(guards); undo(&txn, claimed); return Err(Abort::Conflict); }
+                if cv != *v || (cp != 0 && cp != mark) { drop(guards); landed(&written); undo(&txn, claimed); return Err(Abort::Conflict); }
+            }
+            // tables read other than by key: no write became visible since, and none other than this one is on its way
+            // (in flight first, then visible: a commit that finishes in between is seen by the second)
+            for (t, v) in &txn.scans {
+                let own = written.iter().any(|w| w.id == t.id) as u64;
+                if t.committing.load(Ordering::SeqCst) > own || t.commits.load(Ordering::SeqCst) != *v { drop(guards); landed(&written); undo(&txn, claimed); return Err(Abort::Conflict); }
             }
             let mut payload = Vec::with_capacity(txn.writes.iter().map(|w| w.row().len() + 7).sum());
             let mut ring = Vec::with_capacity(payload.capacity() + 64);
@@ -1687,6 +1731,7 @@ impl Database {
         }
         for w in &txn.writes { if let TxnWrite::Update { table, row, old_key: Some(k), slot, .. } = w { if table.unique_key(row) != Some(&k[..]) { table.uniq_remove(k, *slot); } } }
         for w in &txn.writes { w.table().touched(); }   // after publishing: a sign-in check before this sees the change next time
+        landed(&written);
         self.log.published();
         for w in &txn.writes { match w { TxnWrite::Insert { table, row, .. } => table.mirror_insert(row), TxnWrite::Update { table, row, .. } => table.mirror_update(row), TxnWrite::Delete { table, row, .. } => table.mirror_delete(table.pk_of(row)) } }
         Ok(seq)

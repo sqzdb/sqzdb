@@ -1,4 +1,5 @@
-//! The `sqzdb` command: `serve` a database directory (Unix socket, TCP, the web console) and `shell` into one.
+//! The `sqzdb` command: `serve` a database directory (Unix socket, TCP, the web console), `shell` into one, and `deploy`
+//! an app's functions to one.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;   // musl's allocator halves the engine's speed (E45)
@@ -21,12 +22,13 @@ fn main() {
     match args.first().map(|s| s.as_str()) {
         Some("serve") => serve(&args[1..]),
         Some("shell") => shell(&args[1..]),
+        Some("deploy") => deploy(&args[1..]),
         Some("version") | Some("--version") => println!("sqzdb {}", env!("CARGO_PKG_VERSION")),
         _ => usage(),
     }
 }
 fn usage() -> ! {
-    eprintln!("usage:\n  sqzdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps; with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqzdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqzdb shell <host:port> --token <t>    The same over TCP against a running server.");
+    eprintln!("usage:\n  sqzdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--functions <folder>] [--proxy <http://host:port>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps (with --proxy, in front of your app: what isn't the API's goes on to it); with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqzdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqzdb shell <host:port> --token <t>    The same over TCP against a running server.\n  sqzdb deploy <folder> <dir>            Deploy the app's functions in <folder> (.ts, .js) to a database directory (not open elsewhere).\n  sqzdb deploy <folder> <host:port> --token <t>   The same to a running server, over its TCP port.\n      `serve --functions <folder>` deploys a folder when the server starts, and again whenever it changes.");
     std::process::exit(2)
 }
 fn flag(a: &[String], name: &str) -> Option<String> { a.iter().position(|s| s == name).and_then(|i| a.get(i + 1).cloned()) }
@@ -48,10 +50,14 @@ fn serve(a: &[String]) {
     if let Some(v) = flag(a, "--tcp") { listen.insert("tcp".into(), json!(v)); }
     if let Some(v) = flag(a, "--socket") { listen.insert("socket".into(), json!(v)); }
     if let Some(v) = flag(a, "--app") { listen.insert("app".into(), json!(v)); }
+    if let Some(v) = flag(a, "--functions") { opts.insert("functions".into(), json!(v)); }
+    let mut app = Map::new();
+    if let Some(v) = flag(a, "--proxy") { app.insert("proxy".into(), json!(v)); }
     let mut tls = Map::new();
     if let Some(d) = flag(a, "--domain") { tls.insert("domains".into(), json!(d.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>())); }
     if let Some(e) = flag(a, "--email") { tls.insert("email".into(), json!(e)); }
-    if !tls.is_empty() { opts.insert("app".into(), json!({ "tls": tls })); }
+    if !tls.is_empty() { app.insert("tls".into(), J::Object(tls)); }
+    if !app.is_empty() { opts.insert("app".into(), J::Object(app)); }
     let mut printed_token = None;
     match flag(a, "--token") { Some(t) => { listen.insert("token".into(), json!(t)); } None => if listen.contains_key("http") || listen.contains_key("tcp") { let t = random_token(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t); } }
     if !listen.is_empty() { opts.insert("listen".into(), J::Object(listen)); }
@@ -68,12 +74,30 @@ fn serve(a: &[String]) {
         let tls = cfg.app.tls.as_ref().map(|t| if t.cert.is_some() { format!("  (on {h}, your certificate)") } else { format!("  (on {h}, certificate from {})", t.acme.split('/').nth(2).unwrap_or(&t.acme)) }).unwrap_or_default();
         println!("  app API:    {url}/api/{tls}{}", cfg.app.static_dir.as_ref().map(|d| format!("  (and the files in {})", d.display())).unwrap_or_default());
         if let Some(r) = cfg.app.tls.as_ref().and_then(|t| t.redirect.as_ref()) { println!("  redirect:   http://{r}/ to https"); }
+        if let Some(p) = &cfg.app.proxy { println!("  proxy:      everything else to {}", p.to); }
     }
+    if let Some(d) = &cfg.functions.dir { let names: Vec<String> = sql.function_defs().into_iter().map(|f| f.name).collect(); println!("  functions:  {} from {}{}: {}", names.len(), d.display(), if cfg.functions.watch { " (watched)" } else { "" }, names.join(", ")); }
     if let Some(t) = printed_token { println!("  token:      {t}   (generated; pass --token to choose one)"); }
     unsafe { libc::signal(libc::SIGINT, on_signal as libc::sighandler_t); libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t); }
     while !STOP.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(100)); }
     let t = Instant::now(); let st = sql.snapshot(); sql.close();
     println!("\nstopped: final snapshot of {} rows in {:.0} ms", st.rows, t.elapsed().as_secs_f64() * 1e3);
+}
+
+/// `deploy <folder> <dir | host:port --token t>`: the folder's functions, as one `DEPLOY FUNCTIONS` statement.
+fn deploy(a: &[String]) {
+    let (Some(folder), Some(target)) = (a.first().filter(|s| !s.starts_with("--")), a.get(1).filter(|s| !s.starts_with("--"))) else { usage() };
+    let files = sqzdb::functions::read_folder(std::path::Path::new(folder)).unwrap_or_else(|e| fail(e));
+    let text = format!("{}{}", sqzdb::functions::FUNCTIONS_META, json!({"files": files.iter().cloned().collect::<std::collections::BTreeMap<String, String>>()}));
+    let rows = if !std::path::Path::new(target).exists() && target.contains(':') {
+        let token = flag(a, "--token").unwrap_or_else(|| usage());
+        Client::connect_tcp(target, &token).unwrap_or_else(|e| fail(format!("{target}: {e}"))).exec(&text, &[]).unwrap_or_else(|e| fail(e))
+    } else {
+        let sql = Sql::open_with(std::path::Path::new(target), Config { create: false, ..Config::default() }).unwrap_or_else(|e| fail(e));
+        let r = sql.exec_s(&mut Session::default(), &text, &[]).unwrap_or_else(|e| fail(e)); sql.close(); r
+    };
+    let names: Vec<String> = rows.iter().filter_map(|r| match r.first() { Some(Value::Text(n)) => Some(n.clone()), _ => None }).collect();
+    println!("deployed {} function{} from {} ({} file{}): {}", names.len(), if names.len() == 1 { "" } else { "s" }, folder, files.len(), if files.len() == 1 { "" } else { "s" }, names.join(", "));
 }
 
 enum Conn { Local(Arc<Sql>, Session), Remote(Client) }
