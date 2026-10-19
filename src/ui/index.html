@@ -776,8 +776,9 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   const TYPES = ['INT', 'DOUBLE', 'BOOL', 'TEXT', 'BYTES', 'TIMESTAMP', 'UUID'];
   const RESERVED = new Set('select from where order group by limit insert into values update set delete create alter drop table column index primary key unique references default not null and or in is between like as on join check user desc asc count sum min max avg case when then else end true false'.split(' '));
   function qid(n) { return /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) && !RESERVED.has(n.toLowerCase()) ? n : '"' + String(n).replace(/"/g, '""') + '"'; }
-  const splitType = (t) => { const m = /^(TEXT|BYTES)\((\d+)\)$/.exec(t); return m ? [m[1], Number(m[2])] : [t, 255]; };
-  const sqlType = (c) => (c.type === 'TEXT' ? `VARCHAR(${c.size})` : c.type === 'BYTES' ? `BLOB(${c.size})` : c.type);
+  // TEXT and BYTES: a size keeps up to that many bytes in the row (TEXT(n)); no size means any length
+  const splitType = (t) => { const m = /^(TEXT|BYTES)\((\d+)\)$/.exec(t); return m ? [m[1], Number(m[2])] : [t, '']; };
+  const sqlType = (c) => (c.type === 'TEXT' ? (c.size ? `VARCHAR(${c.size})` : 'TEXT') : c.type === 'BYTES' ? (c.size ? `BLOB(${c.size})` : 'BYTES') : c.type);
   const GENERATORS = { UUID: ['uuid()', 'gen_random_uuid()'], TIMESTAMP: ['now()', 'current_timestamp'] };
   const sized = (t) => t === 'TEXT' || t === 'BYTES';
   const pkOf = (name) => { const t = tablesCache.find((x) => x.name.toLowerCase() === name.toLowerCase()); const c = t && t.columns.find((x) => x.pk); return c ? c.name : 'id'; };
@@ -785,7 +786,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   const KEY_TYPES = ['INT', 'UUID'];
   const LOCKED = 'cannot be changed once the table exists (yet)';
   let D = null, lastFocus = null;
-  const blank = () => ({ orig: null, name: '', type: 'TEXT', size: 255, pk: false, auto: false, notnull: false, unique: false, def: '', ref: '', onDelete: 'RESTRICT', removed: false });
+  const blank = () => ({ orig: null, name: '', type: 'TEXT', size: '', pk: false, auto: false, notnull: false, unique: false, def: '', ref: '', onDelete: 'RESTRICT', removed: false });
   function openDesigner(name) {
     if (name) {
       const t = tablesCache.find((x) => x.name === name); if (!t) return;
@@ -814,8 +815,8 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
       name.addEventListener('input', () => { c.name = name.value; update(); });
       const typ = el('select', { 'aria-label': 'type', disabled: c.removed || c.pk && alter, title: c.pk && alter ? 'the primary key type ' + LOCKED : '' }, TYPES.map((t) => opt(t, t, c.type)));
       typ.addEventListener('change', () => { c.type = typ.value; if (c.pk && !KEY_TYPES.includes(c.type)) c.pk = false; if (c.pk && c.type === 'UUID') { c.auto = false; if (!c.def) c.def = 'uuid()'; } if (c.pk && c.type === 'INT' && c.def === 'uuid()') c.def = ''; if (c.ref && keyTypeOf(c.ref) !== c.type) c.ref = ''; renderCols(); });
-      const size = el('input', { class: 'input', type: 'number', min: '1', max: '65535', value: sized(c.type) ? c.size : '', disabled: !sized(c.type) || c.removed, 'aria-label': 'size', title: 'maximum length in bytes (up to 65535)' });
-      size.addEventListener('input', () => { c.size = Number(size.value); update(); });
+      const size = el('input', { class: 'input', type: 'number', min: '1', max: '65535', value: sized(c.type) ? c.size : '', placeholder: sized(c.type) ? 'any' : '', disabled: !sized(c.type) || c.removed, 'aria-label': 'size', title: 'empty: any length (up to 16 MB); a number: at most that many bytes (up to 65535)' });
+      size.addEventListener('input', () => { c.size = size.value === '' ? '' : Number(size.value); update(); });
       const pk = el('input', { type: 'radio', name: 'dpk', checked: c.pk, disabled: alter || c.removed, 'aria-label': 'primary key', title: alter ? 'the primary key ' + LOCKED : 'primary key (INT or UUID)' });
       pk.addEventListener('change', () => { D.cols.forEach((x) => { x.pk = false; }); c.pk = true; if (!KEY_TYPES.includes(c.type)) c.type = 'INT'; c.notnull = true; c.unique = false; c.ref = ''; if (c.type === 'UUID' && !c.def) c.def = 'uuid()'; renderCols(); });
       const nn = el('input', { type: 'checkbox', checked: c.notnull || c.pk, disabled: c.pk || c.removed, 'aria-label': 'not null' });
@@ -860,7 +861,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   }
   function build() {
     const cols = D.cols.filter((c) => !c.removed); const names = new Set();
-    for (const c of cols) { const n = c.name.trim(); if (!n) throw 'every column needs a name'; if (names.has(n.toLowerCase())) throw `two columns are named ${n}`; names.add(n.toLowerCase()); if (sized(c.type) && !(Number.isInteger(c.size) && c.size >= 1 && c.size <= 65535)) throw `size of ${n} must be between 1 and 65535`; if (c.ref && c.onDelete === 'SET NULL' && c.notnull) throw `${n}: ON DELETE SET NULL needs a column that allows NULL`; }
+    for (const c of cols) { const n = c.name.trim(); if (!n) throw 'every column needs a name'; if (names.has(n.toLowerCase())) throw `two columns are named ${n}`; names.add(n.toLowerCase()); if (sized(c.type) && c.size !== '' && !(Number.isInteger(c.size) && c.size >= 1 && c.size <= 65535)) throw `size of ${n} must be empty (any length) or between 1 and 65535`; if (c.ref && c.onDelete === 'SET NULL' && c.notnull) throw `${n}: ON DELETE SET NULL needs a column that allows NULL`; }
     if (D.mode === 'create') {
       const tn = $('dname').value.trim(); if (!tn) throw 'the table needs a name';
       if (tablesCache.some((t) => t.name.toLowerCase() === tn.toLowerCase())) throw `a table named ${tn} already exists`;

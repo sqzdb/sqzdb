@@ -13,7 +13,7 @@
 //! - After 5 failed sign-ins for one login, the next attempt waits 1 s, then 2, 4 … up to 15 minutes. An unknown login
 //!   costs the same hash as a known one, and both fail with the same message.
 use crate::sql::{Session, Sql};
-use crate::table::{decode_col, encode_row, encode_value, now_micros, ColType, Key, Table, Txn, Value};
+use crate::table::{decode_col, encode_row, now_micros, ColType, Key, Table, Txn, Value};
 use argon2::password_hash::{Output, ParamsString, PasswordHash, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use std::collections::HashMap;
@@ -25,6 +25,17 @@ pub const SESSIONS: &str = "_auth_sessions";
 /// Longest `<table>:<key>` a password row is filed under.
 const ID_MAX: usize = 160;
 const TOKEN_PREFIX: &str = "sqz_";
+/// An agent's access token over MCP (`mcp.rs`): a session like any other, but its id is hashed with "mcp:" first, so
+/// the app API never takes one and /mcp takes nothing else (a token works only where it was issued for).
+const MCP_PREFIX: &str = "sqzm_";
+/// The longest an agent's sign-in lasts, however often it refreshes.
+const GRANT_MAX: std::time::Duration = std::time::Duration::from_secs(90 * 86400);
+/// Registered agents at most; past it, ones that never got a token and are a day old make room.
+const CLIENTS_MAX: usize = 10_000;
+/// An agent's refresh token: one use, then a new one (`mcp_refresh`).
+const GRANT_PREFIX: &str = "sqzr_";
+pub const MCP_GRANTS: &str = "_sqz_mcp_grants";
+pub const MCP_CLIENTS: &str = "_sqz_mcp_clients";
 const PASSWORD_MAX: usize = 1024;
 const FREE_FAILURES: u32 = 5;
 const LOCK_MAX: Duration = Duration::from_secs(15 * 60);
@@ -92,9 +103,13 @@ fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 fn unhex(s: &str) -> Option<Vec<u8>> { if s.len() % 2 != 0 { return None; } (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect() }
 fn token_id(token: &str) -> Option<[u8; 32]> {
     use sha2::Digest;
-    let raw = unhex(token.strip_prefix(TOKEN_PREFIX)?)?; if raw.len() != 32 { return None; }
-    Some(sha2::Sha256::digest(&raw).into())
+    let (raw, tag): (Vec<u8>, &[u8]) = match token.strip_prefix(MCP_PREFIX) { Some(h) => (unhex(h)?, b"mcp:"), None => (unhex(token.strip_prefix(TOKEN_PREFIX)?)?, b"") };
+    if raw.len() != 32 { return None; }
+    let mut h = sha2::Sha256::new(); h.update(tag); h.update(&raw); Some(h.finalize().into())
 }
+fn grant_id(token: &str) -> Option<[u8; 32]> { use sha2::Digest; let raw = unhex(token.strip_prefix(GRANT_PREFIX)?)?; if raw.len() != 32 { return None; } Some(sha2::Sha256::digest(&raw).into()) }
+/// An MCP access token, which only /mcp takes.
+pub fn is_mcp_token(token: &str) -> bool { token.starts_with(MCP_PREFIX) }
 fn normalize(login: &str) -> String { login.trim().to_lowercase() }
 const WRONG: &str = "sign-in failed: wrong login or password";
 /// The hash stored for a user who signs in only through a provider: no password matches it.
@@ -118,13 +133,13 @@ impl Sql {
         if table.contains(':') { return Err(format!("{table}: the name of a table users sign in to can't contain ':'")); }
         let t = self.db.table(table).ok_or_else(|| format!("no such table {table}"))?;
         let s = &t.schema;
-        let login = s.unique.filter(|&u| matches!(s.columns[u].ty, ColType::Text(_))).ok_or_else(|| format!("{table} needs a UNIQUE text column to sign in with, such as email TEXT UNIQUE"))?;
-        let keylen = match &s.columns[s.pk].ty { ColType::Int => 20, ColType::Uuid => 36, ColType::Text(n) | ColType::Bytes(n) => *n, _ => usize::MAX };
-        if matches!(s.columns[s.pk].ty, ColType::Bytes(_)) || s.name.len() + 1 + keylen > ID_MAX { return Err(format!("{table}: the key of a table users sign in to is an INT, a UUID or a short text (at most {} characters here)", ID_MAX.saturating_sub(s.name.len() + 1))); }
+        let login = s.unique.filter(|&u| s.columns[u].ty.is_text()).ok_or_else(|| format!("{table} needs a UNIQUE text column to sign in with, such as email TEXT UNIQUE"))?;
+        let keylen = match &s.columns[s.pk].ty { ColType::Int => 20, ColType::Uuid => 36, ColType::Text(n) | ColType::Bytes(n) => *n, ColType::LongText => 0, _ => usize::MAX };   // a key of any length is checked when a session is made
+        if s.columns[s.pk].ty.is_bytes() || s.name.len() + 1 + keylen > ID_MAX { return Err(format!("{table}: the key of a table users sign in to is an INT, a UUID or a short text (at most {} characters here)", ID_MAX.saturating_sub(s.name.len() + 1))); }
         let role = match role {
-            Some((true, col)) => { let c = s.col(&col).ok_or_else(|| format!("no such column {col}"))?; if !matches!(s.columns[c].ty, ColType::Text(_)) { return Err(format!("ROLE FROM {col}: the column must be text")); } RoleSrc::Column(c) }
+            Some((true, col)) => { let c = s.col(&col).ok_or_else(|| format!("no such column {col}"))?; if !s.columns[c].ty.is_text() { return Err(format!("ROLE FROM {col}: the column must be text")); } RoleSrc::Column(c) }
             Some((false, name)) => { if !self.acl.read().unwrap().roles.contains(&name) { return Err(format!("no such role {name}")); } RoleSrc::Fixed(name) }
-            None => match s.col("role") { Some(c) if matches!(s.columns[c].ty, ColType::Text(_)) => RoleSrc::Column(c), _ => return Err(format!("say which role a user of {table} gets: ENABLE AUTH (ROLE FROM column) or ENABLE AUTH (ROLE name)")) },
+            None => match s.col("role") { Some(c) if s.columns[c].ty.is_text() => RoleSrc::Column(c), _ => return Err(format!("say which role a user of {table} gets: ENABLE AUTH (ROLE FROM column) or ENABLE AUTH (ROLE name)")) },
         };
         for (name, ddl) in [(SECRETS, "CREATE TABLE _auth_secrets (id VARCHAR(160) PRIMARY KEY, hash VARCHAR(160) NOT NULL, gen BYTES(16) NOT NULL, changed TIMESTAMP NOT NULL)"),
                             (SESSIONS, "CREATE TABLE _auth_sessions (id BYTES(32) PRIMARY KEY, secret VARCHAR(160) NOT NULL, gen BYTES(16) NOT NULL, created TIMESTAMP NOT NULL, expires TIMESTAMP NOT NULL)")] {
@@ -174,8 +189,7 @@ impl Sql {
             let e = f.entry(fkey.clone()).or_insert((0, Instant::now())); e.0 += 1; e.1 = Instant::now();
         }
         let ty = &t.schema.columns[cfg.login].ty;
-        let mut key = vec![0u8; ty.width()];
-        let user = if password.len() > PASSWORD_MAX || encode_value(ty, &Value::Text(login.clone()), &mut key).is_err() { None } else { t.with_unique(&key, |r| r.to_vec()) };
+        let user = if password.len() > PASSWORD_MAX { None } else { crate::table::lookup_key(ty, &Value::Text(login.clone())).ok().and_then(|key| t.with_unique(&key, |r| r.to_vec())) };
         let secrets = self.system(SECRETS)?;
         let stored = user.as_ref().and_then(|r| secrets.with_pk(Self::text_pk(&secrets, &Self::secret_id(&t, r)).ok()?, |r| r.to_vec()));
         let ok = match stored.as_ref().map(|sr| decode_col(&secrets.schema, sr, 1)) { Some(Value::Text(h)) if PasswordHash::new(&h).is_ok() => verify_password(password, &h), _ => { let _ = verify_password(password, dummy_hash()); false } };
@@ -190,7 +204,136 @@ impl Sql {
     /// Make `sess` act as the user the token belongs to: the row's role and its columns as session attributes.
     pub fn session_from_token(&self, sess: &mut Session, token: &str) -> Result<(), String> {
         if sess.txn.is_some() { return Err("cannot change identity inside a transaction".into()); }
+        if is_mcp_token(token) { deny(sess); return Err("session: an MCP access token works only at /mcp".into()); }
         self.bind_token(sess, token).inspect_err(|_| deny(sess))
+    }
+    /// Make `sess` act as the user an MCP access token belongs to (and only an MCP token).
+    pub(crate) fn mcp_session(&self, sess: &mut Session, token: &str) -> Result<(), String> {
+        if !is_mcp_token(token) { deny(sess); return Err("session: /mcp takes an access token from this server's OAuth sign-in".into()); }
+        self.bind_token(sess, token).inspect_err(|_| deny(sess))
+    }
+    /// The user a session token of either kind belongs to, as `<table>:<key>` (the token is not checked further).
+    pub(crate) fn token_owner(&self, token: &str) -> Result<String, String> {
+        let id = token_id(token).ok_or("session: not a session token")?; let sessions = self.system(SESSIONS)?;
+        let k = sessions.schema.key_from_value(&Value::Bytes(id.to_vec()))?;
+        match sessions.with_pk(k, |r| decode_col(&sessions.schema, r, 1)) { Some(Value::Text(s)) => Ok(s), _ => Err("session: unknown or signed out; sign in again".into()) }
+    }
+    /// The password generation of a user (`<table>:<key>`): a password change or a sign-out everywhere changes it.
+    fn generation_of(&self, secret_id: &str) -> Result<Value, String> {
+        let secrets = self.system(SECRETS)?;
+        secrets.with_pk(Self::text_pk(&secrets, secret_id)?, |r| decode_col(&secrets.schema, r, 2)).ok_or_else(|| "sign-in: the user no longer exists".into())
+    }
+    fn grants(&self) -> Result<Arc<Table>, String> {
+        if let Some(t) = self.db.table(MCP_GRANTS) { return Ok(t); }
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(()); let _one = ONE.lock().unwrap();
+        if self.db.table(MCP_GRANTS).is_none() { self.create_system_table("CREATE TABLE _sqz_mcp_grants (id BYTES(32) PRIMARY KEY, client VARCHAR(64) NOT NULL, secret VARCHAR(160) NOT NULL, gen BYTES(16) NOT NULL, created TIMESTAMP NOT NULL, expires TIMESTAMP NOT NULL, family BYTES(16) NOT NULL, started TIMESTAMP NOT NULL, access BYTES(32), used BOOL NOT NULL)")?; }
+        self.system(MCP_GRANTS)
+    }
+    /// A new access token and refresh token for an agent (client `client`) acting as a user. A sign-in starts a family
+    /// (`family` None); each refresh continues it, within GRANT_MAX of its start.
+    pub(crate) fn mcp_issue(&self, client: &str, secret_id: &str, access_ttl: std::time::Duration, ttl: std::time::Duration, family: Option<([u8; 16], i64)>) -> Result<(String, String), String> {
+        use sha2::Digest;
+        self.sweep_grants();
+        let t = self.grants()?; let sessions = self.system(SESSIONS)?; let generation = self.generation_of(secret_id)?;
+        let (raw_access, srow) = self.session_row_for(&sessions, secret_id, &generation, access_ttl, b"mcp:")?;
+        let access_id = decode_col(&sessions.schema, &srow, 0);
+        sessions.insert(&srow).map_err(|e| e.to_string())?;
+        let raw = random::<32>(); let id: [u8; 32] = sha2::Sha256::digest(raw).into(); let now = now_micros();
+        let (fam, started) = family.unwrap_or_else(|| (random::<16>(), now));
+        let row = encode_row(&t.schema, &[Value::Bytes(id.to_vec()), Value::Text(client.into()), Value::Text(secret_id.into()), generation, Value::Int(now), Value::Int(now.saturating_add(ttl.as_micros() as i64)), Value::Bytes(fam.to_vec()), Value::Int(started), access_id, Value::Bool(false)])?;
+        t.insert(&row).map_err(|e| e.to_string())?;
+        Ok((format!("{MCP_PREFIX}{}", hex(&raw_access)), format!("{GRANT_PREFIX}{}", hex(&raw))))
+    }
+    /// Use a refresh token: good once, for its client, within its idle and absolute lifetimes, while the user's sign-in
+    /// state holds. A token used a second time ends its whole family (RFC 9700 4.14.2: one of the two is a thief).
+    /// Returns the user and a new pair; the access token the old one came with ends.
+    pub(crate) fn mcp_refresh(&self, client: &str, token: &str, access_ttl: std::time::Duration, ttl: std::time::Duration) -> Result<(String, String, String), String> {
+        let bad = || "the refresh token is unknown, used already, expired, or for another client; sign in again".to_string();
+        let id = grant_id(token).ok_or_else(bad)?; let t = self.grants()?;
+        let k = t.schema.key_from_value(&Value::Bytes(id.to_vec()))?;
+        let row = t.with_pk(k, |r| r.to_vec()).ok_or_else(bad)?;
+        let col = |i| decode_col(&t.schema, &row, i);
+        let (Value::Text(c), Value::Text(secret), generation, Value::Int(expires), Value::Bytes(fam), Value::Int(started), access) = (col(1), col(2), col(3), col(5), col(6), col(7), col(8)) else { return Err(bad()) };
+        let fam: [u8; 16] = fam.try_into().map_err(|_| bad())?;
+        // mark it used: of two uses at once, one wins and the other counts as a reuse
+        let mut first = false;
+        let _ = t.update_by_pk(k, |r| { if decode_col(&t.schema, r, 9) == Value::Bool(true) { return Err(crate::table::Abort::Conflict); } first = true; let mut r = r.to_vec(); crate::table::encode_col(&t.schema, &mut r, 9, &Value::Bool(true)).map_err(crate::table::Abort::Type)?; Ok(r) });
+        if !first { self.end_family(&fam); return Err("this refresh token was used before, so every token of this sign-in has ended; sign in again".into()); }
+        if let Value::Bytes(a) = access { self.end_session_id(&a); }
+        if c != client || expires <= now_micros() { return Err(bad()); }
+        if now_micros() - started > GRANT_MAX.as_micros() as i64 { self.end_family(&fam); return Err(format!("this sign-in is {} days old; sign in again", GRANT_MAX.as_secs() / 86400)); }
+        if self.generation_of(&secret).ok() != Some(generation) { return Err("the sign-in was ended by a password change or a sign-out everywhere; sign in again".into()); }
+        let (a, r) = self.mcp_issue(client, &secret, access_ttl, ttl, Some((fam, started)))?;
+        Ok((secret, a, r))
+    }
+    fn end_session_id(&self, id: &[u8]) { if let Ok(s) = self.system(SESSIONS) { if let Ok(k) = s.schema.key_from_value(&Value::Bytes(id.to_vec())) { let _ = s.delete_by_pk(k); } } }
+    /// End every refresh token of a sign-in, and the access tokens they issued.
+    fn end_family(&self, fam: &[u8; 16]) {
+        let Ok(t) = self.grants() else { return };
+        let mut rows = vec![]; t.scan(|r| { if decode_col(&t.schema, r, 6) == Value::Bytes(fam.to_vec()) { rows.push((t.schema.key_of(r), decode_col(&t.schema, r, 8))); } true });
+        for (k, access) in rows { if let Value::Bytes(a) = access { self.end_session_id(&a); } let _ = t.delete_by_pk(k); }
+    }
+    /// Delete refresh tokens past their time (used ones are kept until then, to catch a reuse), at most once an hour.
+    fn sweep_grants(&self) {
+        static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let now = now_micros(); let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+        if now - last < SWEEP_EVERY_US || LAST.compare_exchange(last, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_err() { return; }
+        let Some(t) = self.db.table(MCP_GRANTS) else { return };
+        let mut gone = vec![]; t.scan(|r| { if matches!(decode_col(&t.schema, r, 5), Value::Int(e) if e <= now) { gone.push(t.schema.key_of(r)); } true });
+        for k in gone { let _ = t.delete_by_pk(k); }
+    }
+    /// End an access or refresh token (RFC 7009: an unknown one is no error). A refresh token ends its family.
+    pub(crate) fn mcp_revoke(&self, token: &str) {
+        if is_mcp_token(token) { let _ = self.sign_out(token); return; }
+        let (Some(id), Ok(t)) = (grant_id(token), self.grants()) else { return };
+        let Ok(k) = t.schema.key_from_value(&Value::Bytes(id.to_vec())) else { return };
+        if let Some(Value::Bytes(fam)) = t.with_pk(k, |r| decode_col(&t.schema, r, 6)) { if let Ok(f) = <[u8; 16]>::try_from(fam) { self.end_family(&f); } }
+    }
+    fn clients(&self) -> Result<Arc<Table>, String> {
+        if let Some(t) = self.db.table(MCP_CLIENTS) { return Ok(t); }
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(()); let _one = ONE.lock().unwrap();
+        if self.db.table(MCP_CLIENTS).is_none() { self.create_system_table("CREATE TABLE _sqz_mcp_clients (id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, redirects TEXT NOT NULL, created TIMESTAMP NOT NULL, secret BYTES(32), method VARCHAR(32) NOT NULL)")?; }
+        self.system(MCP_CLIENTS)
+    }
+    /// Register an agent (RFC 7591): its name, the URIs it may be sent back to, and how it authenticates at the token
+    /// endpoint: "none" (a public client: PKCE alone), or with a secret ("client_secret_post", "client_secret_basic").
+    /// Returns its client id, and the secret if it has one (only its SHA-256 is kept).
+    pub(crate) fn mcp_register(&self, name: &str, redirects: &[String], method: &str) -> Result<(String, Option<String>), String> {
+        use sha2::Digest;
+        let t = self.clients()?;
+        if t.rows_allocated() >= CLIENTS_MAX && self.prune_clients(&t) >= CLIENTS_MAX { return Err("too many agents are registered; try again later".into()); }
+        let id = format!("mcpc_{}", hex(&random::<16>()));
+        let secret = (method != "none").then(|| format!("sqzs_{}", hex(&random::<32>())));
+        let hash = secret.as_ref().map(|x| Value::Bytes(sha2::Sha256::digest(x.as_bytes()).to_vec())).unwrap_or(Value::Null);
+        let row = encode_row(&t.schema, &[Value::Text(id.clone()), Value::Text(name.into()), Value::Text(serde_json::to_string(redirects).unwrap_or_default()), Value::Int(now_micros()), hash, Value::Text(method.into())])?;
+        t.insert(&row).map_err(|e| e.to_string())?; Ok((id, secret))
+    }
+    /// Delete registrations a day old that never got a token (a sign-in in their name). Returns the registrations left.
+    fn prune_clients(&self, t: &Table) -> usize {
+        let mut used = std::collections::HashSet::new();
+        if let Some(g) = self.db.table(MCP_GRANTS) { g.scan(|r| { if let Value::Text(c) = decode_col(&g.schema, r, 1) { used.insert(c); } true }); }
+        let day = now_micros() - 86_400_000_000; let (mut gone, mut left) = (vec![], 0usize);
+        t.scan(|r| { match (decode_col(&t.schema, r, 0), decode_col(&t.schema, r, 3)) { (Value::Text(id), Value::Int(c)) if c < day && !used.contains(&id) => gone.push(t.schema.key_of(r)), _ => left += 1 } true });
+        for k in gone { let _ = t.delete_by_pk(k); }
+        left
+    }
+    /// A registered agent: its name and redirect URIs.
+    pub(crate) fn mcp_client(&self, id: &str) -> Option<(String, Vec<String>)> {
+        let t = self.db.table(MCP_CLIENTS)?; let k = t.schema.key_from_value(&Value::Text(id.into())).ok()?;
+        let row = t.with_pk(k, |r| r.to_vec())?;
+        let (Value::Text(name), Value::Text(r)) = (decode_col(&t.schema, &row, 1), decode_col(&t.schema, &row, 2)) else { return None };
+        Some((name, serde_json::from_str(&r).ok()?))
+    }
+    /// Does an agent authenticate as itself at the token endpoint: a public client needs nothing, one with a secret
+    /// must present it.
+    pub(crate) fn mcp_client_ok(&self, id: &str, secret: Option<&str>) -> bool {
+        use sha2::Digest;
+        let Some(t) = self.db.table(MCP_CLIENTS) else { return false }; let Ok(k) = t.schema.key_from_value(&Value::Text(id.into())) else { return false };
+        match t.with_pk(k, |r| decode_col(&t.schema, r, 4)) {
+            Some(Value::Null) => true,
+            Some(Value::Bytes(h)) => secret.is_some_and(|x| crate::net::same_secret(&sha2::Sha256::digest(x.as_bytes()), &h)),
+            _ => false,
+        }
     }
     /// Who a session is, as a stable name (files record it as their owner): the application is `app`; a signed-in
     /// user is the row their sessions belong to, `<table>:<key>`; an identity the application asserted is its roles
@@ -321,8 +464,8 @@ impl Sql {
             (ut, ur, false)
         } else {
             if linked.is_some() { ids.txn_delete(&mut txn, ik).map_err(|e| e.to_string())?; }   // it pointed at a user who is gone
-            let ty = &t.schema.columns[cfg.login].ty; let mut key = vec![0u8; ty.width()];
-            let existing = if encode_value(ty, &Value::Text(email.clone()), &mut key).is_ok() { t.with_unique(&key, |r| r.to_vec()) } else { None };
+            let ty = &t.schema.columns[cfg.login].ty;
+            let existing = crate::table::lookup_key(ty, &Value::Text(email.clone())).ok().and_then(|key| t.with_unique(&key, |r| r.to_vec()));
             match existing {
                 // never by email: the account may be someone else's (made with their address, or through a provider
                 // that checks emails less strictly). Its owner signs in and links the provider.
@@ -389,11 +532,16 @@ impl Sql {
         Ok(token)
     }
     fn session_row(&self, sessions: &Table, secret_id: &str, generation: &Value) -> Result<(String, Vec<u8>), String> {
-        use sha2::Digest;
-        let raw = random::<32>(); let id: [u8; 32] = sha2::Sha256::digest(raw).into();
-        let now = now_micros(); let ttl = self.cfg.auth.session_ttl.as_micros() as i64;
-        let row = encode_row(&sessions.schema, &[Value::Bytes(id.to_vec()), Value::Text(secret_id.to_string()), generation.clone(), Value::Int(now), Value::Int(now.saturating_add(ttl))])?;
+        let (raw, row) = self.session_row_for(sessions, secret_id, generation, self.cfg.auth.session_ttl, b"")?;
         Ok((format!("{TOKEN_PREFIX}{}", hex(&raw)), row))
+    }
+    /// A session row `ttl` long, its id the SHA-256 of `tag` and the token's random bytes (see `token_id`).
+    fn session_row_for(&self, sessions: &Table, secret_id: &str, generation: &Value, ttl: std::time::Duration, tag: &[u8]) -> Result<([u8; 32], Vec<u8>), String> {
+        use sha2::Digest;
+        let raw = random::<32>(); let mut h = sha2::Sha256::new(); h.update(tag); h.update(raw); let id: [u8; 32] = h.finalize().into();
+        let now = now_micros(); let ttl = ttl.as_micros() as i64;
+        let row = encode_row(&sessions.schema, &[Value::Bytes(id.to_vec()), Value::Text(secret_id.to_string()), generation.clone(), Value::Int(now), Value::Int(now.saturating_add(ttl))])?;
+        Ok((raw, row))
     }
     /// Delete expired sessions, at most once an hour (from sign-ins).
     fn sweep_sessions(&self) {

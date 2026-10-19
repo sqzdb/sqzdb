@@ -17,17 +17,24 @@ pub const PK_SHARD_KEYS: i64 = 65_536;
 pub const PK_SHARDS: usize = 1024;
 pub const SEC_SHARDS: usize = 256;
 
+/// `Text(n)` and `Bytes(n)` hold up to n bytes in the row. `LongText` and `LongBytes` (`TEXT` and `BYTES` without a
+/// length) hold any length up to `LONG_MAX`: see "long values" below.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ColType { Int, Float, Bool, Text(usize), Bytes(usize), Timestamp, Uuid }
+pub enum ColType { Int, Float, Bool, Text(usize), Bytes(usize), Timestamp, Uuid, LongText, LongBytes }
 impl ColType {
-    pub fn width(&self) -> usize { match self { ColType::Int | ColType::Float | ColType::Timestamp => 8, ColType::Uuid => 16, ColType::Bool => 1, ColType::Text(n) | ColType::Bytes(n) => 2 + *n } }
-    pub fn name(&self) -> String { match self { ColType::Int => "INT".into(), ColType::Timestamp => "TIMESTAMP".into(), ColType::Uuid => "UUID".into(), ColType::Float => "DOUBLE".into(), ColType::Bool => "BOOL".into(), ColType::Text(n) => format!("TEXT({n})"), ColType::Bytes(n) => format!("BYTES({n})") } }
+    pub fn width(&self) -> usize { match self { ColType::Int | ColType::Float | ColType::Timestamp => 8, ColType::Uuid => 16, ColType::Bool => 1, ColType::Text(n) | ColType::Bytes(n) => 2 + *n, ColType::LongText | ColType::LongBytes => LONG_SLOT } }
+    pub fn name(&self) -> String { match self { ColType::Int => "INT".into(), ColType::Timestamp => "TIMESTAMP".into(), ColType::Uuid => "UUID".into(), ColType::Float => "DOUBLE".into(), ColType::Bool => "BOOL".into(), ColType::Text(n) => format!("TEXT({n})"), ColType::Bytes(n) => format!("BYTES({n})"), ColType::LongText => "TEXT".into(), ColType::LongBytes => "BYTES".into() } }
+    #[inline] pub fn is_long(&self) -> bool { matches!(self, ColType::LongText | ColType::LongBytes) }
+    /// Text of any length: TEXT(n) or TEXT.
+    #[inline] pub fn is_text(&self) -> bool { matches!(self, ColType::Text(_) | ColType::LongText) }
+    #[inline] pub fn is_bytes(&self) -> bool { matches!(self, ColType::Bytes(_) | ColType::LongBytes) }
 }
 #[derive(Clone, Debug)] pub struct Column { pub name: String, pub ty: ColType, pub nullable: bool, pub default: Value, /// computed per row when the INSERT leaves the column out (`uuid()`, `now()`)
     pub generated: Option<Gen>, /// a `FILE` column: stored and compared as the file's id (a UUID), checked on writes (`files.rs`)
     pub file: bool, /// a `VECTOR(n)` column: n f32s, stored as BYTES(4n) (`vector.rs`)
     pub vector: Option<usize>, /// what a VECTOR column is the embedding of, when it is generated (`vector.rs`)
-    pub embed: Option<std::sync::Arc<EmbedSpec>> }
+    pub embed: Option<std::sync::Arc<EmbedSpec>>, /// a long column's values too long for its row (`Schema::new` gives each its own)
+    pub store: Option<Arc<ValueStore>> }
 impl Column { pub fn type_name(&self) -> String { if self.file { "FILE".into() } else if let Some(n) = self.vector { format!("VECTOR({n})") } else { self.ty.name() } } }
 /// A `VECTOR(n) GENERATED ALWAYS AS (embed(<expr>)) STORED` column's source: the expression as SQL, and the columns
 /// it reads (a write that changes one of them clears the vector, for the embedder to fill again).
@@ -70,8 +77,13 @@ impl Schema {
     }
     /// The primary key value a delete record (or a whole row) names.
     pub fn delete_pk_value(&self, p: &[u8]) -> Value {
-        if p.len() == self.row_size { return decode_col(self, p, self.pk); }
-        if self.key_is_text() && p.len() == self.columns[self.pk].ty.width() { let n = u16::from_le_bytes([p[0], p[1]]) as usize; return text_value(&self.columns[self.pk].ty, &p[2..2 + n]); }
+        if p.len() >= self.row_size { return decode_col(self, p, self.pk); }
+        if self.key_is_text() && p.len() == self.columns[self.pk].ty.width() {
+            let ty = &self.columns[self.pk].ty;
+            // a long key past its row's room is not in the record: its 128-bit key still names the row
+            if ty.is_long() { let n = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize; return if n <= LONG_INLINE { text_value(ty, &p[20..20 + n]) } else { Value::Null }; }
+            let n = u16::from_le_bytes([p[0], p[1]]) as usize; return text_value(ty, &p[2..2 + n]);
+        }
         self.key_value(self.delete_key(p))
     }
     /// A key as a value; NULL for a text key past 15 bytes (see `key_is_text`).
@@ -83,8 +95,10 @@ impl Schema {
         else { v.as_i64().map(|i| i as i128) }
     }
     pub fn new(name: &str, columns: Vec<Column>, pk: usize, unique: Option<usize>) -> Result<Schema, String> {
-        if !matches!(columns.get(pk).map(|c| &c.ty), Some(ColType::Int | ColType::Uuid | ColType::Text(_) | ColType::Bytes(_))) { return Err("primary key must be an INT, UUID, TEXT or BYTES column".into()); }
+        if !matches!(columns.get(pk).map(|c| &c.ty), Some(ColType::Int | ColType::Uuid | ColType::Text(_) | ColType::Bytes(_) | ColType::LongText | ColType::LongBytes)) { return Err("primary key must be an INT, UUID, TEXT or BYTES column".into()); }
         let mut columns = columns; columns[pk].nullable = false;
+        // a new table (or the target of an ALTER) starts with empty stores of its own
+        for c in &mut columns { c.store = if c.ty.is_long() { LONG_IN_USE.store(true, Ordering::Relaxed); Some(Arc::new(ValueStore::default())) } else { None }; }
         let null_bytes = (columns.len() + 7) / 8;
         let mut offsets = vec![]; let mut off = null_bytes;
         for c in &columns { offsets.push(off); off += c.ty.width(); }
@@ -113,6 +127,7 @@ pub fn encode_value(ty: &ColType, v: &Value, out: &mut [u8]) -> Result<(), Strin
         (ColType::Bool, Value::Bool(b)) => out[0] = *b as u8,
         (ColType::Text(n), Value::Text(s)) => { let b = s.as_bytes(); if b.len() > *n { return Err(format!("TEXT value of {} bytes exceeds TEXT({n})", b.len())); } out[..2].copy_from_slice(&(b.len() as u16).to_le_bytes()); out[2..2 + b.len()].copy_from_slice(b); for x in &mut out[2 + b.len()..2 + n] { *x = 0; } }
         (ColType::Bytes(n), Value::Bytes(b)) => { if b.len() > *n { return Err(format!("BYTES value of {} bytes exceeds BYTES({n})", b.len())); } out[..2].copy_from_slice(&(b.len() as u16).to_le_bytes()); out[2..2 + b.len()].copy_from_slice(b); for x in &mut out[2 + b.len()..2 + n] { *x = 0; } }
+        (ColType::LongText, Value::Text(_)) | (ColType::LongBytes, Value::Bytes(_)) => return Err("internal: a long value is set with encode_col".into()),
         (ty, v) => return Err(format!("type mismatch: column is {}, value is {:?}", ty.name(), v)),
     }
     Ok(())
@@ -185,9 +200,18 @@ pub fn format_timestamp(us: i64) -> String {
     if frac == 0 { format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", sod / 3600, sod % 3600 / 60, sod % 60) } else { format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{frac:06}Z", sod / 3600, sod % 3600 / 60, sod % 60) }
 }
 #[inline] pub fn is_null(row: &[u8], i: usize) -> bool { row[i >> 3] >> (i & 7) & 1 == 1 }
-/// Set one column of an encoded row (handles NULL and the null bitmap).
-pub fn encode_col(schema: &Schema, row: &mut [u8], i: usize, v: &Value) -> Result<(), String> {
+/// Set one column of an encoded row (handles NULL and the null bitmap). A long value past the row goes to its tail.
+pub fn encode_col(schema: &Schema, row: &mut Vec<u8>, i: usize, v: &Value) -> Result<(), String> {
     let c = &schema.columns[i]; let off = schema.offsets[i]; let w = c.ty.width();
+    if c.ty.is_long() {
+        let b: Option<&[u8]> = match (&c.ty, v) {
+            (_, Value::Null) => { if !c.nullable { return Err(format!("column {} is NOT NULL", c.name)); } None }
+            (ColType::LongText, Value::Text(t)) => Some(t.as_bytes()), (ColType::LongBytes, Value::Bytes(b)) => Some(b),
+            (ty, v) => return Err(format!("column {}: type mismatch: column is {}, value is {v:?}", c.name, ty.name())),
+        };
+        if b.is_some_and(|b| b.len() > LONG_MAX) { return Err(format!("column {}: a value of {} bytes is longer than the {} MB a value may be", c.name, b.unwrap().len(), LONG_MAX >> 20)); }
+        set_long(schema, row, i, b); return Ok(());
+    }
     if let Value::Null = v { if !c.nullable { return Err(format!("column {} is NOT NULL", c.name)); } row[i >> 3] |= 1 << (i & 7); for b in &mut row[off..off + w] { *b = 0; } return Ok(()); }
     let as_vector; let v = match c.vector { Some(n) => { as_vector = Value::Bytes(vector_bytes(v, n).map_err(|e| format!("column {}: {e}", c.name))?); &as_vector } None => v };
     encode_value(&c.ty, v, &mut row[off..off + w]).map_err(|e| format!("column {}: {e}", c.name))?;
@@ -208,12 +232,42 @@ pub fn decode_col(schema: &Schema, row: &[u8], i: usize) -> Value {
     let off = schema.offsets[i];
     match &schema.columns[i].ty {
         ColType::Int | ColType::Timestamp => Value::Int(read_i64(row, off)), ColType::Float => Value::Float(read_f64(row, off)), ColType::Bool => Value::Bool(row[off] != 0),
-        ColType::Text(_) => Value::Text(String::from_utf8_lossy(read_bytes(row, off)).into_owned()), ColType::Bytes(_) => Value::Bytes(read_bytes(row, off).to_vec()),
+        ColType::Text(_) => Value::Text(text_of(read_bytes(row, off))), ColType::Bytes(_) => Value::Bytes(read_bytes(row, off).to_vec()),
         ColType::Uuid => Value::Text(format_uuid(&row[off..off + 16])),
+        ColType::LongText => match long_bytes(schema, row, i) { Some(b) => Value::Text(text_of(&b)), None => Value::Null },
+        ColType::LongBytes => match long_bytes(schema, row, i) { Some(b) => Value::Bytes(b.to_vec()), None => Value::Null },
     }
 }
-/// Raw encoded bytes of a column (used as index key).
-#[inline] pub fn col_key<'a>(schema: &Schema, row: &'a [u8], i: usize) -> Option<&'a [u8]> { if is_null(row, i) { return None; } let off = schema.offsets[i]; Some(&row[off..off + schema.columns[i].ty.width()]) }
+/// Stored text as a String. It went in as one, so it is valid UTF-8: checked at a tenth of the cost of from_utf8_lossy.
+#[inline] fn text_of(b: &[u8]) -> String { match std::str::from_utf8(b) { Ok(s) => s.to_owned(), Err(_) => String::from_utf8_lossy(b).into_owned() } }
+/// The bytes of a TEXT or BYTES column of either kind, or None for NULL.
+pub fn text_bytes<'a>(schema: &Schema, row: &'a [u8], i: usize) -> Option<ValueRef<'a>> {
+    if is_null(row, i) { return None; }
+    if schema.columns[i].ty.is_long() { long_bytes(schema, row, i) } else { Some(ValueRef::Row(read_bytes(row, schema.offsets[i]))) }
+}
+/// Encoded bytes of a column that stand for its value (used as index key): the field itself, or for a long column its
+/// 128-bit key (the same for equal values, wherever each is stored).
+#[inline] pub fn col_key<'a>(schema: &Schema, row: &'a [u8], i: usize) -> Option<&'a [u8]> {
+    if is_null(row, i) { return None; } let off = schema.offsets[i];
+    if schema.columns[i].ty.is_long() { return Some(&row[off + 4..off + 20]); }
+    Some(&row[off..off + schema.columns[i].ty.width()])
+}
+/// Whether `v` may be stored in a column of type `ty` (a DEFAULT, say), without a row to put it in.
+pub fn check_value(ty: &ColType, v: &Value) -> Result<(), String> {
+    match (ty, v) {
+        (ColType::LongText, Value::Text(t)) if t.len() <= LONG_MAX => Ok(()), (ColType::LongBytes, Value::Bytes(b)) if b.len() <= LONG_MAX => Ok(()),
+        (ColType::LongText | ColType::LongBytes, v) => Err(format!("type mismatch: column is {}, value is {v:?}", ty.name())),
+        _ => { let mut buf = vec![0u8; ty.width()]; encode_value(ty, v, &mut buf) }
+    }
+}
+/// The key `col_key` gives a row holding `v` in a column of type `ty` (to look a row up by its UNIQUE value).
+pub fn lookup_key(ty: &ColType, v: &Value) -> Result<Vec<u8>, String> {
+    match (ty, v) {
+        (ColType::LongText, Value::Text(t)) => Ok(text_key(t.as_bytes()).to_le_bytes().to_vec()),
+        (ColType::LongBytes, Value::Bytes(b)) => Ok(text_key(b).to_le_bytes().to_vec()),
+        _ => { let mut key = vec![0u8; ty.width()]; encode_value(ty, v, &mut key)?; Ok(key) }
+    }
+}
 /// A primary key. INT keys are themselves; UUID keys are their 16 bytes read big-endian with the top bit flipped, so
 /// key order is byte order (creation order for version 7 UUIDs).
 pub type Key = i128;
@@ -236,25 +290,26 @@ const TK_MUL: u128 = 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835;   // odd: invert
 const TK_INV: u128 = { let mut i = TK_MUL; let mut n = 0; while n < 7 { i = i.wrapping_mul(2u128.wrapping_sub(TK_MUL.wrapping_mul(i))); n += 1; } i };
 #[inline] fn tk_mix(x: u128) -> u128 { let x = x ^ (x >> 64); let x = x.wrapping_mul(TK_MUL); x ^ (x >> 64) }
 #[inline] fn tk_unmix(x: u128) -> u128 { let x = x ^ (x >> 64); let x = x.wrapping_mul(TK_INV); x ^ (x >> 64) }
-fn text_value(ty: &ColType, b: &[u8]) -> Value { if matches!(ty, ColType::Bytes(_)) { Value::Bytes(b.to_vec()) } else { Value::Text(String::from_utf8_lossy(b).into_owned()) } }
+fn text_value(ty: &ColType, b: &[u8]) -> Value { if ty.is_bytes() { Value::Bytes(b.to_vec()) } else { Value::Text(text_of(b)) } }
 /// Key of a field of type `ty` at `off` (not NULL): INT and TIMESTAMP are themselves; UUID, TEXT and BYTES 128-bit keys.
 #[inline] pub fn field_key128(ty: &ColType, row: &[u8], off: usize) -> Key {
     match ty {
         ColType::Uuid => key_from_uuid(&row[off..off + 16]),
         ColType::Text(_) | ColType::Bytes(_) => { let n = u16::from_le_bytes([row[off], row[off + 1]]) as usize; text_key(&row[off + 2..off + 2 + n]) }
+        ColType::LongText | ColType::LongBytes => i128::from_le_bytes(row[off + 4..off + 20].try_into().unwrap()),   // kept beside the value
         _ => read_i64(row, off) as i128,
     }
 }
 /// Columns whose keys compare with each other: 0 integers (INT, TIMESTAMP), 1 UUID, 2 TEXT, 3 BYTES; None for DOUBLE and BOOL.
-pub fn key_kind(t: &ColType) -> Option<u8> { match t { ColType::Int | ColType::Timestamp => Some(0), ColType::Uuid => Some(1), ColType::Text(_) => Some(2), ColType::Bytes(_) => Some(3), _ => None } }
+pub fn key_kind(t: &ColType) -> Option<u8> { match t { ColType::Int | ColType::Timestamp => Some(0), ColType::Uuid => Some(1), ColType::Text(_) | ColType::LongText => Some(2), ColType::Bytes(_) | ColType::LongBytes => Some(3), _ => None } }
 /// Key of a value for a column of type `ty`; None for NULL or a value that cannot be of that type.
 pub fn value_key128(ty: &ColType, v: &Value) -> Option<Key> {
     match (ty, v) {
         (ColType::Int | ColType::Timestamp, Value::Int(i)) => Some(*i as i128),
         (ColType::Uuid, Value::Text(s)) => parse_uuid(s).map(|b| key_from_uuid(&b)),
         (ColType::Uuid, Value::Bytes(b)) if b.len() == 16 => Some(key_from_uuid(b)),
-        (ColType::Text(_), Value::Text(s)) => Some(text_key(s.as_bytes())),
-        (ColType::Bytes(_), Value::Bytes(b)) => Some(text_key(b)),
+        (ColType::Text(_) | ColType::LongText, Value::Text(s)) => Some(text_key(s.as_bytes())),
+        (ColType::Bytes(_) | ColType::LongBytes, Value::Bytes(b)) => Some(text_key(b)),
         _ => None,
     }
 }
@@ -264,6 +319,145 @@ pub fn value_key128(ty: &ColType, v: &Value) -> Option<Key> {
 /// every lookup re-checks the full key.
 #[inline] pub fn fold_key(k: Key) -> i64 { if k >= i64::MIN as i128 && k <= i64::MAX as i128 { k as i64 } else { ((k >> 64) as i64) ^ (k as i64) } }
 #[inline] pub fn read_key(schema: &Schema, row: &[u8], i: usize) -> Option<i64> { if is_null(row, i) { None } else { Some(read_i64(row, schema.offsets[i])) } }
+
+// ---------- long values: TEXT and BYTES without a length ----------
+//
+// A long column's field is LONG_SLOT bytes: [len u32][key: the value's `text_key`, 16 bytes][44 bytes]. A value of at
+// most LONG_INLINE bytes is in those 44 bytes. A longer one is elsewhere, and they start with where (an id u64):
+//   - in a table's rows, the id names it in the column's `ValueStore` (ids start at 1);
+//   - in a row outside a table (being written, in a log record, in a change), id 0 says it follows the row: values
+//     past their fields come after the row's fixed part, in column order (the row's tail).
+// Keys, joins, indexes and UNIQUE read the 16-byte key, so they never fetch a value. The log and every change feed carry
+// rows with their tails: a record never points into memory. Inside a table a value is named by one row version; an
+// update that keeps it hands it on, one that replaces it (or a delete) retires it. A retired value is freed once every
+// pin taken before is gone (statements and snapshots pin) and not sooner than RETIRE_AFTER, for the reads that copy a
+// row and decode it at once without a pin.
+pub const LONG_SLOT: usize = 64; pub const LONG_INLINE: usize = 44; pub const LONG_MAX: usize = 16 << 20;
+#[cfg(not(test))] const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)] const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_millis(30);
+/// Set once a long column exists in this process: until then pins cost nothing.
+static LONG_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A long column's values that are too long for their rows, by id.
+#[derive(Default)] pub struct ValueStore { shards: [RwLock<FastMapU64<Held>>; 16], next: std::sync::atomic::AtomicU64, bytes: std::sync::atomic::AtomicU64 }
+/// A stored value: written since the start, or still in the snapshot it was loaded from (mapped, read when used).
+#[derive(Clone)] pub enum Held { Heap(Arc<[u8]>), Mapped(Arc<MmapMut>, usize, usize) }
+impl std::ops::Deref for Held { type Target = [u8]; fn deref(&self) -> &[u8] { match self { Held::Heap(a) => a, Held::Mapped(m, off, n) => &m[*off..*off + *n] } } }
+impl std::fmt::Debug for ValueStore { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "ValueStore({} values, {} bytes)", self.len(), self.bytes()) } }
+impl ValueStore {
+    #[inline] fn shard(&self, id: u64) -> &RwLock<FastMapU64<Held>> { &self.shards[id as usize & 15] }
+    pub fn put(&self, b: &[u8]) -> u64 { let id = self.next.fetch_add(1, Ordering::Relaxed) + 1; self.bytes.fetch_add(b.len() as u64, Ordering::Relaxed); self.shard(id).write().unwrap().insert(id, Held::Heap(Arc::from(b))); id }
+    pub fn get(&self, id: u64) -> Option<Held> { self.shard(id).read().unwrap().get(&id).cloned() }
+    /// A value in a snapshot's mapping at [off, off + n), under its id (new ids continue above it).
+    pub fn load(&self, id: u64, map: &Arc<MmapMut>, off: usize, n: usize) { self.next.fetch_max(id, Ordering::Relaxed); self.bytes.fetch_add(n as u64, Ordering::Relaxed); self.shard(id).write().unwrap().insert(id, Held::Mapped(map.clone(), off, n)); }
+    fn remove(&self, id: u64) { if let Some(v) = self.shard(id).write().unwrap().remove(&id) { self.bytes.fetch_sub(v.len() as u64, Ordering::Relaxed); } }
+    pub fn len(&self) -> usize { self.shards.iter().map(|s| s.read().unwrap().len()).sum() }
+    pub fn bytes(&self) -> u64 { self.bytes.load(Ordering::Relaxed) }
+    fn clear(&self) { for s in &self.shards { s.write().unwrap().clear(); } self.bytes.store(0, Ordering::Relaxed); }
+}
+/// A long value's bytes: in the row, or shared with its store.
+pub enum ValueRef<'a> { Row(&'a [u8]), Stored(Held) }
+impl std::ops::Deref for ValueRef<'_> { type Target = [u8]; fn deref(&self) -> &[u8] { match self { ValueRef::Row(b) => b, ValueRef::Stored(a) => a } } }
+
+struct Reclaim { epoch: u64, pins: BTreeMap<u64, u32> }
+static RECLAIM: Mutex<Reclaim> = Mutex::new(Reclaim { epoch: 0, pins: BTreeMap::new() });
+/// Retired values: (epoch, when, store, id), roughly in epoch order.
+static RETIRED: Mutex<VecDeque<(u64, Instant, std::sync::Weak<ValueStore>, u64)>> = Mutex::new(VecDeque::new());
+/// While held, no long value a row named when it was taken is freed (see "long values").
+pub struct Pin(u64);
+/// Pin for the length of a read that may copy rows and decode them later: a statement, a snapshot, a copy.
+pub fn pin() -> Option<Pin> {
+    if !LONG_IN_USE.load(Ordering::Relaxed) { return None; }
+    let mut r = RECLAIM.lock().unwrap(); let e = r.epoch; *r.pins.entry(e).or_insert(0) += 1; Some(Pin(e))
+}
+impl Drop for Pin {
+    fn drop(&mut self) {
+        { let mut r = RECLAIM.lock().unwrap(); if let Some(c) = r.pins.get_mut(&self.0) { *c -= 1; if *c == 0 { r.pins.remove(&self.0); } } }
+        reclaim();
+    }
+}
+fn retire(store: &Arc<ValueStore>, id: u64) {
+    let e = { let mut r = RECLAIM.lock().unwrap(); let e = r.epoch; r.epoch += 1; e };
+    RETIRED.lock().unwrap().push_back((e, Instant::now(), Arc::downgrade(store), id));
+    reclaim();
+}
+/// Free the retired values no pin can still need.
+pub fn reclaim() {
+    let oldest = RECLAIM.lock().unwrap().pins.keys().next().copied().unwrap_or(u64::MAX);
+    let Ok(mut q) = RETIRED.try_lock() else { return };   // another thread is at it
+    while let Some((e, t, _, _)) = q.front() {
+        if *e >= oldest || t.elapsed() < RETIRE_AFTER { break; }
+        let (_, _, store, id) = q.pop_front().unwrap(); if let Some(store) = store.upgrade() { store.remove(id); }
+    }
+}
+/// Values retired and not yet freed (tests and diagnostics).
+pub fn retired_values() -> usize { RETIRED.lock().unwrap().len() }
+
+#[inline] fn long_len(row: &[u8], off: usize) -> usize { u32::from_le_bytes(row[off..off + 4].try_into().unwrap()) as usize }
+#[inline] fn long_id(row: &[u8], off: usize) -> u64 { u64::from_le_bytes(row[off + 20..off + 28].try_into().unwrap()) }
+#[inline] fn has_long(schema: &Schema) -> bool { schema.columns.iter().any(|c| c.ty.is_long()) }
+/// Column `j` holds a value past its field, in the row's tail.
+#[inline] fn in_tail(schema: &Schema, row: &[u8], j: usize) -> bool { schema.columns[j].ty.is_long() && !is_null(row, j) && { let o = schema.offsets[j]; long_len(row, o) > LONG_INLINE && long_id(row, o) == 0 } }
+/// The id of column `j`'s value in its store, or 0 (NULL, short, or in the tail).
+#[inline] fn stored_id(schema: &Schema, row: &[u8], j: usize) -> u64 { if !schema.columns[j].ty.is_long() || is_null(row, j) { return 0; } let o = schema.offsets[j]; if long_len(row, o) > LONG_INLINE { long_id(row, o) } else { 0 } }
+/// Where column `i`'s value starts in the row's tail.
+fn tail_at(schema: &Schema, row: &[u8], i: usize) -> usize { let mut at = schema.row_size; for j in 0..i { if in_tail(schema, row, j) { at += long_len(row, schema.offsets[j]); } } at }
+/// A long column's bytes (not NULL), wherever they are. None only if a stored value is gone, which pins prevent.
+pub fn long_bytes<'a>(schema: &Schema, row: &'a [u8], i: usize) -> Option<ValueRef<'a>> {
+    let off = schema.offsets[i]; let n = long_len(row, off);
+    if n <= LONG_INLINE { return Some(ValueRef::Row(&row[off + 20..off + 20 + n])); }
+    let v = match long_id(row, off) {
+        0 => { let at = tail_at(schema, row, i); row.get(at..at + n).map(ValueRef::Row) }
+        id => schema.columns[i].store.as_ref().and_then(|s| s.get(id)).map(ValueRef::Stored),
+    };
+    if v.is_none() { static ONCE: std::sync::Once = std::sync::Once::new(); ONCE.call_once(|| eprintln!("sqweezdb: a long value of {}.{} was read after it was freed (read as NULL)", schema.name, schema.columns[i].name)); }
+    v
+}
+/// Set long column `i` of a row (None: NULL), keeping the other values in the tail in column order.
+fn set_long(schema: &Schema, row: &mut Vec<u8>, i: usize, v: Option<&[u8]>) {
+    let mut tail: Vec<(usize, Vec<u8>)> = (0..schema.columns.len()).filter(|&j| j != i && in_tail(schema, row, j)).map(|j| { let (at, n) = (tail_at(schema, row, j), long_len(row, schema.offsets[j])); (j, row[at..at + n].to_vec()) }).collect();
+    row.truncate(schema.row_size);
+    let off = schema.offsets[i]; row[off..off + LONG_SLOT].fill(0);
+    match v {
+        None => row[i >> 3] |= 1 << (i & 7),
+        Some(b) => {
+            row[i >> 3] &= !(1 << (i & 7));
+            row[off..off + 4].copy_from_slice(&(b.len() as u32).to_le_bytes()); row[off + 4..off + 20].copy_from_slice(&text_key(b).to_le_bytes());
+            if b.len() <= LONG_INLINE { row[off + 20..off + 20 + b.len()].copy_from_slice(b); } else { tail.push((i, b.to_vec())); tail.sort_by_key(|x| x.0); }
+        }
+    }
+    for (_, b) in tail { row.extend_from_slice(&b); }
+}
+/// The row with every long value in it, none left in a store: what the log, change feeds and transactions hold.
+pub fn expand<'a>(schema: &Schema, row: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    if !(0..schema.columns.len()).any(|j| stored_id(schema, row, j) != 0) { return std::borrow::Cow::Borrowed(row); }
+    let mut out = row[..schema.row_size].to_vec();
+    for j in 0..schema.columns.len() {
+        if !schema.columns[j].ty.is_long() || is_null(row, j) || long_len(row, schema.offsets[j]) <= LONG_INLINE { continue; }
+        let v = long_bytes(schema, row, j).map(|b| b.to_vec()).unwrap_or_default();
+        let o = schema.offsets[j]; if v.len() != long_len(row, o) { out[o..o + 4].copy_from_slice(&(v.len() as u32).to_le_bytes()); out[o + 4..o + 20].copy_from_slice(&text_key(&v).to_le_bytes()); }
+        out[o + 20..o + 28].fill(0); out.extend_from_slice(&v);
+    }
+    std::borrow::Cow::Owned(out)
+}
+/// The row as a table keeps it, exactly `row_size` bytes: values in the tail move to their columns' stores.
+fn store_row(schema: &Schema, row: &[u8]) -> Vec<u8> {
+    let mut out = row[..schema.row_size].to_vec();
+    for j in 0..schema.columns.len() {
+        if !in_tail(schema, row, j) { continue; }
+        let (at, n, o) = (tail_at(schema, row, j), long_len(row, schema.offsets[j]), schema.offsets[j]);
+        let id = schema.columns[j].store.as_ref().expect("a long column has a store").put(&row[at..at + n]);
+        out[o + 20..o + 28].copy_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+/// Retire the stored values `old` names that `new` (None: the row is gone) doesn't name in the same column.
+fn retire_replaced(schema: &Schema, old: &[u8], new: Option<&[u8]>) {
+    for j in 0..schema.columns.len() {
+        let a = stored_id(schema, old, j);
+        if a != 0 && new.map(|n| stored_id(schema, n, j)) != Some(a) { if let Some(st) = &schema.columns[j].store { retire(st, a); } }
+    }
+}
 
 // ---------- generic group-commit log: segmented, with a catalog of DDL/ACL statements ----------
 pub const OP_INSERT: u8 = 1; pub const OP_UPDATE: u8 = 2; pub const OP_TXN: u8 = 3; pub const OP_META: u8 = 4; pub const OP_DELETE: u8 = 5;
@@ -655,6 +849,7 @@ impl Table {
         let mut keys: Vec<Key> = Vec::with_capacity(1024);
         for ck in 0..self.chunk_count() {
             if stop.load(Ordering::Relaxed) { return Err("stopped".into()); }
+            let _pin = pin();   // the rows copied below are converted after their chunk's lock is gone
             keys.clear();
             { let c = self.chunks()[ck].read().unwrap(); if let Some(d) = c.data.as_ref() { for i in 0..CHUNK_ROWS { let o = i * self.stride; if u64::from_le_bytes(d[o..o + 8].try_into().unwrap()) > 0 { keys.push(self.pk_of(&d[o + 16..o + self.stride])); } } } }
             for &pk in &keys {
@@ -671,6 +866,7 @@ impl Table {
         for c in self.chunks().iter() { let mut c = c.write().unwrap(); c.data = None; }
         for sh in self.pk() { sh.write().unwrap().clear(); } for sh in self.sec() { *sh.write().unwrap() = UniqShard::default(); }
         self.indexes.write().unwrap().clear(); self.free.lock().unwrap().clear(); self.next_slot.store(0, Ordering::Relaxed);
+        for c in &self.schema.columns { if let Some(st) = &c.store { st.clear(); } }
     }
     /// Diagnostics for one key: how the mapped lookup resolves it.
     pub fn debug_lookup(&self, pk: impl Into<Key>) -> String {
@@ -731,10 +927,11 @@ impl Table {
             let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
             let (v, p) = Self::hdr_at(d, off); if v == 0 || self.pk_of(&d[off + 16..off + self.stride]) != pk { return Err(Abort::NotFound); } if p != 0 { return Err(Abort::Conflict); }
             let row = d[off + 16..off + self.stride].to_vec();
-            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &row); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
+            let seq = self.log.append_with_ring(OP_DELETE, self.id, &self.schema.key_record(&row), &expand(&self.schema, &row)); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); (seq, row) };
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
         match guard { Some(mut m) => { m.remove(&pk); drop(m); if let Some(k) = self.unique_key(&row) { self.uniq_remove(k, slot); } self.idx_remove(&row, slot); } None => self.unpublish(slot, &row) }
+        retire_replaced(&self.schema, &row, None);
         self.touched(); self.log.published();
         self.free_slot(slot);
         self.mirror_delete(pk);
@@ -747,7 +944,7 @@ impl Table {
         let slot = match self.pk_slot(pk) { Some(s) => s, None => return };
         let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * self.stride);
         let stored: Option<Vec<u8>> = { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); let (v, _) = Self::hdr_at(d, off); if v == 0 || v >= seq || self.pk_of(&d[off + 16..off + self.stride]) != pk { None } else { let r = d[off + 16..off + self.stride].to_vec(); d[off..off + 16].copy_from_slice(&[0u8; 16]); Some(r) } };
-        if let Some(r) = stored { self.unpublish(slot, &r); self.free_slot(slot); }
+        if let Some(r) = stored { self.unpublish(slot, &r); retire_replaced(&self.schema, &r, None); self.free_slot(slot); }
     }
     pub fn index_on(&self, col: usize) -> Option<Arc<SecIndex>> { self.indexes.read().unwrap().iter().find(|i| i.col == col).cloned() }
     /// Create a non-unique index on an INT, TIMESTAMP, UUID, TEXT or BYTES column: publish it first (writers maintain it from now on), then backfill.
@@ -782,14 +979,16 @@ impl Table {
         let pk = self.pk_of(row);
         if self.schema.auto { self.bump_id(pk as i64); }
         let slot = self.pk_slot(pk);
+        let long = has_long(&self.schema);
         match slot {
-            None => { let slot = self.alloc_slot(); self.load_committed_at(slot, row, seq); }
+            None => { let slot = self.alloc_slot(); if long { self.load_committed_at(slot, &store_row(&self.schema, row), seq); } else { self.load_committed_at(slot, row, seq); } }
             Some(slot) => {
                 let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * self.stride);
+                let kept; let row: &[u8] = if long { kept = store_row(&self.schema, row); &kept } else { row };
                 let old: Option<Vec<u8>> = { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
-                    let v = u64::from_le_bytes(d[off..off + 8].try_into().unwrap()); if v >= seq { return; }
+                    let v = u64::from_le_bytes(d[off..off + 8].try_into().unwrap()); if v >= seq { drop(c); if long { retire_replaced(&self.schema, row, None); } return; }
                     let old = d[off + 16..off + self.stride].to_vec(); d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(row); Some(old) };
-                if let Some(old) = old { let (ok, nk) = (self.unique_key(&old).map(|k| k.to_vec()), self.unique_key(row).map(|k| k.to_vec())); if ok != nk { if let Some(k) = ok { self.uniq_remove(&k, slot); } if let Some(k) = nk { self.uniq_insert(&k, slot); } } self.idx_replace(&old, row, slot); }
+                if let Some(old) = old { if long { retire_replaced(&self.schema, &old, Some(row)); } let (ok, nk) = (self.unique_key(&old).map(|k| k.to_vec()), self.unique_key(row).map(|k| k.to_vec())); if ok != nk { if let Some(k) = ok { self.uniq_remove(&k, slot); } if let Some(k) = nk { self.uniq_insert(&k, slot); } } self.idx_replace(&old, row, slot); }
             }
         }
     }
@@ -809,13 +1008,16 @@ impl Table {
         out
     }
     /// Snapshot of this table in slot layout, sorted by primary key: [version u64][0 u64][row] per committed row,
-    /// zero-padded to whole chunks; then the page fence; then the unique-key table ([tag u32][slot u32], 2x capacity).
-    /// Each region starts at a 4096-byte boundary. Returns (rows, min pending seq, max version, [rows, fence, uniq] offsets, ucap, fence entries, kmin, kmax).
-    pub fn snapshot_table(&self, w: &mut BufWriter<File>) -> (u64, u64, u64, [u64; 3], u64, u64, Key, Key) {
+    /// zero-padded to whole chunks; then the page fence; then the unique-key table ([tag u32][slot u32], 2x capacity);
+    /// then the long values the rows name ([column u16][id u64][len u32][bytes] each).
+    /// Each region starts at a 4096-byte boundary. Returns (rows, min pending seq, max version, [rows, fence, uniq] offsets, ucap, fence entries, kmin, kmax, (values offset, values)).
+    pub fn snapshot_table(&self, w: &mut BufWriter<File>) -> (u64, u64, u64, [u64; 3], u64, u64, Key, Key, (u64, u64)) {
         fn align(w: &mut BufWriter<File>) -> u64 { let pos = w.stream_position().unwrap(); let pad = (SNAP_ALIGN as u64 - pos % SNAP_ALIGN as u64) % SNAP_ALIGN as u64; w.write_all(&vec![0u8; pad as usize]).unwrap(); pos + pad }
         let (mut n, mut min_pending, mut max_v) = (0u64, u64::MAX, 0u64);
         let mut fence: Vec<Key> = Vec::new(); let mut ukeys: Vec<(u64, u32)> = Vec::new(); let (mut kmin, mut kmax) = (Key::MAX, Key::MIN);
         let u = self.schema.unique;
+        let longs: Vec<usize> = (0..self.schema.columns.len()).filter(|&j| self.schema.columns[j].ty.is_long()).collect();
+        let mut named: Vec<(usize, u64)> = Vec::new();   // (column, id) of the long values the rows name
         let rows_off = align(w);
         let mut cur = usize::MAX; let mut guard: Option<RwLockReadGuard<Chunk>> = None;
         for (_, slot) in self.ordered_slots() {
@@ -826,7 +1028,8 @@ impl Table {
                 if p != 0 && p < TXN_MARK { min_pending = min_pending.min(p); }
                 if v > 0 { let row = &d[off + 16..off + self.stride]; w.write_all(&v.to_le_bytes()).unwrap(); w.write_all(&0u64.to_le_bytes()).unwrap(); w.write_all(row).unwrap();
                            let pk = self.pk_of(row); let page = (n as usize * self.stride) / SNAP_ALIGN; while fence.len() <= page { fence.push(pk); } kmin = kmin.min(pk); kmax = kmax.max(pk);
-                           if let Some(u) = u { if let Some(k) = col_key(&self.schema, row, u) { ukeys.push((hash_bytes(k), n as u32)); } } n += 1; max_v = max_v.max(v); }
+                           if let Some(u) = u { if let Some(k) = col_key(&self.schema, row, u) { ukeys.push((hash_bytes(k), n as u32)); } } n += 1; max_v = max_v.max(v);
+                           for &j in &longs { let id = stored_id(&self.schema, row, j); if id != 0 { named.push((j, id)); } } }
             }
         }
         drop(guard);
@@ -841,8 +1044,14 @@ impl Table {
             for (h, slot) in ukeys { let tag = ((h >> 32) as u32) | 1; let mut i = (h as usize) & mask; while tbl[i] != 0 { i = (i + 1) & mask; } tbl[i] = ((tag as u64) << 32) | slot as u64; }
             w.write_all(unsafe { std::slice::from_raw_parts(tbl.as_ptr() as *const u8, ucap * 8) }).unwrap();
         }
+        let vals_off = align(w);
+        for &(j, id) in &named {
+            // the caller pins: a value replaced since its row was read above is still in the store
+            let v = self.schema.columns[j].store.as_ref().and_then(|st| st.get(id)).unwrap_or_else(|| Held::Heap(Arc::from(&b""[..])));
+            w.write_all(&(j as u16).to_le_bytes()).unwrap(); w.write_all(&id.to_le_bytes()).unwrap(); w.write_all(&(v.len() as u32).to_le_bytes()).unwrap(); w.write_all(&v).unwrap();
+        }
         align(w);
-        (n, min_pending, max_v, [rows_off, fence_off, uniq_off], ucap as u64, fence.len() as u64, kmin, kmax)
+        (n, min_pending, max_v, [rows_off, fence_off, uniq_off], ucap as u64, fence.len() as u64, kmin, kmax, (if named.is_empty() { 0 } else { vals_off }, named.len() as u64))
     }
     /// Restart: point chunks [0, n) at the private mapping of the snapshot file and install the mapped indexes.
     pub fn attach_base(&self, map: Arc<MmapMut>, base: *mut u8, n: usize, offs: [u64; 3], ucap: usize, fence: Fence, kmin: Key, kmax: Key) {
@@ -868,7 +1077,10 @@ impl Table {
     #[inline] pub fn unique_key<'a>(&self, row: &'a [u8]) -> Option<&'a [u8]> { self.schema.unique.and_then(|u| col_key(&self.schema, row, u)) }
 
     pub fn insert(&self, row: &[u8]) -> Result<u64, Abort> {
-        debug_assert_eq!(row.len(), self.schema.row_size);
+        debug_assert!(row.len() >= self.schema.row_size);
+        let long = has_long(&self.schema);
+        let row: std::borrow::Cow<[u8]> = if long { expand(&self.schema, row) } else { std::borrow::Cow::Borrowed(row) };   // as logged
+        let row: &[u8] = &row;
         let links = self.fks.read().unwrap().clone(); let _fk = self.fk_guards(&links, row)?;
         let pk = self.pk_of(row);
         let ukey: Option<Vec<u8>> = self.unique_key(row).map(|k| k.to_vec());
@@ -886,7 +1098,8 @@ impl Table {
             pkm.insert(pk, slot);
             if let Some(m) = &mut secm { Self::uniq_insert_locked(m, h, slot); }
             let d = Self::alloc(&mut c, self.stride);
-            d[off..off + 8].copy_from_slice(&0u64.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(row);
+            d[off..off + 8].copy_from_slice(&0u64.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes());
+            if long { d[off + 16..off + self.stride].copy_from_slice(&store_row(&self.schema, row)); } else { d[off + 16..off + self.stride].copy_from_slice(row); }
         }
         self.log.wait_commit(seq, self.durable);
         { let mut c = self.chunks()[ck].write().unwrap();
@@ -923,7 +1136,8 @@ impl Table {
         let (ver, row) = self.with_slot(slot, |v, r| (v, r.to_vec())).ok_or(Abort::NotFound)?;
         if self.pk_of(&row) != pk { return Err(Abort::NotFound); }
         let new = f(&row)?;
-        if new.len() != self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+        if new.len() < self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+        let long = has_long(&self.schema);
         let links = self.fks.read().unwrap().clone(); let _fk = self.fk_guards(&links, &new)?;
         let old_key = self.unique_key(&row).map(|k| k.to_vec()); let new_key = self.unique_key(&new).map(|k| k.to_vec());
         let key_changed = old_key != new_key;
@@ -937,17 +1151,21 @@ impl Table {
             let d = Self::alloc(&mut c, self.stride);
             let v = u64::from_le_bytes(d[off..off + 8].try_into().unwrap()); let p = u64::from_le_bytes(d[off + 8..off + 16].try_into().unwrap());
             if p != 0 || v != ver { return Err(Abort::Conflict); }
-            seq = self.log.append(OP_UPDATE, self.id, &new);
+            // logged whole: the values `new` shares with the current row are still there (this row, under this lock)
+            seq = if long { self.log.append(OP_UPDATE, self.id, &expand(&self.schema, &new)) } else { self.log.append(OP_UPDATE, self.id, &new) };
             d[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes());
             if let Some(m) = &mut secm { Self::uniq_insert_locked(m, nh.unwrap(), slot); }
         }
         self.log.wait_commit(seq, self.durable);
+        // kept: new values to the stores, values shared with the old row handed on, the old row's others retired
+        let kept = if long { store_row(&self.schema, &new) } else { new };
         { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
-          d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(&new); }
+          d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(&kept); }
+        if long { retire_replaced(&self.schema, &row, Some(&kept)); }
         self.touched();
         if key_changed { if let Some(k) = old_key { self.uniq_remove(&k, slot); } }
-        self.idx_replace(&row, &new, slot); self.log.published();
-        self.mirror_update(&new);
+        self.idx_replace(&row, &kept, slot); self.log.published();
+        self.mirror_update(&kept);
         Ok(seq)
     }
 
@@ -995,6 +1213,8 @@ impl Table {
 pub struct Database {
     pub dir: PathBuf, pub log: Arc<GLog>, pub durable: bool,
     tables: RwLock<Vec<Arc<Table>>>, names: RwLock<HashMap<String, usize>>,
+    /// The catalog has the record after which TEXT and BYTES without a length are unbounded (`sql::LONG_TEXT_ERA`).
+    pub long_era: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug, Default)] pub struct SnapStats { pub rows: u64, pub bytes: u64, pub low_water: u64, pub secs: f64, pub deleted_segments: usize }
 #[derive(Debug, Default)] pub struct RecStats { pub snap_rows: u64, pub snap_secs: f64, pub catalog: usize, pub replayed: u64, pub skipped: u64, pub replay_secs: f64, pub segments: usize, pub low_water: u64 }
@@ -1036,7 +1256,7 @@ pub fn check_dir(dir: &Path) -> Result<DirState, String> {
 /// The directory format recorded in `dir`'s marker, or None when there is no marker.
 /// A foreign key column holds the parent's kind of key (a text key of any width); Some(the type it needs) when not.
 fn fk_mismatch(parent: &Schema, col: &ColType) -> Option<String> {
-    match (&parent.columns[parent.pk].ty, col) { (ColType::Text(_), ColType::Text(_)) | (ColType::Bytes(_), ColType::Bytes(_)) => None, (ColType::Text(_), _) => Some("TEXT".into()), (ColType::Bytes(_), _) => Some("BYTES".into()), (p, c) if p == c => None, (p, _) => Some(p.name()) }
+    match (&parent.columns[parent.pk].ty, col) { (p, c) if (p.is_text() && c.is_text()) || (p.is_bytes() && c.is_bytes()) => None, (p, _) if p.is_text() => Some("TEXT".into()), (p, _) if p.is_bytes() => Some("BYTES".into()), (p, c) if p == c => None, (p, _) => Some(p.name()) }
 }
 pub fn read_meta(dir: &Path) -> Result<Option<u32>, String> {
     let p = dir.join(META_FILE);
@@ -1059,7 +1279,7 @@ impl Database {
     pub fn open(dir: &Path, durable: bool) -> Database {
         fs::create_dir_all(dir).unwrap();
         let _ = write_meta_if_missing(dir);   // best effort here: a read-only follower of another directory may not write
-        Database { dir: dir.to_path_buf(), log: Arc::new(GLog::new(dir)), durable, tables: RwLock::new(vec![]), names: RwLock::new(HashMap::new()) }
+        Database { dir: dir.to_path_buf(), log: Arc::new(GLog::new(dir)), durable, tables: RwLock::new(vec![]), names: RwLock::new(HashMap::new()), long_era: Default::default() }
     }
     pub fn start(&self) { { let mut s = self.log.st.lock().unwrap(); s.started = true; s.running = true; s.idle_exit = None; } self.log.spawn_threads(); }
     /// Like `start`, but the log threads leave after `idle` of silence and come back on the next write (many tenants, few active).
@@ -1134,6 +1354,7 @@ impl Database {
     /// Restart replays log records with seq >= low_water on top (idempotent).
     pub fn snapshot(&self) -> SnapStats {
         let t = Instant::now();
+        let _pin = pin();   // long values named by the rows written stay until they are written too
         let (s0, catalog) = self.log.snapshot_point();
         let ntables = catalog.iter().filter(|c| { let u = c.trim_start().to_uppercase(); u.starts_with("CREATE TABLE") || (u.starts_with("ALTER TABLE") && !u.ends_with(" DONE") && !u.ends_with(" ABORT")) }).count();
         let tables: Vec<Arc<Table>> = { let ts = self.tables.read().unwrap(); ts.iter().take(ntables).cloned().collect() };
@@ -1147,7 +1368,7 @@ impl Database {
         let dir_pos = w.stream_position().unwrap(); w.write_all(&vec![0u8; SNAP_HDR * tables.len()]).unwrap();
         let mut min_pending = u64::MAX; let mut rows = 0u64;
         for (ti, tb) in tables.iter().enumerate() {
-            let (n, mp, max_v, offs, ucap, fence_n, kmin, kmax) = tb.snapshot_table(&mut w);
+            let (n, mp, max_v, offs, ucap, fence_n, kmin, kmax, (vals_off, vals_n)) = tb.snapshot_table(&mut w);
             rows += n; min_pending = min_pending.min(mp);
             let here = w.stream_position().unwrap(); w.seek(SeekFrom::Start(dir_pos + (SNAP_HDR * ti) as u64)).unwrap();
             let mut h = Vec::with_capacity(SNAP_HDR);
@@ -1158,6 +1379,7 @@ impl Database {
             h.extend_from_slice(&fence_n.to_le_bytes()); h.extend_from_slice(&(kmin as i64).to_le_bytes()); h.extend_from_slice(&(kmax as i64).to_le_bytes());
             h.extend_from_slice(&tb.next_id.load(Ordering::Relaxed).to_le_bytes());   // offset 88: highest id issued, so deleted ids are not reused after a restart
             h.extend_from_slice(&((kmin >> 64) as i64).to_le_bytes()); h.extend_from_slice(&((kmax >> 64) as i64).to_le_bytes());   // offsets 96/104: high halves (16-byte keys)
+            h.extend_from_slice(&vals_off.to_le_bytes()); h.extend_from_slice(&vals_n.to_le_bytes());   // offsets 112/120: long values (zero before they existed)
             h.resize(SNAP_HDR, 0);
             w.write_all(&h).unwrap(); w.seek(SeekFrom::Start(here)).unwrap();
         }
@@ -1221,6 +1443,13 @@ impl Database {
                 let fence = if wide { Fence::W(raw.chunks_exact(16).map(|c| i128::from_le_bytes(c.try_into().unwrap())).collect()) } else { Fence::N(raw.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect()) };
                 tb.attach_base(mm.clone(), base, n, [rd(40), rd(48), rd(56)], ucap, fence, kmin, kmax);
                 tb.backfill_indexes();
+                let (mut at, vals_n) = (rd(112) as usize, rd(120));
+                for _ in 0..vals_n {
+                    let bad = || format!("snapshot: the long values of table {} are cut short", tb.schema.name);
+                    let hd = mm.get(at..at + 14).ok_or_else(bad)?; let (j, id, len) = (u16::from_le_bytes(hd[..2].try_into().unwrap()) as usize, u64::from_le_bytes(hd[2..10].try_into().unwrap()), u32::from_le_bytes(hd[10..14].try_into().unwrap()) as usize);
+                    if mm.len() < at + 14 + len { return Err(bad()); }
+                    tb.schema.columns.get(j).and_then(|c| c.store.as_ref()).ok_or_else(bad)?.load(id, &mm, at + 14, len); at += 14 + len;
+                }
                 max_seq = max_seq.max(max_v); st.snap_rows += n as u64;
             }
         }
@@ -1283,11 +1512,11 @@ impl Table {
             match &txn.writes[i] {
                 TxnWrite::Delete { .. } => return Err(Abort::NotFound),
                 TxnWrite::Insert { .. } => { txn.writes[i] = TxnWrite::Insert { table: self.clone(), row: vec![], slot: u32::MAX }; txn.by_key.remove(&(self.id, pk)); return Ok(()); } // tombstoned own insert (skipped at commit)
-                TxnWrite::Update { slot, base, .. } => { let (slot, base) = (*slot, *base); let old = self.with_slot(slot, |_, r| r.to_vec()).ok_or(Abort::NotFound)?; txn.writes[i] = TxnWrite::Delete { table: self.clone(), slot, base, row: old }; return Ok(()); }
+                TxnWrite::Update { slot, base, .. } => { let (slot, base) = (*slot, *base); let old = self.with_slot(slot, |_, r| expand(&self.schema, r).into_owned()).ok_or(Abort::NotFound)?; txn.writes[i] = TxnWrite::Delete { table: self.clone(), slot, base, row: old }; return Ok(()); }
             }
         }
         let slot = match self.pk_slot(pk) { Some(s) => s, None => return Err(Abort::NotFound) };
-        let (ver, row) = self.with_slot(slot, |v, r| (v, r.to_vec())).ok_or(Abort::NotFound)?;
+        let (ver, row) = self.with_slot(slot, |v, r| (v, expand(&self.schema, r).into_owned())).ok_or(Abort::NotFound)?;
         if self.pk_of(&row) != pk { return Err(Abort::NotFound); }
         txn.by_key.insert((self.id, pk), txn.writes.len());
         txn.writes.push(TxnWrite::Delete { table: self.clone(), slot, base: ver, row });
@@ -1296,12 +1525,12 @@ impl Table {
     pub fn txn_insert(self: &Arc<Self>, txn: &mut Txn, row: &[u8]) -> Result<(), Abort> {
         let pk = self.pk_of(row);
         if let Some(&i) = txn.by_key.get(&(self.id, pk)) {
-            if let TxnWrite::Delete { slot, base, row: old, .. } = &txn.writes[i] { let (slot, base, old_key) = (*slot, *base, self.unique_key(old).map(|k| k.to_vec())); txn.writes[i] = TxnWrite::Update { table: self.clone(), slot, base, row: row.to_vec(), old_key }; return Ok(()); }
+            if let TxnWrite::Delete { slot, base, row: old, .. } = &txn.writes[i] { let (slot, base, old_key) = (*slot, *base, self.unique_key(old).map(|k| k.to_vec())); txn.writes[i] = TxnWrite::Update { table: self.clone(), slot, base, row: expand(&self.schema, row).into_owned(), old_key }; return Ok(()); }
             return Err(Abort::Duplicate);
         }
         if self.pk_slot(pk).is_some() { return Err(Abort::Duplicate); }
         txn.by_key.insert((self.id, pk), txn.writes.len());
-        txn.writes.push(TxnWrite::Insert { table: self.clone(), row: row.to_vec(), slot: 0 });
+        txn.writes.push(TxnWrite::Insert { table: self.clone(), row: expand(&self.schema, row).into_owned(), slot: 0 });
         Ok(())
     }
     pub fn txn_update(self: &Arc<Self>, txn: &mut Txn, pk: impl Into<Key>, f: impl FnOnce(&[u8]) -> Result<Vec<u8>, Abort>) -> Result<(), Abort> {
@@ -1309,7 +1538,8 @@ impl Table {
         if let Some(&i) = txn.by_key.get(&(self.id, pk)) {
             if matches!(txn.writes[i], TxnWrite::Delete { .. }) { return Err(Abort::NotFound); }
             let new = f(txn.writes[i].row())?;
-            if new.len() != self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+            if new.len() < self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+            let new = expand(&self.schema, &new).into_owned();
             match &mut txn.writes[i] { TxnWrite::Insert { row, .. } | TxnWrite::Update { row, .. } => *row = new, TxnWrite::Delete { .. } => unreachable!() }
             return Ok(());
         }
@@ -1317,7 +1547,8 @@ impl Table {
         let (ver, row) = self.with_slot(slot, |v, r| (v, r.to_vec())).ok_or(Abort::NotFound)?;
         if self.pk_of(&row) != pk { return Err(Abort::NotFound); }
         let new = f(&row)?;
-        if new.len() != self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+        if new.len() < self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+        let new = expand(&self.schema, &new).into_owned();
         let old_key = self.unique_key(&row).map(|k| k.to_vec());
         txn.by_key.insert((self.id, pk), txn.writes.len());
         txn.writes.push(TxnWrite::Update { table: self.clone(), slot, base: ver, row: new, old_key });
@@ -1337,7 +1568,8 @@ impl Table {
         let mut c = self.chunks()[ck].write().unwrap();
         pkm.insert(pk, slot);
         let d = Self::alloc(&mut c, self.stride);
-        d[off..off + 8].copy_from_slice(&0u64.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&mark.to_le_bytes()); d[off + 16..off + self.stride].copy_from_slice(row);
+        d[off..off + 8].copy_from_slice(&0u64.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&mark.to_le_bytes());
+        if has_long(&self.schema) { d[off + 16..off + self.stride].copy_from_slice(&store_row(&self.schema, row)); } else { d[off + 16..off + self.stride].copy_from_slice(row); }
         if let Some(m) = &mut secm { Self::uniq_insert_locked(m, h, slot); }
         *slot_out = slot;
         Ok(())
@@ -1347,7 +1579,8 @@ impl Table {
         self.pk()[Self::pk_shard(pk)].write().unwrap().remove(&pk);
         if let Some(k) = self.unique_key(row) { self.uniq_remove(k, slot); }
         let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * self.stride);
-        { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
+        let kept = { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); d[off..off + 16].copy_from_slice(&[0u8; 16]); d[off + 16..off + self.stride].to_vec() };
+        retire_replaced(&self.schema, &kept, None);
         self.free_slot(slot);
     }
     fn claim_update(&self, slot: u32, base: u64, new: &[u8], old_key: Option<&[u8]>, mark: u64, freed: &HashSet<u32>) -> Result<(), Abort> {
@@ -1440,13 +1673,15 @@ impl Database {
             let (t, slot) = (w.table(), w.slot());
             let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * t.stride);
             if let TxnWrite::Delete { row, .. } = w {
-                { let mut c = t.chunk_lock(ck); let d = t.alloc_in(&mut c); d[off..off + 16].copy_from_slice(&[0u8; 16]); }
-                t.unpublish(slot, row); t.free_slot(slot); continue;
+                let kept = { let mut c = t.chunk_lock(ck); let d = t.alloc_in(&mut c); d[off..off + 16].copy_from_slice(&[0u8; 16]); d[off + 16..off + t.stride].to_vec() };
+                t.unpublish(slot, row); retire_replaced(&t.schema, &kept, None); t.free_slot(slot); continue;
             }
+            let long = has_long(&t.schema);
+            let kept = match w { TxnWrite::Update { row, .. } if long => Some(store_row(&t.schema, row)), _ => None };
             let old: Option<Vec<u8>> = { let mut c = t.chunk_lock(ck); let d = t.alloc_in(&mut c);
                 d[off..off + 8].copy_from_slice(&seq.to_le_bytes()); d[off + 8..off + 16].copy_from_slice(&0u64.to_le_bytes());
-                if let TxnWrite::Update { row, .. } = w { let old = d[off + 16..off + t.stride].to_vec(); d[off + 16..off + t.stride].copy_from_slice(row); Some(old) } else { None } };
-            match (w, old) { (TxnWrite::Insert { row, .. }, _) => t.idx_add(row, slot), (TxnWrite::Update { row, .. }, Some(old)) => t.idx_replace(&old, row, slot), _ => {} }
+                if let TxnWrite::Update { row, .. } = w { let old = d[off + 16..off + t.stride].to_vec(); d[off + 16..off + t.stride].copy_from_slice(kept.as_deref().unwrap_or(row)); Some(old) } else { None } };
+            match (w, old) { (TxnWrite::Insert { row, .. }, _) => t.idx_add(row, slot), (TxnWrite::Update { row, .. }, Some(old)) => { if long { retire_replaced(&t.schema, &old, kept.as_deref()); } t.idx_replace(&old, row, slot) } _ => {} }
         }
         for w in &txn.writes { if let TxnWrite::Update { table, row, old_key: Some(k), slot, .. } = w { if table.unique_key(row) != Some(&k[..]) { table.uniq_remove(k, *slot); } } }
         for w in &txn.writes { w.table().touched(); }   // after publishing: a sign-in check before this sees the change next time

@@ -132,7 +132,7 @@ impl Reactor {
                 let mut st = self.state.lock().unwrap();
                 for (seq, t, op, payload) in &recs {
                     self.last_seq.store(*seq, Ordering::Relaxed);
-                    let is_row = payload.len() == t.schema.row_size;
+                    let is_row = payload.len() >= t.schema.row_size;   // a row, with any long values after it (not a key-only delete)
                     // candidates: keyed subscriptions matching this row's values on each indexed column, plus the general ones
                     let mut cands: Vec<usize> = Vec::new();
                     if is_row { if let Some(cols) = st.key_cols.get(&t.id) { for &c in cols { if let Some(v) = read_key(&t.schema, payload, c) { if let Some(ix) = st.keyed.get(&(t.id, c, v)) { cands.extend_from_slice(ix); } } } } }

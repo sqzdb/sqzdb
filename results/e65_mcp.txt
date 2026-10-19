@@ -1,0 +1,5 @@
+flow and checks: ok
+a query tool call over HTTP (Node fetch, keep-alive)             0.27 ms
+connecting an agent: authorize, sign in, allow, exchange         11 ms (most of it the password hash)
+the SDK client: discover, register, sign in, connect, list, call 27 ms, protocol sqweezdb 2025-11-25
+official SDK client: ok

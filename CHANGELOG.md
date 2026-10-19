@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.0 — 2026-10-18
+
+**`TEXT` without a length now means text of any length.** In tables made before this version, `TEXT`
+columns stay `TEXT(255)`; a column added or a table made from now on gets the new kind. A database opened
+by this version can't be opened by an older one once it runs a `CREATE` or `ALTER`.
+
+### Added
+- **Text and bytes of any length.** `TEXT` and `BYTES` (also `VARCHAR`, `CLOB`, `BLOB`, `BYTEA`) hold
+  values up to 16 MB. A value of up to 44 bytes stays in its row (64 bytes of row, where `TEXT` took 257);
+  a longer one is kept beside it. Such a column can be a key, `UNIQUE`, indexed, joined and referenced,
+  like `TEXT(n)`, which keeps its meaning. The log, change feeds, live queries, backups and followers
+  carry whole values. A value replaced or deleted is freed once no statement can still be reading it.
+  After a restart, values stay in the snapshot's mapping until read.
+- **Agents over MCP** (`[app.mcp]`). Claude, ChatGPT, Claude Code and other MCP clients connect to
+  `/mcp` and act as a user who signed in, under that user's grants and row policies. They get three tools:
+  `describe`, `query` (SELECT) and `execute` (INSERT, UPDATE, DELETE). The app API is their OAuth 2.1
+  server, per the MCP authorization spec:
+  - discovery metadata and dynamic client registration;
+  - a sign-in page (password or `auth.oauth` providers) with a consent step;
+  - PKCE (S256), tokens bound to `/mcp`, and refresh tokens that rotate.
+
+  A refresh token used twice ends the sign-in, and a sign-in lasts at most 90 days. A password change
+  or sign-out everywhere ends an agent's access. New settings: `app.mcp.users`, `tokenTtl`, `grantTtl`,
+  `maxRows`. The official TypeScript SDK's client connects end to end (E65).
+- A provider sign-in's `return` may no longer point into `/oauth/`, except at a sign-in in progress.
+- The sign-in rate limit counts an IPv6 client by its /64.
+- `app.maxRequest` (default `8MB`): the largest request body or WebSocket message a client may send. It
+  was a fixed 1 MB.
+
+### Fixed
+- A process connected through a Unix socket (the shared-memory ring) got a result over 1 MB cut short,
+  and couldn't send a request over 1 MB. Both now go through the ring in pieces.
+- Reading text is faster: a 4 MB value takes 0.1 ms instead of 0.8 ms. It was checked for UTF-8 the slow
+  way.
+
 ## 0.8.1 — 2026-10-18
 
 ### Fixed

@@ -105,8 +105,14 @@ impl Default for LivePolicy { fn default() -> Self { LivePolicy { debounce: Dura
 /// columns a client may set besides the login column (other tables are sign-in only).
 #[derive(Clone, Debug)] pub struct AppPolicy { pub origins: Vec<String>, pub public_url: Option<String>, pub anonymous_role: Option<String>, pub max_rows: usize, pub static_dir: Option<PathBuf>, pub sign_up: std::collections::BTreeMap<String, Vec<String>>, pub tls: Option<TlsPolicy>,
     /// FILE columns: the largest upload, and how long a link to a file that a query hands out works
-    pub file_max: u64, pub file_link_ttl: Duration }
-impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None, file_max: 25 << 20, file_link_ttl: Duration::from_secs(3600) } } }
+    pub file_max: u64, pub file_link_ttl: Duration, /// the largest request body or WebSocket message (an upload streams instead)
+    pub max_request: usize, /// agents over MCP, signed in through the API's own OAuth server (`mcp.rs`); off unless set
+    pub mcp: Option<McpPolicy> }
+/// `app.mcp`: which table people sign in to when they connect an agent, how long an access token lasts (refreshed by
+/// the agent on its own), how long a sign-in lasts unused, and the most rows a query hands an agent.
+#[derive(Clone, Debug)] pub struct McpPolicy { pub users: Option<String>, pub token_ttl: Duration, pub grant_ttl: Duration, pub max_rows: usize }
+impl Default for McpPolicy { fn default() -> McpPolicy { McpPolicy { users: None, token_ttl: Duration::from_secs(3600), grant_ttl: Duration::from_secs(30 * 86400), max_rows: 500 } } }
+impl Default for AppPolicy { fn default() -> AppPolicy { AppPolicy { origins: vec![], public_url: None, anonymous_role: None, max_rows: 10_000, static_dir: None, sign_up: Default::default(), tls: None, file_max: 25 << 20, file_link_ttl: Duration::from_secs(3600), max_request: 8 << 20, mcp: None } } }
 /// TLS for the app API (`app.tls`, see `tls.rs`): your own certificate (`cert` and `key`, PEM files), or one for
 /// `domains` from the ACME CA whose directory is `acme` (Let's Encrypt), kept in `dir` (the database's `tls/` when
 /// unset) under an account with `email` as its contact. `acme_root` is a root to trust for the CA itself (a private
@@ -162,7 +168,10 @@ pub struct ConfigFile {
 pub struct EmbedFile { pub url: Option<String>, pub model: Option<String>, #[serde(alias = "api_key")] pub api_key: Option<String>, pub dimensions: Option<usize>, pub batch: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile>, pub files: Option<AppFilesFile> }
+pub struct AppFile { pub origins: Option<Vec<String>>, #[serde(alias = "public_url")] pub public_url: Option<String>, #[serde(alias = "anonymous_role")] pub anonymous_role: Option<String>, #[serde(alias = "max_rows")] pub max_rows: Option<usize>, #[serde(alias = "static_dir")] pub static_dir: Option<String>, #[serde(alias = "sign_up")] pub sign_up: Option<std::collections::BTreeMap<String, Vec<String>>>, pub tls: Option<TlsFile>, pub files: Option<AppFilesFile>, #[serde(alias = "max_request")] pub max_request: Option<Size>, pub mcp: Option<McpFile> }
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct McpFile { pub users: Option<String>, #[serde(alias = "token_ttl")] pub token_ttl: Option<Dur>, #[serde(alias = "grant_ttl")] pub grant_ttl: Option<Dur>, #[serde(alias = "max_rows")] pub max_rows: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AppFilesFile { #[serde(alias = "max_size")] pub max_size: Option<Size>, #[serde(alias = "link_ttl")] pub link_ttl: Option<Dur> }
@@ -240,7 +249,8 @@ impl ConfigFile {
             follow: nest(self.follow, o.follow, |a, b| FollowFile { dir: pick(a.dir, b.dir), bucket: nest(a.bucket, b.bucket, |x, y| x.overlay(y)), poll: pick(a.poll, b.poll) }),
             snapshot: nest(self.snapshot, o.snapshot, |a, b| SnapshotFile { log_bytes: pick(a.log_bytes, b.log_bytes), idle_after: pick(a.idle_after, b.idle_after) }),
             listen: nest(self.listen, o.listen, |a, b| ListenFile { socket: pick(a.socket, b.socket), tcp: pick(a.tcp, b.tcp), http: pick(a.http, b.http), token: pick(a.token, b.token), app: pick(a.app, b.app) }),
-            app: nest(self.app, o.app, |a, b| AppFile { origins: pick(a.origins, b.origins), public_url: pick(a.public_url, b.public_url), anonymous_role: pick(a.anonymous_role, b.anonymous_role), max_rows: pick(a.max_rows, b.max_rows), static_dir: pick(a.static_dir, b.static_dir), sign_up: pick(a.sign_up, b.sign_up),
+            app: nest(self.app, o.app, |a, b| AppFile { origins: pick(a.origins, b.origins), public_url: pick(a.public_url, b.public_url), anonymous_role: pick(a.anonymous_role, b.anonymous_role), max_rows: pick(a.max_rows, b.max_rows), static_dir: pick(a.static_dir, b.static_dir), sign_up: pick(a.sign_up, b.sign_up), max_request: pick(a.max_request, b.max_request),
+                mcp: nest(a.mcp, b.mcp, |x, y| McpFile { users: pick(x.users, y.users), token_ttl: pick(x.token_ttl, y.token_ttl), grant_ttl: pick(x.grant_ttl, y.grant_ttl), max_rows: pick(x.max_rows, y.max_rows) }),
                 files: nest(a.files, b.files, |x, y| AppFilesFile { max_size: pick(x.max_size, y.max_size), link_ttl: pick(x.link_ttl, y.link_ttl) }),
                 tls: nest(a.tls, b.tls, |x, y| TlsFile { domains: pick(x.domains, y.domains), email: pick(x.email, y.email), cert: pick(x.cert, y.cert), key: pick(x.key, y.key), acme: pick(x.acme, y.acme), acme_root: pick(x.acme_root, y.acme_root), dir: pick(x.dir, y.dir), redirect: pick(x.redirect, y.redirect) }) }),
             embed: nest(self.embed, o.embed, |a, b| EmbedFile { url: pick(a.url, b.url), model: pick(a.model, b.model), api_key: pick(a.api_key, b.api_key), dimensions: pick(a.dimensions, b.dimensions), batch: pick(a.batch, b.batch) }),
@@ -295,6 +305,7 @@ impl ConfigFile {
             if let Some(u) = a.public_url.filter(|u| !u.is_empty()) { if !(u.starts_with("https://") || u.starts_with("http://")) { return Err("app.publicUrl: an http(s) URL".into()); } c.app.public_url = Some(u.trim_end_matches('/').to_string()); }
             c.app.anonymous_role = a.anonymous_role.filter(|r| !r.is_empty());
             if let Some(n) = a.max_rows { if n == 0 { return Err("app.maxRows: at least 1".into()); } c.app.max_rows = n; }
+            if let Some(m) = a.max_request { let m = size_of(m, "app.maxRequest")?; if !(64 << 10..=256 << 20).contains(&m) { return Err("app.maxRequest: between 64KB and 256MB".into()); } c.app.max_request = m as usize; }
             c.app.static_dir = a.static_dir.filter(|d| !d.is_empty()).map(PathBuf::from);
             if let Some(m) = a.sign_up { c.app.sign_up = m.into_iter().map(|(t, cols)| (t.to_ascii_lowercase(), cols.into_iter().map(|c| c.to_ascii_lowercase()).collect())).collect(); }
             if let Some(f) = a.files {
@@ -317,6 +328,18 @@ impl ConfigFile {
                     c.app.public_url = Some(format!("https://{d}{}", port.map(|p| format!(":{p}")).unwrap_or_default()));
                 } }
                 c.app.tls = Some(TlsPolicy { domains, email: some(t.email), cert, key, acme, acme_root: some(t.acme_root).map(PathBuf::from), dir: some(t.dir).map(PathBuf::from), redirect: some(t.redirect) });
+            }
+            if let Some(m) = a.mcp {
+                let mut p = McpPolicy { users: m.users.filter(|u| !u.is_empty()).map(|u| u.to_ascii_lowercase()), ..McpPolicy::default() };
+                if let Some(d) = m.token_ttl { let d = dur_of(d, "app.mcp.tokenTtl")?; if d < Duration::from_secs(300) || d > Duration::from_secs(86400) { return Err("app.mcp.tokenTtl: between 5m and 1d".into()); } p.token_ttl = d; }
+                if let Some(d) = m.grant_ttl { let d = dur_of(d, "app.mcp.grantTtl")?; if d < Duration::from_secs(3600) || d > Duration::from_secs(365 * 86400) { return Err("app.mcp.grantTtl: between 1h and 365d".into()); } p.grant_ttl = d; }
+                if let Some(n) = m.max_rows { if n == 0 { return Err("app.mcp.maxRows: at least 1".into()); } p.max_rows = n; }
+                // the issuer and the resource are absolute URLs agents check
+                if c.app.public_url.as_deref().is_none_or(|u| !u.starts_with("https://") && !(u.starts_with("http://localhost") || u.starts_with("http://127.0.0.1") || u.starts_with("http://[::1]"))) {
+                    return Err("app.mcp needs app.publicUrl, the https address agents reach this server at (or app.tls.domains); http only on this machine".into());
+                }
+                if c.app.public_url.as_deref().and_then(|u| u.split_once("://")).is_some_and(|(_, r)| r.contains('/')) { return Err("app.mcp: app.publicUrl is an origin, without a path (agents find the server at its /.well-known)".into()); }
+                c.app.mcp = Some(p);
             }
         }
         if let Some(a) = self.auth {

@@ -54,13 +54,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(120);
 const PING_EVERY: Duration = Duration::from_secs(30);
-const MAX_BODY: usize = 1 << 20;
 const MAX_LINE: u64 = 16 << 10;
 const MAX_HEADERS: usize = 64;
 const MAX_SQL: usize = 64 << 10;
 const MAX_PARAMS: usize = 1000;
 const MAX_BATCH: usize = 100;
-const MAX_MESSAGE: usize = 1 << 20;
 const MAX_LIVES: usize = 64;
 const CODE_TTL: Duration = Duration::from_secs(60);
 const CLIENT_JS: &str = include_str!("../clients/js/index.js");
@@ -69,11 +67,11 @@ const OUT_QUEUE: usize = 64;
 
 /// Shared by every connection of one listener. `hashing`: sign-ups and sign-ins running at once (a password hash
 /// takes 19 MB and a core); the rest wait here as tasks rather than as blocked threads.
-struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore, links: Arc<Links> }
+struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore, links: Arc<Links>, mcp: crate::mcp::McpState }
 /// Links to files: signed with this database's key (`files/link.key`), under `base` (`app.publicUrl`, or none: a link
 /// relative to the API), and working for a `ttl`. A link's expiry is rounded to half the ttl, so the same file gets
 /// the same link for a while and browsers can cache it.
-struct Links { key: ring::hmac::Key, base: String, ttl: i64 }
+pub(crate) struct Links { key: ring::hmac::Key, base: String, ttl: i64 }
 impl Links {
     fn load(sql: &Sql) -> Result<Links, String> {
         let dir = sql.files_dir(); let p = dir.join("link.key");
@@ -119,6 +117,8 @@ impl AppState {
     fn allow(&self, ip: IpAddr) -> bool {
         let mut m = self.limits.lock().unwrap();
         if m.len() > 100_000 { m.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(60)); }
+        // an IPv6 client by its /64: one host has a whole one to pick addresses from
+        let ip = match ip { IpAddr::V6(v) if v.to_ipv4_mapped().is_none() => { let s = v.segments(); IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)) } ip => ip };
         let (tokens, at) = m.entry(ip).or_insert((10.0, Instant::now()));
         *tokens = (*tokens + at.elapsed().as_secs_f64() / 3.0).min(10.0); *at = Instant::now();
         if *tokens >= 1.0 { *tokens -= 1.0; true } else { false }
@@ -143,7 +143,7 @@ pub fn start(sql: Arc<Sql>, addr: &str) -> Result<crate::net::Listener, String> 
     }
     let links = Arc::new(Links::load(&sql)?);
     let weak = Arc::downgrade(&sql); drop(sql);
-    let st = Arc::new(AppState { limits: Default::default(), codes: Default::default(), hashing: tokio::sync::Semaphore::new(workers), links });
+    let st = Arc::new(AppState { limits: Default::default(), codes: Default::default(), hashing: tokio::sync::Semaphore::new(workers), links, mcp: Default::default() });
     Ok(crate::net::spawn_listener(local, move |stop| {
         rt.block_on(async move {
             loop {
@@ -169,7 +169,7 @@ pub fn start(sql: Arc<Sql>, addr: &str) -> Result<crate::net::Listener, String> 
 }
 
 // ---------- HTTP ----------
-struct Req { method: String, path: String, query: HashMap<String, String>, headers: HashMap<String, String>, body: Vec<u8> }
+pub(crate) struct Req { pub(crate) method: String, pub(crate) path: String, pub(crate) query: HashMap<String, String>, pub(crate) headers: HashMap<String, String>, pub(crate) body: Vec<u8> }
 /// One CRLF/LF-terminated line of at most MAX_LINE bytes; `None` at a clean end of stream.
 async fn read_line<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> io::Result<Option<String>> {
     let mut buf = Vec::new(); let n = (&mut *r).take(MAX_LINE).read_until(b'\n', &mut buf).await?;
@@ -177,7 +177,8 @@ async fn read_line<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> io::Result<Opt
     if buf.last() != Some(&b'\n') { return Err(io::Error::other("request line or header too long")); }
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
-async fn read_req<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> io::Result<Option<Req>> {
+/// One request, its body at most `max` bytes (`app.maxRequest`; an upload streams instead).
+async fn read_req<R: AsyncRead + Unpin>(r: &mut BufReader<R>, max: usize) -> io::Result<Option<Req>> {
     let Some(line) = read_line(r).await? else { return Ok(None) };
     let mut parts = line.split_whitespace(); let method = parts.next().unwrap_or("").to_string(); let target = parts.next().unwrap_or("/").to_string();
     let mut headers = HashMap::new();
@@ -190,7 +191,7 @@ async fn read_req<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> io::Result<Opti
     let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut body = vec![];
     if !(method == "POST" && path == "/api/files") {   // an upload's body is the handler's to stream
-        if len > MAX_BODY { return Err(io::Error::other("body too large")); }
+        if len > max { return Err(io::Error::other("body too large")); }
         body = vec![0u8; len]; if len > 0 { r.read_exact(&mut body).await?; }
     }
     let query = q.split('&').filter(|s| !s.is_empty()).map(|kv| { let (k, v) = kv.split_once('=').unwrap_or((kv, "")); (url_decode(k), url_decode(v)) }).collect();
@@ -205,7 +206,7 @@ fn head(status: u16, ctype: &str, len: u64, extra: &[(String, String)]) -> Vec<u
     out.push_str("\r\n"); out.into_bytes()
 }
 /// A whole response, written in one piece: a response in fragments waits on the peer's delayed ACK for each one.
-fn respond(status: u16, ctype: &str, body: &[u8], extra: &[(String, String)]) -> Vec<u8> {
+pub(crate) fn respond(status: u16, ctype: &str, body: &[u8], extra: &[(String, String)]) -> Vec<u8> {
     if extra.iter().any(|(k, v)| k.contains(['\r', '\n']) || v.contains(['\r', '\n'])) { return respond(500, "text/plain", b"a response header with a line break", &[]); }
     let mut out = format!("HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n", reason(status), body.len());
     for (k, v) in extra { out.push_str(k); out.push_str(": "); out.push_str(v); out.push_str("\r\n"); }
@@ -263,7 +264,7 @@ fn params_of(v: &J) -> Result<Vec<Value>, J> {
     Ok(a.iter().map(j_to_value).collect())
 }
 /// Run one client statement as `sess`: `{columns, rows}` (plus `lastInsertId` for an INSERT).
-fn run(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
+pub(crate) fn run(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
     let p = client_statement(sql, v.get("sql").and_then(|s| s.as_str()).unwrap_or(""))?;
     let params = params_of(v)?;
     let rows = sql.execute_s(sess, &p, &params).map_err(err_json)?;
@@ -275,7 +276,7 @@ fn run(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
     Ok(out)
 }
 /// Several statements in one transaction: all or none.
-fn run_batch(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
+pub(crate) fn run_batch(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result<J, J> {
     let list = v.get("statements").and_then(|s| s.as_array()).ok_or_else(|| json!({"error": "statements is an array of {sql, params}", "code": "ARGUMENTS"}))?;
     if list.len() > MAX_BATCH { return Err(json!({"error": format!("at most {MAX_BATCH} statements in a batch"), "code": "ARGUMENTS"})); }
     sql.exec_s(sess, "BEGIN", &[]).map_err(err_json)?;
@@ -308,20 +309,25 @@ fn user_json(sql: &Sql, table: &str, user: &[(String, Value)]) -> J {
 }
 fn signed_json(sql: &Sql, table: &str, si: &crate::auth::SignedIn) -> J { json!({"token": si.token, "user": user_json(sql, table, &si.user), "created": si.created}) }
 fn body_json(req: &Req) -> Result<J, J> { serde_json::from_slice(&req.body).map_err(|e| json!({"error": format!("bad JSON: {e}"), "code": "ARGUMENTS"})) }
-fn cookie(req: &Req, name: &str) -> Option<String> { req.headers.get("cookie")?.split(';').filter_map(|c| c.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| url_decode(v)) }
+pub(crate) fn cookie(req: &Req, name: &str) -> Option<String> { req.headers.get("cookie")?.split(';').filter_map(|c| c.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| url_decode(v)) }
 /// The PKCE-style challenge for a verifier: base64url (no padding) of its SHA-256.
-fn challenge_of(verifier: &str) -> String { crate::util::base64(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()).as_ref()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string() }
-fn is_challenge(c: &str) -> bool { c.len() == 43 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') }
-fn enc(s: &str) -> String { s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect() }
+pub(crate) fn challenge_of(verifier: &str) -> String { crate::util::base64(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()).as_ref()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string() }
+pub(crate) fn is_challenge(c: &str) -> bool { c.len() == 43 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') }
+pub(crate) fn enc(s: &str) -> String { s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect() }
 /// A URL to send the browser back to after a provider sign-in: on an allowed origin, so the API is no open redirect,
 /// and printable ASCII only (it goes into a Location header).
 fn return_ok(sql: &Sql, url: &str) -> bool {
     if !url.bytes().all(|b| (0x21..0x7f).contains(&b)) { return false; }
     let origin = match url.splitn(4, '/').collect::<Vec<_>>().as_slice() { [scheme, "", host, ..] if *scheme == "https:" || *scheme == "http:" => format!("{scheme}//{host}"), _ => return false };
+    // under the API's OAuth server, only back to a sign-in in progress: its other URLs redirect on, and the sign-in's
+    // code (in the fragment) would go with them
+    if let Some(rest) = url.strip_prefix(origin.as_str()).filter(|r| r.starts_with("/oauth/")) {
+        return rest.strip_prefix("/oauth/authorize?request=").is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) && sql.cfg.app.public_url.as_deref() == Some(origin.as_str());
+    }
     let cfg = &sql.cfg.app;
     cfg.public_url.as_deref() == Some(origin.as_str()) || cfg.origins.iter().any(|x| x.eq_ignore_ascii_case(&origin))
 }
-fn redirect(to: &str, cookies: &[String]) -> Vec<u8> {
+pub(crate) fn redirect(to: &str, cookies: &[String]) -> Vec<u8> {
     let mut h: Vec<(String, String)> = vec![("Location".into(), to.into()), ("Cache-Control".into(), "no-store".into()), ("Referrer-Policy".into(), "no-referrer".into())];
     for c in cookies { h.push(("Set-Cookie".into(), c.clone())); }
     respond(302, "text/plain", b"", &h)
@@ -335,15 +341,16 @@ fn blocks(sql: &Sql, req: &Req) -> bool {
 /// One connection, plain or TLS: HTTP requests until it closes, or a WebSocket.
 async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Weak<Sql>, stream: S, ip: IpAddr, st: Arc<AppState>) {
     let (rd, mut w) = tokio::io::split(stream); let mut r = BufReader::with_capacity(4 << 10, rd);
+    let Some(max) = weak.upgrade().map(|s| s.cfg.app.max_request) else { return };
     loop {
-        let Ok(Ok(Some(req))) = timeout(IO_TIMEOUT, read_req(&mut r)).await else { return };
+        let Ok(Ok(Some(req))) = timeout(IO_TIMEOUT, read_req(&mut r, max)).await else { return };
         let Some(sql) = weak.upgrade() else { return };
         let close = req.headers.get("connection").map(|c| c.eq_ignore_ascii_case("close")).unwrap_or(false);
         if req.method == "GET" && req.path.trim_matches('/') == "api/socket" { drop(sql); return websocket(weak, r, w, req, st.links.clone()).await; }
         if req.method == "POST" && req.path == "/api/files" { drop(sql); if !upload(&weak, &st, &mut r, &mut w, &req).await || close { return; } continue; }
         if (req.method == "GET" || req.method == "HEAD") && req.path.starts_with("/api/files/") { drop(sql); if !download(&weak, &st, &mut w, &req).await || close { return; } continue; }
         let out = if blocks(&sql, &req) {
-            let hashes = req.method == "POST" && req.path.starts_with("/api/auth/") && (req.path.ends_with("/sign-up") || req.path.ends_with("/sign-in"));
+            let hashes = req.method == "POST" && ((req.path.starts_with("/api/auth/") && (req.path.ends_with("/sign-up") || req.path.ends_with("/sign-in"))) || req.path == "/oauth/authorize");   // the MCP sign-in page hashes too
             let _turn = if hashes { st.hashing.acquire().await.ok() } else { None };
             let st = st.clone();
             let Ok(out) = tokio::task::spawn_blocking(move || handle(&sql, &st, ip, &req)).await else { return };
@@ -355,6 +362,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Weak<Sq
 
 /// One HTTP request (not the socket): the whole response.
 fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
+    if let Some(r) = crate::mcp::handle(sql, &st.mcp, &st.links, ip, &|| st.allow(ip), req) { return r; }
     let api = req.path.starts_with("/api/");
     let origin = match allowed_origin(sql, req) { Ok(o) => o, Err(()) if api => return json_resp(403, &json!({"error": "permission denied: this origin may not call the API (app.origins)", "code": "DENIED"}), &[]), Err(()) => None };
     let h = cors(&origin);
@@ -536,13 +544,13 @@ fn frame(op: u8, payload: &[u8]) -> Vec<u8> {
     f.extend_from_slice(payload); f
 }
 /// One frame: (fin, opcode, unmasked payload). Client frames must be masked.
-async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<(bool, u8, Vec<u8>)> {
+async fn read_frame(r: &mut (impl AsyncRead + Unpin), max: usize) -> io::Result<(bool, u8, Vec<u8>)> {
     let mut h = [0u8; 2]; r.read_exact(&mut h).await?;
     let (fin, op, masked) = (h[0] & 0x80 != 0, h[0] & 0x0f, h[1] & 0x80 != 0);
     let mut len = (h[1] & 0x7f) as u64;
     if len == 126 { let mut b = [0u8; 2]; r.read_exact(&mut b).await?; len = u16::from_be_bytes(b) as u64; } else if len == 127 { let mut b = [0u8; 8]; r.read_exact(&mut b).await?; len = u64::from_be_bytes(b); }
     if !masked { return Err(io::Error::other("a client frame must be masked")); }
-    if len > MAX_MESSAGE as u64 { return Err(io::Error::other("message too large")); }
+    if len > max as u64 { return Err(io::Error::other("message too large")); }
     let mut mask = [0u8; 4]; r.read_exact(&mut mask).await?;
     let mut p = vec![0u8; len as usize]; r.read_exact(&mut p).await?;
     for (i, b) in p.iter_mut().enumerate() { *b ^= mask[i % 4]; }
@@ -571,8 +579,9 @@ async fn websocket<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(weak: Wea
 /// The socket's reader: each message runs as the socket's session, and its replies queue for the writer.
 async fn read_loop<R: AsyncRead + Unpin>(weak: &Weak<Sql>, conn: &Arc<Conn>, r: &mut BufReader<R>, tx: &mpsc::Sender<Out>) -> io::Result<()> {
     let mut msg: Vec<u8> = vec![]; let mut text = false;
+    let Some(max) = weak.upgrade().map(|s| s.cfg.app.max_request) else { return Ok(()) };
     loop {
-        let (fin, op, p) = timeout(SOCKET_TIMEOUT, read_frame(r)).await.map_err(|_| io::Error::other("the client went quiet"))??;
+        let (fin, op, p) = timeout(SOCKET_TIMEOUT, read_frame(r, max)).await.map_err(|_| io::Error::other("the client went quiet"))??;
         match op {
             0x8 => { let _ = tx.send(Out::Close(p[..p.len().min(2)].to_vec())).await; return Ok(()); }
             0x9 => { if tx.send(Out::Pong(p)).await.is_err() { return Ok(()); } continue; }
@@ -582,7 +591,7 @@ async fn read_loop<R: AsyncRead + Unpin>(weak: &Weak<Sql>, conn: &Arc<Conn>, r: 
             _ => return Err(io::Error::other("text frames only")),
         }
         msg.extend_from_slice(&p);
-        if msg.len() > MAX_MESSAGE { return Err(io::Error::other("message too large")); }
+        if msg.len() > max { return Err(io::Error::other("message too large")); }
         if !fin { continue; }
         text = false;
         let Some(sql) = weak.upgrade() else { return Ok(()) };

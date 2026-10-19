@@ -296,7 +296,7 @@ fn default_spec(e: &ast::Expr, col: &str, ty: &ColType) -> Result<(Value, Option
         return Ok((Value::Null, Some(g)));
     }
     let v = default_value(e)?;
-    if v != Value::Null { let mut buf = vec![0u8; ty.width()]; encode_value(ty, &v, &mut buf).map_err(|e| format!("column {col}: DEFAULT {e}"))?; }
+    if v != Value::Null { crate::table::check_value(ty, &v).map_err(|e| format!("column {col}: DEFAULT {e}"))?; }
     Ok((v, None))
 }
 /// SERIAL and friends: an INT column whose values are assigned automatically.
@@ -309,9 +309,9 @@ fn index_key(schema: &Schema, col: usize, v: &Value) -> Result<crate::table::Key
         (ColType::Uuid, Value::Bytes(b)) if b.len() == 16 => Ok(crate::table::key_from_uuid(b)),
         (ColType::Uuid, v) => Err(format!("column {}: expected a UUID, got {v:?}", c.name)),
         (ColType::Timestamp, Value::Text(s)) => crate::table::parse_timestamp(s).map(|t| t as i128).ok_or_else(|| format!("column {}: not a timestamp {s:?}", c.name)),
-        (ColType::Text(_), Value::Text(s)) => Ok(crate::table::text_key(s.as_bytes())),
-        (ColType::Bytes(_), Value::Bytes(b)) => Ok(crate::table::text_key(b)),
-        (ColType::Text(_) | ColType::Bytes(_), v) => Err(format!("column {}: expected {}, got {v:?}", c.name, c.ty.name())),
+        (ColType::Text(_) | ColType::LongText, Value::Text(s)) => Ok(crate::table::text_key(s.as_bytes())),
+        (ColType::Bytes(_) | ColType::LongBytes, Value::Bytes(b)) => Ok(crate::table::text_key(b)),
+        (ColType::Text(_) | ColType::Bytes(_) | ColType::LongText | ColType::LongBytes, v) => Err(format!("column {}: expected {}, got {v:?}", c.name, c.ty.name())),
         (_, v) => v.as_i64().map(|i| i as i128).map_err(|e| format!("column {}: {e}", c.name)),
     }
 }
@@ -483,18 +483,28 @@ fn embed_arg<'e>(e: &'e ast::Expr, col: &str) -> Result<&'e ast::Expr, String> {
     if !obj_name(&f.name).eq_ignore_ascii_case("embed") { return Err(bad()); }
     match &f.args { FunctionArguments::List(l) if l.args.len() == 1 => match &l.args[0] { FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Ok(x), _ => Err(bad()) }, _ => Err(bad()) }
 }
+thread_local! {
+    /// While replaying catalog statements logged before `LONG_TEXT_ERA`: `TEXT`, `BLOB` and `BYTEA` mean TEXT(255) and
+    /// BYTES(255), as they did when those statements were written.
+    static LEGACY_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// The catalog record after which `TEXT` and `BYTES` without a length are unbounded (`ColType::LongText`, `LongBytes`).
+/// Logged before a database's first catalog statement from a version that has them; an older version stops at it.
+pub const LONG_TEXT_ERA: &str = "SET sqweezdb_text = 'unbounded'";
 fn coltype_of(dt: &ast::DataType) -> Result<ColType, String> {
     let s = format!("{dt}").to_uppercase();
     let num = |s: &str| s.split(|c| c == '(' || c == ')').nth(1).and_then(|x| x.trim().parse::<usize>().ok());
     // a value's length is stored in two bytes: a wider column would cut longer values (E54)
-    let width = |n: usize| if n > 65_535 { Err(unsup(format!("{s}: text and binary columns wider than 65,535 bytes"))) } else { Ok(n) };
+    let width = |n: usize| if n > 65_535 { Err(unsup(format!("{s}: TEXT(n) and BYTES(n) up to 65,535 bytes; TEXT and BYTES without a length hold any length"))) } else { Ok(n) };
+    if LEGACY_TEXT.with(|l| l.get()) { if let "TEXT" | "BLOB" | "BYTEA" = s.as_str() { return Ok(if s == "TEXT" { ColType::Text(255) } else { ColType::Bytes(255) }); } }
     Ok(match s.as_str() {
         "INT" | "INTEGER" | "BIGINT" | "INT64" | "SMALLINT" => ColType::Int,
         "UUID" | "FILE" => ColType::Uuid,   // a FILE column holds the file's id (`is_file`)
         "TIMESTAMP" | "DATETIME" | "TIMESTAMPTZ" => ColType::Timestamp,
         "DOUBLE" | "DOUBLE PRECISION" | "REAL" | "FLOAT" | "FLOAT64" => ColType::Float,
         "BOOL" | "BOOLEAN" => ColType::Bool,
-        "TEXT" => ColType::Text(255), "BLOB" | "BYTEA" => ColType::Bytes(255),
+        "TEXT" | "STRING" | "VARCHAR" | "CLOB" | "LONGTEXT" | "MEDIUMTEXT" | "CHARACTER VARYING" => ColType::LongText,
+        "BLOB" | "BYTEA" | "BYTES" | "LONGBLOB" | "VARBINARY" => ColType::LongBytes,
         _ if s.starts_with("VARCHAR") || s.starts_with("CHAR") || s.starts_with("TEXT") || s.starts_with("STRING") => ColType::Text(width(num(&s).ok_or(format!("need a length: {s}"))?)?),
         _ if s.starts_with("BLOB") || s.starts_with("VARBINARY") || s.starts_with("BYTES") || s.starts_with("BINARY") => ColType::Bytes(width(num(&s).ok_or(format!("need a length: {s}"))?)?),
         _ if s.starts_with("VECTOR") => { let n = num(&s).ok_or("need a length: VECTOR(n), the number of dimensions")?; if !(1..=16_000).contains(&n) { return Err(format!("{s}: between 1 and 16,000 dimensions")); } ColType::Bytes(4 * n) }
@@ -714,7 +724,7 @@ impl<'a> Planner<'a> {
         };
         if matches!(gf, GenFn::Sum | GenFn::Avg) {
             let ty = match &arg { AggArg::Col(v) => types.borrow().get(v).cloned(), AggArg::Expr(x) => x.ty(&|i| types.borrow().get(&i).cloned()), AggArg::Star => None };
-            if let Some(t @ (ColType::Text(_) | ColType::Bytes(_) | ColType::Uuid | ColType::Timestamp)) = ty { return Err(format!("{f}: {name}() takes numbers, and this is {}", t.name())); }
+            if let Some(t @ (ColType::Text(_) | ColType::Bytes(_) | ColType::LongText | ColType::LongBytes | ColType::Uuid | ColType::Timestamp)) = ty { return Err(format!("{f}: {name}() takes numbers, and this is {}", t.name())); }
         }
         let sep = match args.get(1) { None => ",".to_string(), Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(x))) => match self.expr(x)? { Expr::Lit(Value::Text(t)) => t, _ => return Err(format!("{name}(): the separator must be a text literal")) }, Some(_) => return Err(format!("{name}(): the separator must be a text literal")) };
         Ok(AggSpec { f: gf, arg, distinct: distinct && !matches!(gf, GenFn::Min | GenFn::Max), sep })
@@ -786,7 +796,7 @@ impl<'a> Planner<'a> {
                     if file || vector.is_some() { file_column_ok(&c.name.value, pk == Some(i) || unique == Some(i), &default, &generated)?; }
                     if embed_src.is_some() && !nullable { return Err(format!("column {}: a generated VECTOR column is NULL until its embedding is made", c.name.value)); }
                     if let Some(e) = embed_src { embeds.push((i, e)); }
-                    cols.push(Column { name: c.name.value.clone(), ty, nullable, default, generated, file, vector, embed: None });
+                    cols.push(Column { name: c.name.value.clone(), ty, nullable, default, generated, file, vector, embed: None, store: None });
                 }
                 if ct.or_replace || ct.temporary || ct.query.is_some() || ct.like.is_some() || ct.clone.is_some() || ct.inherits.is_some() || ct.partition_of.is_some() { return Err(unsup("CREATE TABLE with OR REPLACE, TEMPORARY, AS SELECT, LIKE, CLONE, INHERITS or PARTITION OF")); }
                 let one_col = |cols_: &[ast::IndexColumn], what: &str, cols: &[Column]| -> Result<usize, String> {
@@ -926,7 +936,7 @@ impl<'a> Planner<'a> {
                         ast::AlterTableOperation::AddColumn { column_def: c, .. } => { literal_name(&c.name)?; let mut nullable = true; let mut default = Value::Null; let mut generated = None; let ty = coltype_of(&c.data_type)?; let vector = vector_dims(&c.data_type); let mut embed = None;
                             for o in &c.options { match &o.option { ast::ColumnOption::NotNull => nullable = false, ast::ColumnOption::Default(e) => { (default, generated) = default_spec(e, &c.name.value, &ty)?; } ast::ColumnOption::Null => nullable = true,
                                 ast::ColumnOption::Generated { generation_expr: Some(e), .. } if vector.is_some() => { let t = self.db.table(&obj_name(&at.name)).ok_or_else(|| format!("no such table {}", obj_name(&at.name)))?; let names: Vec<String> = t.schema.columns.iter().map(|c| c.name.clone()).collect(); embed = Some(Arc::new(self.embed_spec(embed_arg(e, &c.name.value)?, &names)?)); }
-                                other => return Err(format!("unsupported column option {other}")) } } if !nullable && default == Value::Null && generated.is_none() { return Err(format!("column {} is NOT NULL and needs a DEFAULT for existing rows", c.name.value)); } let file = is_file(&c.data_type); if file || vector.is_some() { file_column_ok(&c.name.value, false, &default, &generated)?; } AlterOp::Add { col: Column { name: c.name.value.clone(), ty, nullable, default: default.clone(), generated, file, vector, embed }, default } }
+                                other => return Err(format!("unsupported column option {other}")) } } if !nullable && default == Value::Null && generated.is_none() { return Err(format!("column {} is NOT NULL and needs a DEFAULT for existing rows", c.name.value)); } let file = is_file(&c.data_type); if file || vector.is_some() { file_column_ok(&c.name.value, false, &default, &generated)?; } AlterOp::Add { col: Column { name: c.name.value.clone(), ty, nullable, default: default.clone(), generated, file, vector, embed, store: None }, default } }
                         ast::AlterTableOperation::DropColumn { column_names, .. } => { if column_names.len() != 1 { return Err("drop one column at a time".into()); } AlterOp::Drop(column_names[0].value.clone()) }
                         ast::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => AlterOp::Rename(old_column_name.value.clone(), new_column_name.value.clone()),
                         ast::AlterTableOperation::AlterColumn { column_name, op } => match op { ast::AlterColumnOperation::SetNotNull => AlterOp::SetNotNull(column_name.value.clone()), ast::AlterColumnOperation::DropNotNull => AlterOp::DropNotNull(column_name.value.clone()), ast::AlterColumnOperation::SetDataType { data_type, .. } => { if is_file(data_type) || vector_dims(data_type).is_some() { return Err(unsup("ALTER COLUMN … TYPE FILE or VECTOR: add such a column instead")); } AlterOp::SetType(column_name.value.clone(), coltype_of(data_type)?) } other => return Err(format!("unsupported ALTER COLUMN {other}")) },
@@ -1255,7 +1265,7 @@ impl<'a> Planner<'a> {
             let mut off = vn + ps.row_size; let mut vbase = ncols_probe;
             for (k, &(bs, bcol, _, _)) in step_specs.iter().enumerate() {
                 let bsch = &srcs[bs].table.schema; let base = off;
-                for &c in &step_cols[k] { schema.columns.push(Column { name: format!("{}.{}", srcs[bs].alias, bsch.columns[c].name), ty: bsch.columns[c].ty.clone(), nullable: bsch.columns[c].nullable, default: Value::Null, generated: None, file: bsch.columns[c].file, vector: bsch.columns[c].vector, embed: bsch.columns[c].embed.clone() }); schema.offsets.push(off); off += bsch.columns[c].ty.width(); }
+                for &c in &step_cols[k] { schema.columns.push(Column { name: format!("{}.{}", srcs[bs].alias, bsch.columns[c].name), ty: bsch.columns[c].ty.clone(), nullable: bsch.columns[c].nullable, default: Value::Null, generated: None, file: bsch.columns[c].file, vector: bsch.columns[c].vector, embed: bsch.columns[c].embed.clone(), store: bsch.columns[c].store.clone() }); schema.offsets.push(off); off += bsch.columns[c].ty.width(); }
                 let mut build_preds = std::mem::take(&mut side_preds[bs]);
                 let build_access = access_path(&srcs[bs].table, &mut build_preds);
                 let outer = outer_of[bs]; let multi = bcol != srcs[bs].table.schema.pk;
@@ -1340,8 +1350,22 @@ fn uuid_key(v: &Value) -> Option<Key> { match v { Value::Text(s) => parse_uuid(s
 /// Correlated scalar results by the outer row's key: INT/TIMESTAMP keys, or UUID keys.
 pub enum CorrMap { N(FastMap<f64>), W(crate::util::WideMap<f64>) }
 #[inline] fn mix_pair(a: i64, b: i64) -> i64 { ((a as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (b as u64).rotate_left(32).wrapping_mul(0xC2B2AE3D27D4EB4F)) as i64 }
-pub struct CPred { off: usize, kind: u8, cmp: Cmp, i: i64, f: f64, b: Vec<u8>, nb: usize, nm: u8, set: Option<Arc<KeySet>>, pair: Option<(usize, usize, u8)>, corr_map: Option<Arc<CorrMap>>, ckind: u8 }
+/// kind: 0 integer, 1 DOUBLE, 2 BOOL, 3 TEXT(n)/BYTES(n) bytes, 4 UUID, 6 TEXT(n)/BYTES(n) IN, 7 long IN, 8 long (its key
+/// for = and <>, its bytes otherwise, from `store` when not in the row), 9 never, 20 correlated scalar
+pub struct CPred { off: usize, kind: u8, cmp: Cmp, i: i64, f: f64, b: Vec<u8>, nb: usize, nm: u8, set: Option<Arc<KeySet>>, pair: Option<(usize, usize, u8)>, corr_map: Option<Arc<CorrMap>>, ckind: u8, key: crate::table::Key, store: Option<Arc<crate::table::ValueStore>> }
 impl CPred {
+    /// A long column against a value: = and <> by key; an order by bytes, fetched when not in the row (a row with its
+    /// tail, which only change feeds see, passes: they re-check by running the query).
+    #[inline(never)] fn long_cmp(&self, row: &[u8]) -> bool {
+        let o = self.off; let k = i128::from_le_bytes(row[o + 4..o + 20].try_into().unwrap());
+        match self.cmp { Cmp::Eq => return k == self.key, Cmp::Ne => return k != self.key, _ => {} }
+        let n = u32::from_le_bytes(row[o..o + 4].try_into().unwrap()) as usize;
+        if n <= crate::table::LONG_INLINE { return Self::ok(self.cmp, &row[o + 20..o + 20 + n], &self.b[..]); }
+        match u64::from_le_bytes(row[o + 20..o + 28].try_into().unwrap()) {
+            0 => true,
+            id => self.store.as_ref().and_then(|s| s.get(id)).is_some_and(|v| Self::ok(self.cmp, &v[..], &self.b[..])),
+        }
+    }
     #[inline] fn ok<T: PartialOrd>(cmp: Cmp, a: T, b: T) -> bool { match cmp { Cmp::Eq => a == b, Cmp::Ne => a != b, Cmp::Lt => a < b, Cmp::Le => a <= b, Cmp::Gt => a > b, Cmp::Ge => a >= b, _ => false } }
     #[inline(always)] pub fn eval(&self, row: &[u8]) -> bool {
         let null = row[self.nb] & self.nm != 0;
@@ -1351,7 +1375,8 @@ impl CPred {
                 if null { return false; }
                 let set = self.set.as_ref().unwrap();
                 let hit = if self.kind == 4 { set.contains_wide(key_from_uuid(&row[self.off..self.off + 16])) }
-                    else if self.kind == 6 { let n = u16::from_le_bytes([row[self.off], row[self.off + 1]]) as usize; set.contains_wide(crate::table::text_key(&row[self.off + 2..self.off + 2 + n])) } else {
+                    else if self.kind == 6 { let n = u16::from_le_bytes([row[self.off], row[self.off + 1]]) as usize; set.contains_wide(crate::table::text_key(&row[self.off + 2..self.off + 2 + n])) }
+                    else if self.kind == 7 { set.contains_wide(i128::from_le_bytes(row[self.off + 4..self.off + 20].try_into().unwrap())) } else {
                     let mut k = read_i64(row, self.off);
                     if let Some((po, pnb, pnm)) = self.pair { if row[pnb] & pnm != 0 { return false; } k = mix_pair(k, read_i64(row, po)); }
                     set.contains(k)
@@ -1369,7 +1394,7 @@ impl CPred {
             let a = if self.ckind == 1 { read_f64(row, self.off) } else { read_i64(row, self.off) as f64 };
             return Self::ok(self.cmp, a, v);
         }
-        match self.kind { 0 => Self::ok(self.cmp, read_i64(row, self.off), self.i), 1 => Self::ok(self.cmp, read_f64(row, self.off), self.f), 2 => Self::ok(self.cmp, row[self.off] as i64, self.i), 4 => Self::ok(self.cmp, &row[self.off..self.off + 16], &self.b[..]), 9 => false, _ => Self::ok(self.cmp, read_bytes(row, self.off), &self.b[..]) }
+        match self.kind { 0 => Self::ok(self.cmp, read_i64(row, self.off), self.i), 1 => Self::ok(self.cmp, read_f64(row, self.off), self.f), 2 => Self::ok(self.cmp, row[self.off] as i64, self.i), 4 => Self::ok(self.cmp, &row[self.off..self.off + 16], &self.b[..]), 8 => self.long_cmp(row), 9 => false, _ => Self::ok(self.cmp, read_bytes(row, self.off), &self.b[..]) }
     }
 }
 
@@ -1416,6 +1441,7 @@ fn value_order(a: &Value, b: &Value) -> std::cmp::Ordering {
         ColType::Bool => buf.push((row[off] != 0) as u8),
         ColType::Float => { let f = read_f64(row, off); buf.extend_from_slice(&(if f == 0.0 { 0.0f64 } else { f }).to_bits().to_le_bytes()); }
         ColType::Text(_) | ColType::Bytes(_) => buf.extend_from_slice(read_bytes(row, off)),
+        ColType::LongText | ColType::LongBytes => buf.extend_from_slice(&row[off + 4..off + 20]),   // the value's 128-bit key
         ColType::Int | ColType::Timestamp => buf.extend_from_slice(&read_i64(row, off).to_le_bytes()),
     }
 }
@@ -1435,7 +1461,7 @@ impl<'a> Sink<'a> {
         Sink { schema, proj, subs, has_agg: !aggs.is_empty(), single: vec![AggState::default(); aggs.len()], aggs, group_by, group_off: group_by.filter(|&g| matches!(schema.columns[g].ty, ColType::Int | ColType::Timestamp)).map(|g| schema.offsets[g]), order, limit: limit.unwrap_or(usize::MAX), groups: FastMap::default(), gstates: vec![], dense: vec![], dense_seen: vec![], null_group: None, topk: vec![], out: vec![],
             wide_group: group_by.is_some_and(|g| !matches!(schema.columns[g].ty, ColType::Int | ColType::Timestamp)), bgroups: HashMap::new(), bvals: vec![], kbuf: vec![],
             near: exprs.iter().map(|x| x.as_column_distance().filter(|(_, c, _)| schema.columns.get(*c).is_some_and(|c| c.vector.is_some())).map(|(f, c, q)| (f, c, q.to_vec()))).collect(),
-            sort_col, sort_off: schema.offsets.get(sort_col).copied().unwrap_or(0), sort_kind: match schema.columns.get(sort_col).map(|c| &c.ty) { Some(ColType::Float) => 1, Some(ColType::Bool) => 2, Some(ColType::Text(_) | ColType::Bytes(_) | ColType::Uuid) => 3, _ => 0 }, topk_b: vec![], exprs, filters, err: None }
+            sort_col, sort_off: schema.offsets.get(sort_col).copied().unwrap_or(0), sort_kind: match schema.columns.get(sort_col).map(|c| &c.ty) { Some(ColType::Float) => 1, Some(ColType::Bool) => 2, Some(ColType::Text(_) | ColType::Bytes(_) | ColType::LongText | ColType::LongBytes | ColType::Uuid) => 3, _ => 0 }, topk_b: vec![], exprs, filters, err: None }
     }
     /// The output values of one row.
     #[inline] fn project(&mut self, row: &[u8]) -> Vec<Value> {
@@ -1467,7 +1493,8 @@ impl<'a> Sink<'a> {
     /// ORDER BY a TEXT, BYTES or UUID column (out of line; allocates only for rows that enter the top k).
     #[inline(never)] fn push_sorted_bytes(&mut self, row: &[u8], desc: bool) {
         let (c, off) = (self.sort_col, self.sort_off);
-        let key: Option<&[u8]> = if is_null(row, c) { None } else if self.sort_kind == 3 && self.schema.columns[c].ty == ColType::Uuid { Some(&row[off..off + 16]) } else { Some(read_bytes(row, off)) };
+        let held; let key: Option<&[u8]> = if is_null(row, c) { None } else if self.sort_kind == 3 && self.schema.columns[c].ty == ColType::Uuid { Some(&row[off..off + 16]) }
+            else if self.schema.columns[c].ty.is_long() { held = crate::table::long_bytes(self.schema, row, c); held.as_deref() } else { Some(read_bytes(row, off)) };
         let ord = |a: Option<&[u8]>, b: Option<&[u8]>| { let o = a.cmp(&b); if desc { o.reverse() } else { o } };
         if self.topk_b.len() >= self.limit && ord(key, self.topk_b[self.limit - 1].0.as_deref()) != std::cmp::Ordering::Less { return; }
         let vals = self.project(row);
@@ -1644,8 +1671,8 @@ impl Feed {
     }
     fn decode_owned(&self, seq: u64, t: &Arc<Table>, op: u8, payload: &[u8], out: &mut Vec<Change>) {
         match op {
-            OP_DELETE => { let pk = t.schema.delete_pk_value(payload); let row = if payload.len() == t.schema.row_size { Some((0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect()) } else { None }; out.push(Change { seq, table: t.schema.name.clone(), op: ChangeOp::Delete, pk, row }); }
-            OP_INSERT | OP_UPDATE => { if payload.len() != t.schema.row_size { return; } let row: Vec<Value> = (0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect(); out.push(Change { seq, table: t.schema.name.clone(), op: if op == OP_INSERT { ChangeOp::Insert } else { ChangeOp::Update }, pk: t.schema.key_value(t.pk_of(payload)), row: Some(row) }); }
+            OP_DELETE => { let pk = t.schema.delete_pk_value(payload); let row = if payload.len() >= t.schema.row_size { Some((0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect()) } else { None }; out.push(Change { seq, table: t.schema.name.clone(), op: ChangeOp::Delete, pk, row }); }
+            OP_INSERT | OP_UPDATE => { if payload.len() < t.schema.row_size { return; } let row: Vec<Value> = (0..t.schema.columns.len()).map(|i| decode_col(&t.schema, payload, i)).collect(); out.push(Change { seq, table: t.schema.name.clone(), op: if op == OP_INSERT { ChangeOp::Insert } else { ChangeOp::Update }, pk: t.schema.key_value(t.pk_of(payload)), row: Some(row) }); }
             _ => {}
         }
     }
@@ -1894,6 +1921,11 @@ impl Sql {
     }
     /// Execute a catalog statement (DDL or ACL) without logging it.
     fn apply_meta(&self, text: &str) -> Result<(), String> {
+        if text == LONG_TEXT_ERA { self.db.long_era.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
+        let legacy = !self.db.long_era.load(std::sync::atomic::Ordering::Acquire);
+        LEGACY_TEXT.with(|l| l.set(legacy)); let r = self.apply_meta_in(text); LEGACY_TEXT.with(|l| l.set(false)); r
+    }
+    fn apply_meta_in(&self, text: &str) -> Result<(), String> {
         let app = Session::default();
         if is_admin_stmt(text) { return self.admin(&app, text); }
         let u = text.trim().to_uppercase();
@@ -1922,7 +1954,11 @@ impl Sql {
         let Plan::CreateTable(schema, _) = pl.plan(&stmts[0])? else { return Err("not a CREATE TABLE".into()) };
         self.db.create_table(schema)?; self.log_meta(ddl); self.cache.lock().unwrap().clear(); Ok(())
     }
-    fn log_meta(&self, text: &str) { let seq = self.db.log.append_meta(text); if self.db.durable { self.db.log.wait_durable(seq); } }
+    fn log_meta(&self, text: &str) {
+        // the first catalog statement this version logs in a database: say first that TEXT means any length from here on
+        if !self.db.long_era.swap(true, std::sync::atomic::Ordering::AcqRel) { self.db.log.append_meta(LONG_TEXT_ERA); }
+        let seq = self.db.log.append_meta(text); if self.db.durable { self.db.log.wait_durable(seq); }
+    }
     /// Bind a session to a named user (roles and attributes are copied in). A session without a user is the embedding
     /// application itself and is unrestricted.
     pub fn login(&self, sess: &mut Session, user: &str) -> Result<(), String> {
@@ -2067,7 +2103,7 @@ impl Sql {
     pub fn compile(&self, sess: &Session, schema: &Schema, p: &Pred, params: &[Value]) -> Result<CPred, String> {
         let off = schema.offsets[p.col]; let c = &schema.columns[p.col];
         let (nb, nm) = (p.col >> 3, 1u8 << (p.col & 7));
-        let base = CPred { off, kind: 0, cmp: p.cmp, i: 0, f: 0.0, b: vec![], nb, nm, set: None, pair: None, corr_map: None, ckind: 0 };
+        let base = CPred { off, kind: 0, cmp: p.cmp, i: 0, f: 0.0, b: vec![], nb, nm, set: None, pair: None, corr_map: None, ckind: 0, key: 0, store: None };
         if let Expr::Scalar(sp) = &p.rhs { if let Some((_, oc)) = sp.corr {
             if !matches!(c.ty, ColType::Int | ColType::Float | ColType::Timestamp) { return Err(format!("column {}: correlated comparison needs a numeric column", c.name)); }
             let rows = self.run_select(sess, sp, params)?;
@@ -2078,7 +2114,7 @@ impl Sql {
         } }
         if matches!(p.cmp, Cmp::IsNull | Cmp::IsNotNull) { return Ok(base); }
         if matches!(p.cmp, Cmp::In | Cmp::NotIn) {
-            if matches!(c.ty, ColType::Uuid | ColType::Text(_) | ColType::Bytes(_)) {
+            if matches!(c.ty, ColType::Uuid | ColType::Text(_) | ColType::Bytes(_) | ColType::LongText | ColType::LongBytes) {
                 let what = if c.ty == ColType::Uuid { "a UUID" } else { "a value of this type" };
                 let keys: Vec<Key> = match &p.rhs {
                     Expr::List(items) => { let mut ks = Vec::with_capacity(items.len()); for e in items { match self.resolve(sess, e, params)? { Value::Null => {}, v => ks.push(crate::table::value_key128(&c.ty, &v).ok_or_else(|| format!("column {} ({}): not {what}: {v:?}", c.name, c.ty.name()))?) } } ks }
@@ -2089,7 +2125,7 @@ impl Sql {
                     }
                     _ => return Err("IN needs a list or a subquery".into()),
                 };
-                return Ok(CPred { kind: if c.ty == ColType::Uuid { 4 } else { 6 }, set: Some(Arc::new(KeySet::build_wide(&keys))), ..base });
+                return Ok(CPred { kind: if c.ty == ColType::Uuid { 4 } else if c.ty.is_long() { 7 } else { 6 }, set: Some(Arc::new(KeySet::build_wide(&keys))), ..base });
             }
             if !matches!(c.ty, ColType::Int | ColType::Timestamp) { return Err(format!("column {}: IN is supported on INT columns (for now)", c.name)); }
             let mut pair = None;
@@ -2118,6 +2154,8 @@ impl Sql {
             ColType::Bool => CPred { kind: 2, i: match v { Value::Bool(b) => b as i64, v => return Err(format!("column {}: expected BOOL, got {v:?}", c.name)) }, ..base },
             ColType::Text(_) => CPred { kind: 3, b: match v { Value::Text(s) => s.into_bytes(), v => return Err(format!("column {}: expected TEXT, got {v:?}", c.name)) }, ..base },
             ColType::Bytes(_) => CPred { kind: 3, b: match v { Value::Bytes(b) => b, v => return Err(format!("column {}: expected BYTES, got {v:?}", c.name)) }, ..base },
+            ColType::LongText | ColType::LongBytes => { let b = match (&c.ty, v) { (ColType::LongText, Value::Text(s)) => s.into_bytes(), (ColType::LongBytes, Value::Bytes(b)) => b, (_, v) => return Err(format!("column {}: expected {}, got {v:?}", c.name, c.ty.name())) };
+                CPred { kind: 8, key: crate::table::text_key(&b), b, store: c.store.clone(), ..base } }
             ColType::Uuid => CPred { kind: 4, b: match &v { Value::Text(s) => crate::table::parse_uuid(s).ok_or_else(|| format!("column {}: not a UUID: {s:?}", c.name))?.to_vec(), Value::Bytes(b) if b.len() == 16 => b.clone(), v => return Err(format!("column {}: expected a UUID, got {v:?}", c.name)) }, ..base },
         })
     }
@@ -2128,6 +2166,7 @@ impl Sql {
     }
 
     pub fn execute_s(&self, sess: &mut Session, p: &Prepared, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
+        let _pin = crate::table::pin();   // long values the statement's rows name stay until it is done
         self.check_identity(sess)?;
         if params.len() < p.nparams { return Err(format!("statement needs {} parameters, got {}", p.nparams, params.len())); }
         if p.epoch != self.epoch.load(std::sync::atomic::Ordering::Acquire) { let p2 = self.prepare(&p.text)?; return self.execute_s(sess, &p2, params); }  // a schema change swapped the table under this plan
@@ -2351,7 +2390,7 @@ impl Sql {
         let (t, schema) = (&s.table, &s.schema);
         match &s.access {
             Access::Pk(e) => { let pk = t.schema.key_from_value(&self.resolve(sess, e, params)?)?; match txn { Some(tx) => { if let Some(row) = t.txn_get(tx, pk) { visit(&row); } } None => { t.with_pk(pk, |r| visit(r)); } } }
-            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; t.with_unique(&key, |r| visit(r)); }
+            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let key = crate::table::lookup_key(ty, &v)?; t.with_unique(&key, |r| visit(r)); }
             Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } t.range(a, b, visit); }
             Access::Index(ix, e) => { let k = index_key(&t.schema, ix.col, &self.resolve(sess, e, params)?)?; t.index_lookup(ix, k, visit); }
             Access::Scan => t.scan(visit),
@@ -2370,7 +2409,7 @@ impl Sql {
         };
         match access {
             Access::Pk(e) => { let pk = schema.key_from_value(&self.resolve(sess, e, params)?)?; match &mut sess.txn { Some(t) => { if let Some(r) = table.txn_get(t, pk) { collect(&r); } } None => { table.with_pk(pk, |r| collect(r)); } } }
-            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; table.with_unique(&key, |r| collect(r)); }
+            Access::Unique(e) => { let u = schema.unique.unwrap(); let ty = &schema.columns[u].ty; let v = self.resolve(sess, e, params)?; let key = crate::table::lookup_key(ty, &v)?; table.with_unique(&key, |r| collect(r)); }
             Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } table.range(a, b, &mut collect); }
             Access::Index(ix, e) => { let k = index_key(schema, ix.col, &self.resolve(sess, e, params)?)?; table.index_lookup(ix, k, &mut collect); }
             Access::Scan => table.scan(&mut collect),
@@ -2541,7 +2580,7 @@ impl Sql {
         };
         match &j.probe_access {
             Access::Pk(e) => { let pk = ps.key_from_value(&self.resolve(sess, e, params)?)?; j.probe.with_pk(pk, |r| per_probe(r)); }
-            Access::Unique(e) => { let u = ps.unique.unwrap(); let ty = &ps.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; j.probe.with_unique(&key, |r| per_probe(r)); }
+            Access::Unique(e) => { let u = ps.unique.unwrap(); let ty = &ps.columns[u].ty; let v = self.resolve(sess, e, params)?; let key = crate::table::lookup_key(ty, &v)?; j.probe.with_unique(&key, |r| per_probe(r)); }
             Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } j.probe.range(a, b, &mut per_probe); }
             Access::Index(ix, e) => { let k = index_key(ps, ix.col, &self.resolve(sess, e, params)?)?; j.probe.index_lookup(ix, k, &mut per_probe); }
             Access::Scan => j.probe.scan(&mut per_probe),
@@ -2632,7 +2671,7 @@ impl Sql {
         };
         match &j.probe_access {
             Access::Pk(e) => { let pk = ps.key_from_value(&self.resolve(sess, e, params)?)?; j.probe.with_pk(pk, |r| per_probe(r)); }
-            Access::Unique(e) => { let u = ps.unique.unwrap(); let ty = &ps.columns[u].ty; let v = self.resolve(sess, e, params)?; let mut key = vec![0u8; ty.width()]; encode_value(ty, &v, &mut key)?; j.probe.with_unique(&key, |r| per_probe(r)); }
+            Access::Unique(e) => { let u = ps.unique.unwrap(); let ty = &ps.columns[u].ty; let v = self.resolve(sess, e, params)?; let key = crate::table::lookup_key(ty, &v)?; j.probe.with_unique(&key, |r| per_probe(r)); }
             Access::Range { lo, lo_excl, hi, hi_excl } => { let mut a = self.resolve(sess, lo, params)?.as_i64()?; let mut b = self.resolve(sess, hi, params)?.as_i64()?; if *lo_excl { a += 1; } if *hi_excl { b -= 1; } j.probe.range(a, b, &mut per_probe); }
             Access::Index(ix, e) => { let k = index_key(ps, ix.col, &self.resolve(sess, e, params)?)?; j.probe.index_lookup(ix, k, &mut per_probe); }
             Access::Scan => j.probe.scan(&mut per_probe),
@@ -3554,5 +3593,199 @@ mod insert_tests {
         assert_eq!(rows(&s, "SELECT k FROM kv WHERE email = 'b@x'"), vec![vec![Value::Int(3)]]);
         assert!(s.exec_s(&mut Session::default(), "INSERT INTO kv (k, email) VALUES (6, 'b@x')", &[]).is_err());
         drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod long_tests {
+    //! TEXT and BYTES without a length: values of any length (up to 16 MB), wherever TEXT(n) works.
+    use super::*;
+    use crate::config::Config;
+    use crate::table::{decode_col, reclaim};
+    fn tmp(name: &str) -> std::path::PathBuf { let p = std::env::temp_dir().join(format!("sqweezdb-long-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&p); p }
+    fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
+    fn qp(s: &Sql, sql: &str, p: &[Value]) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, p).unwrap_or_else(|e| panic!("{sql}: {e}")) }
+    fn err(s: &Sql, sql: &str, p: &[Value]) -> String { s.exec_s(&mut Session::default(), sql, p).err().unwrap_or_else(|| panic!("{sql}: no error")) }
+    fn t(v: &str) -> Value { Value::Text(v.into()) }
+    fn i(n: i64) -> Value { Value::Int(n) }
+    /// n letters, different per seed
+    fn big(n: usize, seed: usize) -> String { (0..n).map(|k| (b'a' + ((k * 7 + seed * 13 + k / 26) % 26) as u8) as char).collect() }
+    fn store(s: &Sql, table: &str, col: &str) -> (usize, u64) { let tb = s.db.table(table).unwrap(); let c = tb.schema.col(col).unwrap(); let st = tb.schema.columns[c].store.clone().unwrap(); (st.len(), st.bytes()) }
+    fn settle(what: &str, f: impl Fn() -> bool) { for _ in 0..500 { reclaim(); if f() { return; } std::thread::sleep(std::time::Duration::from_millis(10)); } panic!("waited for {what}"); }
+
+    #[test] fn text_and_bytes_of_any_length() {
+        let d = tmp("any"); let s = Sql::open_with(&d, Config::default()).unwrap();
+        q(&s, "CREATE TABLE docs (id SERIAL PRIMARY KEY, title TEXT, body TEXT, data BYTES, n INT)");
+        let tb = s.db.table("docs").unwrap();
+        assert_eq!(tb.schema.columns.iter().map(|c| c.type_name()).collect::<Vec<_>>(), ["INT", "TEXT", "TEXT", "BYTES", "INT"]);
+        let sizes = [0usize, 1, 44, 45, 1000, 70_000, 300_000, 5 << 20];
+        for (k, &n) in sizes.iter().enumerate() {
+            let b = big(n, k); let bytes: Vec<u8> = b.bytes().rev().collect();
+            qp(&s, "INSERT INTO docs (title, body, data, n) VALUES (?, ?, ?, ?)", &[t(&format!("doc {k}")), t(&b), Value::Bytes(bytes.clone()), i(n as i64)]);
+            let r = qp(&s, "SELECT body, data, length(body) FROM docs WHERE n = ?", &[i(n as i64)]);
+            assert!(r[0][0] == t(&b) && r[0][1] == Value::Bytes(bytes), "{n} bytes back as they went in"); assert_eq!(r[0][2], i(n as i64));
+        }
+        // past their rows only values longer than 44 bytes, in their column's store
+        assert_eq!(store(&s, "docs", "body").0, 5); assert_eq!(store(&s, "docs", "title").0, 0);
+        let five = big(5 << 20, 7);
+        // by value: = and <> by key, IN, an order, LIKE, functions, GROUP BY, ORDER BY
+        assert_eq!(qp(&s, "SELECT n FROM docs WHERE body = ?", &[t(&big(300_000, 6))]), vec![vec![i(300_000)]]);
+        assert_eq!(qp(&s, "SELECT count(*) FROM docs WHERE body <> ?", &[t(&big(300_000, 6))]), vec![vec![i(7)]]);
+        assert_eq!(qp(&s, "SELECT n FROM docs WHERE body IN (?, ?) ORDER BY n", &[t(&big(45, 3)), t(&big(70_000, 5))]), vec![vec![i(45)], vec![i(70_000)]]);
+        let mid = big(1000, 4); let below = q(&s, "SELECT body FROM docs").iter().filter(|r| matches!(&r[0], Value::Text(x) if x.as_str() < mid.as_str())).count() as i64;
+        assert_eq!(qp(&s, "SELECT count(*) FROM docs WHERE body < ?", &[t(&mid)]), vec![vec![i(below)]], "an order, values fetched from the store");
+        let all: Vec<String> = sizes.iter().enumerate().map(|(k, &n)| big(n, k)).collect();
+        for p in [&five[..30], &big(300_000, 6)[..30], ""] { assert_eq!(qp(&s, "SELECT n FROM docs WHERE body LIKE ?", &[t(&format!("{p}%"))]).len(), all.iter().filter(|b| b.starts_with(p)).count(), "LIKE '{p}%'"); }
+        assert_eq!(qp(&s, "SELECT substr(body, 1, 5) FROM docs WHERE n = 300000", &[]), vec![vec![t(&big(300_000, 6)[..5])]]);
+        let mut want: Vec<String> = q(&s, "SELECT body FROM docs").into_iter().map(|r| match &r[0] { Value::Text(x) => x.clone(), _ => unreachable!() }).collect(); want.sort();
+        let got: Vec<String> = q(&s, "SELECT body FROM docs ORDER BY body LIMIT 3").into_iter().map(|r| match &r[0] { Value::Text(x) => x.clone(), _ => unreachable!() }).collect();
+        assert_eq!(got, want[..3], "ORDER BY a long column");
+        qp(&s, "INSERT INTO docs (title, body, n) VALUES ('again', ?, -1)", &[t(&big(70_000, 5))]);
+        assert_eq!(qp(&s, "SELECT count(*), max(n) FROM docs WHERE length(body) = 70000 GROUP BY body", &[]), vec![vec![i(2), i(70_000)]]);
+        // limits: 16 MB a value; TEXT(n) as before
+        assert!(err(&s, "INSERT INTO docs (body) VALUES (?)", &[t(&"x".repeat((16 << 20) + 1))]).contains("16 MB"));
+        q(&s, "CREATE TABLE short (id INT PRIMARY KEY, s TEXT(10))");
+        assert!(err(&s, "INSERT INTO short VALUES (1, ?)", &[t("eleven char")]).contains("exceeds TEXT(10)"));
+        drop(tb); drop(s); std::fs::remove_dir_all(&d).ok();
+    }
+    #[test] fn long_text_is_a_key_unique_indexed_and_joined() {
+        let d = tmp("keys"); let s = Sql::open_with(&d, Config::default()).unwrap();
+        q(&s, "CREATE TABLE users (email TEXT PRIMARY KEY, name TEXT UNIQUE, bio TEXT, role TEXT DEFAULT 'member')");
+        let emails: Vec<String> = [10usize, 44, 45, 200].iter().enumerate().map(|(k, &n)| format!("{}@x.test", big(n - 7, k))).collect();
+        for (k, e) in emails.iter().enumerate() { qp(&s, "INSERT INTO users (email, name, bio) VALUES (?, ?, ?)", &[t(e), t(&big(60 + k, k + 20)), t(&big(5000, k % 2))]); }
+        for e in &emails { assert_eq!(qp(&s, "SELECT email FROM users WHERE email = ?", &[t(e)]), vec![vec![t(e)]], "by its key ({} bytes)", e.len()); }
+        assert!(err(&s, "INSERT INTO users (email, name) VALUES (?, 'n')", &[t(&emails[3])]).contains("UNIQUE") || err(&s, "INSERT INTO users (email, name) VALUES (?, 'n')", &[t(&emails[3])]).contains("uplicate"));
+        assert!(!s.exec_s(&mut Session::default(), "INSERT INTO users (email, name) VALUES ('new@x', ?)", &[t(&big(61, 21))]).is_ok(), "a UNIQUE long value is taken");
+        assert_eq!(qp(&s, "SELECT email FROM users WHERE name = ?", &[t(&big(63, 23))]), vec![vec![t(&emails[3])]], "by the UNIQUE value");
+        qp(&s, "UPDATE users SET bio = ? WHERE email = ?", &[t("short now"), t(&emails[2])]);
+        assert_eq!(qp(&s, "SELECT bio FROM users WHERE email = ?", &[t(&emails[2])]), vec![vec![t("short now")]]);
+        q(&s, "CREATE INDEX users_bio ON users (bio)");
+        assert_eq!(qp(&s, "SELECT count(*) FROM users WHERE bio = ?", &[t(&big(5000, 1))]), vec![vec![i(2)]], "through the index");
+        // a foreign key and a join on long text, against TEXT and TEXT(n) alike
+        q(&s, "CREATE TABLE posts (id SERIAL PRIMARY KEY, author TEXT REFERENCES users(email), body TEXT)");
+        for e in &emails { qp(&s, "INSERT INTO posts (author, body) VALUES (?, ?)", &[t(e), t(&big(400, 9))]); }
+        assert!(err(&s, "INSERT INTO posts (author, body) VALUES (?, 'x')", &[t(&format!("{}@nobody", big(80, 1)))]).to_lowercase().contains("foreign key"));
+        assert_eq!(q(&s, "SELECT count(*) FROM posts p JOIN users u ON p.author = u.email WHERE u.role = 'member'"), vec![vec![i(4)]]);
+        q(&s, "CREATE TABLE tags (author VARCHAR(300) PRIMARY KEY, tag TEXT)");
+        for e in &emails { qp(&s, "INSERT INTO tags VALUES (?, 'x')", &[t(e)]); }
+        assert_eq!(q(&s, "SELECT count(*) FROM posts p JOIN tags g ON p.author = g.author"), vec![vec![i(4)]], "TEXT joins TEXT(n)");
+        qp(&s, "DELETE FROM posts WHERE author = ?", &[t(&emails[3])]); qp(&s, "DELETE FROM users WHERE email = ?", &[t(&emails[3])]);
+        assert_eq!(q(&s, "SELECT count(*) FROM users"), vec![vec![i(3)]]);
+        // sign-in on a long TEXT login
+        q(&s, "CREATE TABLE members (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member')"); q(&s, "CREATE ROLE member"); q(&s, "ALTER TABLE members ENABLE AUTH (ROLE FROM role)");
+        let login = format!("{}@long.example", big(70, 3));
+        s.sign_up("members", &[("email".into(), t(&login))], "the password 1").unwrap();
+        assert!(s.sign_in("members", &login, "the password 1").is_ok(), "signs in with a 85-byte login");
+        drop(s); std::fs::remove_dir_all(&d).ok();
+    }
+    #[test] fn replaced_values_are_freed_and_kept_ones_handed_on() {
+        let d = tmp("free"); let s = Sql::open_with(&d, Config::default()).unwrap();
+        q(&s, "CREATE TABLE d (id INT PRIMARY KEY, body TEXT, n INT)");
+        qp(&s, "INSERT INTO d VALUES (1, ?, 0)", &[t(&big(100_000, 1))]);
+        assert_eq!(store(&s, "d", "body"), (1, 100_000));
+        q(&s, "UPDATE d SET n = 1 WHERE id = 1");
+        settle("nothing to free", || store(&s, "d", "body") == (1, 100_000)); assert_eq!(store(&s, "d", "body"), (1, 100_000), "an update that keeps the value hands it on");
+        qp(&s, "UPDATE d SET body = ? WHERE id = 1", &[t(&big(100_000, 2))]);
+        settle("the old value freed", || store(&s, "d", "body") == (1, 100_000));
+        // a reader holding a copy of the row, pinned: the value it names stays until the pin goes
+        let tb = s.db.table("d").unwrap();
+        let pin = crate::table::pin(); let copy = tb.with_pk(1i64, |r| r.to_vec()).unwrap();
+        qp(&s, "UPDATE d SET body = ? WHERE id = 1", &[t(&big(100_000, 3))]);
+        std::thread::sleep(std::time::Duration::from_millis(100)); reclaim();
+        assert_eq!(decode_col(&tb.schema, &copy, 1), t(&big(100_000, 2)), "still there for the pinned reader");
+        drop(pin); settle("freed once the pin went", || store(&s, "d", "body") == (1, 100_000));
+        // transactions: own writes visible, a rollback leaves nothing behind, a commit replaces
+        let mut sess = Session::default();
+        s.exec_s(&mut sess, "BEGIN", &[]).unwrap(); s.exec_s(&mut sess, "UPDATE d SET body = ? WHERE id = 1", &[t(&big(200_000, 4))]).unwrap();
+        assert_eq!(s.exec_s(&mut sess, "SELECT body FROM d WHERE id = 1", &[]).unwrap(), vec![vec![t(&big(200_000, 4))]]);
+        s.exec_s(&mut sess, "ROLLBACK", &[]).unwrap();
+        settle("nothing kept by a rollback", || store(&s, "d", "body") == (1, 100_000)); assert_eq!(q(&s, "SELECT body FROM d"), vec![vec![t(&big(100_000, 3))]]);
+        s.exec_s(&mut sess, "BEGIN", &[]).unwrap(); s.exec_s(&mut sess, "UPDATE d SET n = 5 WHERE id = 1", &[]).unwrap();
+        qp(&s, "UPDATE d SET body = ? WHERE id = 1", &[t(&big(100_000, 5))]);   // another session wins the row
+        std::thread::sleep(std::time::Duration::from_millis(100)); reclaim();
+        assert_eq!(s.exec_s(&mut sess, "SELECT body FROM d WHERE id = 1", &[]).unwrap(), vec![vec![t(&big(100_000, 3))]], "the transaction keeps the value its write was made from");
+        assert!(s.exec_s(&mut sess, "COMMIT", &[]).is_err(), "and conflicts at commit");
+        s.exec_s(&mut sess, "BEGIN", &[]).unwrap(); s.exec_s(&mut sess, "UPDATE d SET body = ? WHERE id = 1", &[t(&big(150_000, 6))]).unwrap(); s.exec_s(&mut sess, "COMMIT", &[]).unwrap();
+        settle("a commit replaces", || store(&s, "d", "body") == (1, 150_000));
+        q(&s, "DELETE FROM d WHERE id = 1");
+        settle("a delete frees", || store(&s, "d", "body") == (0, 0));
+        drop(tb); drop(s); std::fs::remove_dir_all(&d).ok();
+    }
+    #[test] fn long_values_survive_restarts() {
+        let d = tmp("restart");
+        let row = |k: usize| (i(k as i64), t(&big(1000 * (k + 1), k)), Value::Bytes(big(300 * k, k + 1).into_bytes()));
+        let check = |s: &Sql, ks: &[usize], what: &str| { for &k in ks { let (id, b, x) = row(k); assert_eq!(qp(s, "SELECT body, data FROM d WHERE id = ?", &[id]), vec![vec![b, x]], "{what}: row {k}"); } };
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); q(&s, "CREATE TABLE d (id INT PRIMARY KEY, body TEXT, data BYTES)");
+          for k in 0..50 { let (id, b, x) = row(k); qp(&s, "INSERT INTO d VALUES (?, ?, ?)", &[id, b, x]); } }
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); check(&s, &(0..50).collect::<Vec<_>>(), "from the log"); s.snapshot(); }
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); check(&s, &(0..50).collect::<Vec<_>>(), "from the snapshot");
+          assert_eq!(store(&s, "d", "body").0, 50, "values loaded from the snapshot");
+          for k in 0..25 { qp(&s, "DELETE FROM d WHERE id = ?", &[i(k as i64)]); }
+          qp(&s, "UPDATE d SET body = ? WHERE id = 30", &[t("short")]); }
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); assert_eq!(qp(&s, "SELECT body FROM d WHERE id = 30", &[]), vec![vec![t("short")]]); check(&s, &(31..50).collect::<Vec<_>>(), "snapshot then log");
+          s.snapshot(); }
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); check(&s, &(25..30).chain(31..50).collect::<Vec<_>>(), "the second snapshot");
+          assert_eq!(store(&s, "d", "body").0, 24, "a snapshot holds only the values its rows name");
+          assert_eq!(q(&s, "SELECT count(*) FROM d"), vec![vec![i(25)]]);
+          qp(&s, "INSERT INTO d VALUES (100, ?, NULL)", &[t(&big(80_000, 3))]); assert_eq!(qp(&s, "SELECT length(body) FROM d WHERE id = 100", &[]), vec![vec![i(80_000)]], "ids continue past the loaded ones"); }
+        std::fs::remove_dir_all(&d).ok();
+    }
+    #[test] fn a_database_from_before_keeps_its_text_columns() {
+        let d = tmp("legacy");
+        // as 0.8 wrote it: its catalog says TEXT, which meant TEXT(255), and there is no marker
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); let ddl = "CREATE TABLE old (id INT PRIMARY KEY, s TEXT, b BLOB)";
+          LEGACY_TEXT.with(|l| l.set(true)); s.apply_meta_in(ddl).unwrap(); LEGACY_TEXT.with(|l| l.set(false)); s.db.log.append_meta(ddl);
+          qp(&s, "INSERT INTO old VALUES (1, ?, ?)", &[t(&"o".repeat(255)), Value::Bytes(vec![1; 255])]); }
+        let types = |s: &Sql, n: &str| s.db.table(n).unwrap().schema.columns.iter().map(|c| c.type_name()).collect::<Vec<_>>();
+        { let s = Sql::open_with(&d, Config::default()).unwrap();
+          assert_eq!(types(&s, "old"), ["INT", "TEXT(255)", "BYTES(255)"], "replayed as it was written");
+          assert_eq!(q(&s, "SELECT s FROM old"), vec![vec![t(&"o".repeat(255))]]);
+          assert!(err(&s, "INSERT INTO old VALUES (2, ?, NULL)", &[t(&"x".repeat(256))]).contains("TEXT(255)"));
+          q(&s, "CREATE TABLE new (id INT PRIMARY KEY, s TEXT)");   // logs the marker first
+          q(&s, "ALTER TABLE old ADD COLUMN notes TEXT"); s.snapshot(); }
+        { let s = Sql::open_with(&d, Config::default()).unwrap();
+          assert_eq!(types(&s, "old"), ["INT", "TEXT(255)", "BYTES(255)", "TEXT"]); assert_eq!(types(&s, "new"), ["INT", "TEXT"]);
+          qp(&s, "UPDATE old SET notes = ? WHERE id = 1", &[t(&big(10_000, 1))]); }
+        { let s = Sql::open_with(&d, Config::default()).unwrap(); assert_eq!(qp(&s, "SELECT length(notes), s FROM old", &[]), vec![vec![i(10_000), t(&"o".repeat(255))]]); }
+        std::fs::remove_dir_all(&d).ok();
+    }
+    #[test] fn changes_and_alter_carry_long_values() {
+        let d = tmp("feed"); let s = Sql::open_with(&d, Config::default()).unwrap();
+        q(&s, "CREATE TABLE d (id INT PRIMARY KEY, title TEXT(40), body TEXT)");
+        let _keep = s.subscribe(0); let from = s.current_seq();
+        qp(&s, "INSERT INTO d VALUES (1, 'a', ?)", &[t(&big(50_000, 1))]);
+        qp(&s, "UPDATE d SET title = 'b' WHERE id = 1", &[]);
+        qp(&s, "UPDATE d SET body = ? WHERE id = 1", &[t(&big(60_000, 2))]);
+        q(&s, "DELETE FROM d WHERE id = 1");
+        std::thread::sleep(std::time::Duration::from_millis(100)); reclaim();   // the values are freed: a change carries its own
+        let mut f = s.subscribe(from); let mut got = vec![]; loop { let ch = f.poll(); if ch.is_empty() { break; } got.extend(ch); }
+        let bodies: Vec<Value> = got.iter().map(|c| c.row.as_ref().map(|r| r[2].clone()).unwrap_or(Value::Null)).collect();
+        assert_eq!(bodies, vec![t(&big(50_000, 1)), t(&big(50_000, 1)), t(&big(60_000, 2)), t(&big(60_000, 2))], "each change with its whole row");
+        // ALTER: to and from long text, values converted
+        for k in 0..20 { qp(&s, "INSERT INTO d VALUES (?, ?, ?)", &[i(k), t(&format!("title {k}")), t(&big(3000 + k as usize, k as usize))]); }
+        q(&s, "ALTER TABLE d ALTER COLUMN title TYPE TEXT");
+        q(&s, "ALTER TABLE d ADD COLUMN extra TEXT DEFAULT 'none'");
+        assert_eq!(qp(&s, "SELECT title, length(body), extra FROM d WHERE id = 7", &[]), vec![vec![t("title 7"), i(3007), t("none")]]);
+        assert!(err(&s, "ALTER TABLE d ALTER COLUMN body TYPE TEXT(100)", &[]).contains("TEXT(100)"), "a long value that doesn't fit stops the change");
+        assert_eq!(qp(&s, "SELECT length(body) FROM d WHERE id = 19", &[]), vec![vec![i(3019)]], "and leaves the table as it was");
+        drop(s); std::fs::remove_dir_all(&d).ok();
+    }
+}
+#[cfg(test)]
+mod long_timing {
+    use super::*;
+    #[test] #[ignore] fn where_a_long_read_goes() {
+        let b: std::sync::Arc<[u8]> = std::sync::Arc::from((0..4 << 20).map(|k| b'a' + (k % 26) as u8).collect::<Vec<u8>>());
+        let n = 100; let t = std::time::Instant::now(); for _ in 0..n { let s = String::from_utf8_lossy(&b).into_owned(); std::hint::black_box(s); } println!("lossy+owned   {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        let t = std::time::Instant::now(); for _ in 0..n { let s = std::str::from_utf8(&b).unwrap().to_owned(); std::hint::black_box(s); } println!("from_utf8+own {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        let t = std::time::Instant::now(); for _ in 0..n { let s = b.to_vec(); std::hint::black_box(s); } println!("to_vec        {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        let d = std::env::temp_dir().join(format!("sqweezdb-lt-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Sql::open_with(&d, crate::config::Config::default()).unwrap(); s.exec_s(&mut Session::default(), "CREATE TABLE t (id INT PRIMARY KEY, body TEXT)", &[]).unwrap();
+        s.exec_s(&mut Session::default(), "INSERT INTO t VALUES (1, ?)", &[Value::Text(String::from_utf8(b.to_vec()).unwrap())]).unwrap();
+        let p = s.prepare("SELECT body FROM t WHERE id = 1").unwrap(); let mut sess = Session::default();
+        let t = std::time::Instant::now(); for _ in 0..n { let r = s.execute_s(&mut sess, &p, &[]).unwrap(); std::hint::black_box(r); } println!("execute_s     {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        let tb = s.db.table("t").unwrap();
+        let t = std::time::Instant::now(); for _ in 0..n { let v = tb.with_pk(1i64, |r| crate::table::decode_col(&tb.schema, r, 1)); std::hint::black_box(v); } println!("decode_col    {:.0} µs", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        drop(tb); drop(s); std::fs::remove_dir_all(&d).ok();
     }
 }

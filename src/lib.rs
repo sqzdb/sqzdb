@@ -7,6 +7,7 @@ pub mod engine;
 pub mod expr;
 pub mod files;
 pub mod live;
+pub mod mcp;
 pub mod net;
 pub mod oauth;
 pub mod sql;

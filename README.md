@@ -39,11 +39,12 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 |---|---|
 | **Concurrent writers** | Commits share one append-only log with group commit, so concurrent writers share each fsync: 256 writers make 130,000 to 165,000 durable commits per second, where SQLite stays near 2,300. Transactions conflict per row, not per database. |
 | **Lock-free reads** | Readers never take a lock. A point read costs about 0.4 µs in-process, and 8 threads make 17.5 million point reads per second. |
-| **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT(n)`, `BYTES(n)`, `TIMESTAMP`, `UUID`, `FILE`, `VECTOR(n)`. A value of the wrong type is rejected, never stored. |
+| **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT` and `BYTES` of any length (up to 16 MB) or `TEXT(n)`, `TIMESTAMP`, `UUID`, `FILE`, `VECTOR(n)`. A value of the wrong type is rejected, never stored. |
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
 | **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
 | **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 20 KB. |
+| **Agents over MCP** | Claude, ChatGPT, Claude Code and other MCP clients connect to `/mcp`, sign their user in on the database's own OAuth page, and query and change data as that user, under the same grants and row policies. |
 | **Files as a column** | A `FILE` column holds an uploaded file. A browser uploads it with the row, and whoever may read the row gets a signed link that an `<img>` can load, with caching and byte ranges. Files no row refers to are cleaned up. |
 | **Vectors and search by meaning** | A `VECTOR(n)` column, searched with `cosine_distance` under the same policies as everything else. A column can be the embedding of other columns, filled in the background by OpenAI, Ollama or any OpenAI-compatible model, and `embed(?)` embeds the search text. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
@@ -130,7 +131,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.8.1` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.9.0` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -604,9 +605,9 @@ The client (`clients/js`) runs in browsers, React Native and Node 22+. It keeps 
 which providers are configured), then `sql(text, params)`, `batch([[text, params], …])` for one
 transaction, `live(text, params, fn)` and `close()`. [`demos/notes`](demos/notes) is a whole app built this way.
 
-- **Statements:** `SELECT`, `INSERT`, `UPDATE` and `DELETE`, up to 64 KB and 1,000 parameters each. No
-  DDL, no grants, no `BEGIN`: a transaction is a `batch` of up to 100 statements, all or none. A result
-  has at most `app.maxRows` rows.
+- **Statements:** `SELECT`, `INSERT`, `UPDATE` and `DELETE`, up to 64 KB of SQL and 1,000 parameters
+  each, in a request of at most `app.maxRequest` (8 MB). No DDL, no grants, no `BEGIN`: a transaction is a
+  `batch` of up to 100 statements, all or none. A result has at most `app.maxRows` rows.
 - **Who is asking:** a request acts as the user its session token belongs to. Without a token it acts as
   `app.anonymousRole`, or is refused with `AUTH`.
 - **Sign-up** works only in the tables `app.signUp` lists, and sets only the login column and the columns
@@ -722,6 +723,52 @@ redirect = "0.0.0.0:80"             # optional: send http:// visitors to https:/
 **Not built yet:** a trusted-proxy setting (behind a proxy, the sign-in rate limit sees every user as the
 proxy's address), HTTP/2, email verification and password reset.
 
+#### Agents over MCP: Claude, ChatGPT, Claude Code
+
+With `[app.mcp]` set, the app API also serves the [Model Context Protocol](https://modelcontextprotocol.io)
+at `/mcp`. An agent connects with that URL alone. It finds the database's sign-in through the protocol's
+discovery, registers itself, and sends its user to a sign-in page that the database serves. The user signs
+in with a password or a provider (`auth.oauth`) and allows the agent. From then on the agent acts as that
+user, with that user's grants and row policies, as a browser does.
+
+```toml
+[app]
+publicUrl = "https://api.example.com"   # or --domain api.example.com
+
+[app.mcp]
+users = "users"                          # the ENABLE AUTH table people sign in to (optional when there is one)
+```
+
+```sh
+claude mcp add --transport http myapp https://api.example.com/mcp   # Claude Code
+```
+
+In Claude and ChatGPT, add a custom connector with the same URL.
+
+- **What an agent can do:** three tools. `describe` lists the tables it may use (columns, types, keys, what
+  it may do with each, the policies that apply) and who it is. `query` runs one `SELECT`. `execute` runs
+  `INSERT`, `UPDATE` and `DELETE`, one statement or several in a transaction. The statement rules are
+  those of `/api/sql`: no DDL and no grants. Rows come back as objects, at most `app.mcp.maxRows` (500) a
+  result.
+- **Sign-in** follows the MCP authorization spec: protected-resource and authorization-server metadata,
+  dynamic client registration (public clients, or ones with a secret), PKCE with S256 only, tokens bound
+  to this server's `/mcp`. The page shows which app is asking and where it will send the user back. It
+  can't be framed. An address the app didn't register is never redirected to.
+- **Tokens:** an access token lasts `app.mcp.tokenTtl` (an hour) and works only at `/mcp`. An app
+  session works only at the app API. A refresh token is good once: it's replaced, and the access token
+  it came with ends. A refresh token used twice ends the whole sign-in, since someone has a copy. A
+  sign-in lapses after `app.mcp.grantTtl` (30 days) unused and after 90 days in any case. A password
+  change or a sign-out everywhere ends it. Revocation is at `/oauth/revoke`.
+- **Abuse:** a sign-in in progress is bound to the browser that started it, so its link alone is
+  useless to anyone else. Sign-ins and registrations are rate-limited per address (an IPv6 /64), with
+  at most 20 sign-ins in progress per address. Registrations that never got a token make room after a
+  day. A page may call `/mcp` only from the app's own origin or `app.origins`.
+- The official TypeScript SDK's client (1.30) connects, signs in, lists the tools and calls them; a tool
+  call takes about 0.3 ms over HTTP (E65). Claude, ChatGPT and Claude Code use the same flow but weren't
+  tested here: they need the server on a public https address.
+- **Not built yet:** tools of an app's own (named operations with their own checks), Client ID Metadata
+  Documents (clients register dynamically instead), server-to-agent notifications, resources and prompts.
+
 ### Backup, restore and replication
 
 Everything is built on the change log, so backups never pause the database.
@@ -829,6 +876,11 @@ Python takes the same keys as keyword arguments, `sqweezdb.Database(path, backup
 | `app.staticDir` | none | Files to serve beside the API (the app itself), with `index.html` for paths without a file. |
 | `app.files.maxSize` | `25MB` | The largest file a client may upload. |
 | `app.files.linkTtl` | `1h` | How long a link to a file in a query's result works (at least `1m`, at most `7d`). |
+| `app.mcp` | off | Serve MCP at `/mcp`, with sign-in through the API's own OAuth server (needs an https `app.publicUrl` or `app.tls.domains`). See [agents over MCP](#agents-over-mcp-claude-chatgpt-claude-code). |
+| `app.mcp.users` | the only `ENABLE AUTH` table | The table people sign in to when they connect an agent. |
+| `app.mcp.tokenTtl` / `grantTtl` | `1h` / `30d` | How long an agent's access token lasts, and how long its sign-in lasts unused (the agent refreshes on its own). |
+| `app.mcp.maxRows` | `500` | The most rows one result for an agent may have. |
+| `app.maxRequest` | `8MB` | The largest request body or WebSocket message a client may send, between `64KB` and `256MB`. A file upload streams instead (`app.files.maxSize`). |
 | `app.tls.domains` | none | Serve https with a certificate for these names from the CA (`--domain`), renewed automatically. See [HTTPS](#https-with-certificates-from-lets-encrypt). |
 | `app.tls.email` | none | The contact on the CA account, for its notices (`--email`). |
 | `app.tls.cert` / `key` | none | Your own certificate chain and key (PEM files), instead of `domains`. |
@@ -881,6 +933,12 @@ token = "${DB_TOKEN}"
   `FOREIGN KEY … REFERENCES … ON DELETE RESTRICT | CASCADE | SET NULL`. The key and the `UNIQUE`
   column can also be declared at the end: `PRIMARY KEY (id)`, `UNIQUE (email)`.
 - `CREATE INDEX` on one column of type `INT`, `TIMESTAMP`, `UUID`, `TEXT` or `BYTES`.
+- `TEXT` and `BYTES` (also `VARCHAR`, `CLOB`, `BLOB`, `BYTEA`) hold values of any length, up to 16 MB.
+  A value of up to 44 bytes is kept in its row and a longer one beside it, so short text costs 64 bytes
+  of row and a document costs about its length. `TEXT(n)` and `BYTES(n)` keep up to n bytes (at most
+  65,535) in the row itself. Either kind can be a key, `UNIQUE`, indexed, joined on and referenced.
+  An update logs the whole row, long values included: changing a status on a row with a 256 KB text
+  writes 256 KB of log (E64). In a database made before 0.9, a `TEXT` column made then stays `TEXT(255)`.
 - `FILE` columns hold uploaded files (see [files](#files)). A `FILE` column can't be a key, `UNIQUE` or have
   a `DEFAULT`, and its type doesn't change.
 - `VECTOR(n)` columns hold n numbers, and `VECTOR(n) GENERATED ALWAYS AS (embed(<expression>)) STORED` the
@@ -935,8 +993,7 @@ token = "${DB_TOKEN}"
 - `UUID` literals as text, with or without hyphens.
 
 **Not supported yet:** `UPDATE … FROM`, `DELETE … RETURNING`, `RIGHT` and `FULL` joins, `WITH`, `UNION`, window functions, subqueries in `FROM`, correlated subqueries on text
-columns, `DISTINCT ON`, `NULLS FIRST` and `NULLS LAST`, variable-length text (every text column has a
-maximum, at most 65,535 bytes), `CHECK` constraints, generated columns other than embeddings, a second `UNIQUE` column,
+columns, `DISTINCT ON`, `NULLS FIRST` and `NULLS LAST`, `CHECK` constraints, generated columns other than embeddings, a second `UNIQUE` column,
 composite primary keys, multi-column indexes, `DELETE … LIMIT`, savepoints, `DROP TABLE`, views and
 triggers. A value an expression builds is at most 1 MB (`group_concat`: 16 MB). A correlated `IN (subquery)` can't be keyed on a UUID column; use `EXISTS` or a join. A table
 holds at most 16.7 million rows.
@@ -1041,7 +1098,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.8.1`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.9.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

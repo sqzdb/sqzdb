@@ -15,6 +15,9 @@ const SHM_DIR: &str = "/dev/shm/"; const SHM_PREFIX: &str = "sqweezdb-ring-";
 pub fn same_secret(a: &[u8], b: &[u8]) -> bool { let mut d = (a.len() != b.len()) as u8; for i in 0..a.len().min(b.len()) { d |= a[i] ^ b[i]; } d == 0 }
 // shared-memory ring: one outstanding request per connection, both sides spin briefly then back off
 const SHM_SIZE: usize = 2 << 20; const REQ_OFF: usize = 64; const REQ_CAP: usize = 1 << 20; const RESP_OFF: usize = REQ_OFF + REQ_CAP; const RESP_CAP: usize = SHM_SIZE - RESP_OFF;
+/// A message longer than its area goes in pieces: a piece's length with MORE set says another follows. The server acks
+/// a request piece with an empty response; the client asks for the next response piece with a request of length NEXT.
+const MORE: u32 = 1 << 31; const NEXT: u32 = u32::MAX;
 use std::sync::atomic::{AtomicU32, Ordering};
 struct Ring { map: memmap2::MmapMut }
 unsafe impl Send for Ring {}
@@ -208,15 +211,21 @@ impl Server {
     }
     fn serve_ring(weak: std::sync::Weak<Sql>, mut ring: Ring, closer: Arc<std::sync::atomic::AtomicBool>) {
         let mut sess = Session::default(); let mut out = Vec::with_capacity(1 << 16); let mut seq = 0u32;
+        let (mut req, mut sent) = (Vec::new(), 0usize);   // a request arriving in pieces; how much of `out` has gone
         loop {
             if closer.load(Ordering::Relaxed) { ring.closed().store(1, Ordering::Relaxed); return; }
             if !ring.wait_for(ring.req_seq(), seq + 1) { return; }
             seq += 1;
-            let n = ring.req_len().load(Ordering::Acquire) as usize;
-            let req = ring.read_at(REQ_OFF, n).to_vec();
-            let Some(sql) = weak.upgrade() else { ring.closed().store(1, Ordering::Relaxed); return };
-            out.clear(); dispatch(&sql, &mut sess, &req, &mut out); drop(sql);
-            let n = out.len().min(RESP_CAP); ring.write_at(RESP_OFF, &out[..n]); ring.resp_len().store(n as u32, Ordering::Release);
+            let n = ring.req_len().load(Ordering::Acquire);
+            if n != NEXT {
+                req.extend_from_slice(ring.read_at(REQ_OFF, ((n & !MORE) as usize).min(REQ_CAP)));
+                if req.len() > MAX_FRAME { ring.closed().store(1, Ordering::Relaxed); return; }
+                if n & MORE != 0 { ring.resp_len().store(0, Ordering::Release); ring.resp_seq().store(seq, Ordering::Release); continue; }
+                let Some(sql) = weak.upgrade() else { ring.closed().store(1, Ordering::Relaxed); return };
+                out.clear(); dispatch(&sql, &mut sess, &req, &mut out); drop(sql); req.clear(); sent = 0;
+            }
+            let piece = (out.len() - sent).min(RESP_CAP); ring.write_at(RESP_OFF, &out[sent..sent + piece]); sent += piece;
+            ring.resp_len().store(piece as u32 | if sent < out.len() { MORE } else { 0 }, Ordering::Release);
             ring.resp_seq().store(seq, Ordering::Release);
         }
     }
@@ -258,12 +267,22 @@ impl Client {
     pub fn next_event(&mut self) -> Result<Vec<Value>, String> { let resp = read_frame(&mut self.r).map_err(|e| e.to_string())?; decode_result(&resp, &mut 0).map(|mut r| r.pop().unwrap_or_default()) }
     fn round_trip(&mut self) -> Result<Vec<u8>, String> {
         if let Some((ring, seq, _)) = &mut self.ring {
-            if self.buf.len() > REQ_CAP { return Err("request too large for the ring".into()); }
-            ring.write_at(REQ_OFF, &self.buf); ring.req_len().store(self.buf.len() as u32, Ordering::Release);
-            *seq += 1; ring.req_seq().store(*seq, Ordering::Release);
-            if !ring.wait_for(ring.resp_seq(), *seq) { return Err("connection closed".into()); }
-            let n = ring.resp_len().load(Ordering::Acquire) as usize;
-            return Ok(ring.read_at(RESP_OFF, n).to_vec());
+            if self.buf.len() > MAX_FRAME { return Err("request too large".into()); }
+            let mut at = 0;
+            loop {
+                let piece = (self.buf.len() - at).min(REQ_CAP); let more = at + piece < self.buf.len();
+                ring.write_at(REQ_OFF, &self.buf[at..at + piece]); ring.req_len().store(piece as u32 | if more { MORE } else { 0 }, Ordering::Release);
+                *seq += 1; ring.req_seq().store(*seq, Ordering::Release);
+                if !ring.wait_for(ring.resp_seq(), *seq) { return Err("connection closed".into()); }
+                at += piece; if !more { break; }
+            }
+            let mut resp = Vec::new();
+            loop {
+                let n = ring.resp_len().load(Ordering::Acquire); resp.extend_from_slice(ring.read_at(RESP_OFF, ((n & !MORE) as usize).min(RESP_CAP)));
+                if n & MORE == 0 { return Ok(resp); }
+                ring.req_len().store(NEXT, Ordering::Release); *seq += 1; ring.req_seq().store(*seq, Ordering::Release);
+                if !ring.wait_for(ring.resp_seq(), *seq) { return Err("connection closed".into()); }
+            }
         }
         write_frame(&mut self.w, &self.buf).map_err(|e| e.to_string())?; read_frame(&mut self.r).map_err(|e| e.to_string())
     }
@@ -286,5 +305,22 @@ mod tests {
         assert!(Ring::open(&small, false).is_err(), "a file of another size is refused");
         assert!(Ring::open(&dir, false).is_err(), "a directory is refused");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// Requests and results larger than the ring's areas (1 MB) go through it in pieces, in the same session.
+    #[test]
+    fn large_values_go_through_the_ring_in_pieces() {
+        let dir = std::env::temp_dir().join(format!("sqweezdb-ring-big-{}", std::process::id())); let _ = std::fs::remove_dir_all(&dir);
+        let sql = Sql::open_with(&dir.join("db"), crate::config::Config::default()).unwrap();
+        let sock = dir.join("db.sock"); let l = Server::start(sql.clone(), &sock).unwrap();
+        let mut c = Client::connect_shm(&sock, std::path::Path::new("/dev/shm")).unwrap();
+        c.exec("CREATE TABLE d (id INT PRIMARY KEY, body TEXT)", &[]).unwrap();
+        let big: String = (0..5_000_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        c.exec("BEGIN", &[]).unwrap();
+        c.exec("INSERT INTO d VALUES (1, ?)", &[Value::Text(big.clone())]).unwrap();
+        assert_eq!(c.exec("SELECT body FROM d WHERE id = 1", &[]).unwrap(), vec![vec![Value::Text(big.clone())]], "a 5 MB result, inside the transaction");
+        c.exec("COMMIT", &[]).unwrap();
+        assert_eq!(c.exec("SELECT length(body) FROM d", &[]).unwrap(), vec![vec![Value::Int(5_000_000)]]);
+        assert_eq!(c.exec("SELECT 1 + 1", &[]).unwrap(), vec![vec![Value::Int(2)]], "small round trips as before");
+        drop(c); drop(l); drop(sql); std::fs::remove_dir_all(&dir).ok();   // the listener before its socket file (its shutdown connects to it)
     }
 }

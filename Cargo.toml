@@ -1,6 +1,6 @@
 [package]
 name = "sqweezdb"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"
 
@@ -234,6 +234,11 @@ required-features = ["lab"]
 [[bin]]
 name = "e55_sql_diff"
 path = "src/bin/e55_sql_diff.rs"
+required-features = ["lab"]
+
+[[bin]]
+name = "e64_long_text"
+path = "src/bin/e64_long_text.rs"
 required-features = ["lab"]
 
 [profile.release]

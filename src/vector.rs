@@ -29,7 +29,8 @@ const SKIP_FOR: Duration = Duration::from_secs(600);
 #[derive(Default)] pub struct VectorState { started: AtomicBool, cache: Mutex<(HashMap<[u8; 32], Vec<u8>>, VecDeque<[u8; 32]>)>, refused: Mutex<HashMap<(u16, Key), Instant>> }
 
 fn clip(mut s: String) -> String { if s.len() > MAX_TEXT { let mut n = MAX_TEXT; while !s.is_char_boundary(n) { n -= 1; } s.truncate(n); } s }
-fn raw<'r>(schema: &Schema, row: &'r [u8], k: usize) -> (bool, &'r [u8]) { (is_null(row, k), &row[schema.offsets[k]..schema.offsets[k] + schema.columns[k].ty.width()]) }
+/// A column as compared for a change: its field, or for a long column its length and key (not where the value is).
+fn raw<'r>(schema: &Schema, row: &'r [u8], k: usize) -> (bool, &'r [u8]) { let w = if schema.columns[k].ty.is_long() { 20 } else { schema.columns[k].ty.width() }; (is_null(row, k), &row[schema.offsets[k]..schema.offsets[k] + w]) }
 fn generated(c: &crate::table::Column) -> String { format!("permission denied: column {} is generated from embed({}); the database writes it", c.name, c.embed.as_ref().map(|e| e.expr.as_str()).unwrap_or("")) }
 
 /// A new row of a table with generated VECTOR columns: they must be NULL (the embedder fills them).
@@ -38,7 +39,7 @@ pub(crate) fn embed_insert_ok(schema: &Schema, row: &[u8]) -> Result<(), String>
     Ok(())
 }
 /// An updated row: a generated VECTOR column may only be set to NULL, and becomes NULL when the text it embeds changes.
-pub(crate) fn embed_on_update(schema: &Schema, old: &[u8], new: &mut [u8]) -> Result<(), String> {
+pub(crate) fn embed_on_update(schema: &Schema, old: &[u8], new: &mut Vec<u8>) -> Result<(), String> {
     for (c, col) in schema.columns.iter().enumerate() {
         let Some(spec) = &col.embed else { continue };
         if raw(schema, old, c) != raw(schema, new, c) && !is_null(new, c) { return Err(generated(col)); }

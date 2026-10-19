@@ -1,0 +1,13 @@
+=== E64: TEXT of any length ===
+(c) a row of (id INT, name ...): 282 bytes with name TEXT(255), as TEXT meant before; 89 bytes with TEXT (values up to 44 bytes in the row)
+    100,000 values of 1 KB (98 MB of text), first thing in this process: it grew 117 MB, 200 bytes per value beyond its 1,024 (the row, its key, the store's entry)
+(a) one at a time, in this process: write a row, then read its value back by key
+    value      rows    sqweezdb write / read      SQLite write / read
+    2 KB      20000         5.3 /      0.3 µs        26.4 /      1.1 µs
+    256 KB     2000       587.5 /      8.1 µs       787.2 /     23.6 µs
+    4 MB        100      9410.1 /    147.1 µs     12262.5 /    361.0 µs
+(b) UPDATE t SET n = n + 1 on rows holding a 256 KB value: 408.4 µs each; the log grows 256 KB per update (the row is logged whole); values in memory stay 100 (26.2 MB)
+    SQLite, the same: 106.7 µs each; its WAL grows 2.1 KB per update (the pages that changed)
+(d) 2,000 values of 256 KB (524 MB): snapshot 0.41 s (525 MB). Reopen 0.002 s: memory +0 MB, file pages mapped +375 MB (the values stay in the snapshot's mapping)
+    reading every value (0.03 s): memory +0 MB, file pages +126 MB, which the kernel can drop and read again; [Int(2000), Int(524288000)]
+(e) each value replaced (543 µs per UPDATE): values held 524 MB -> 1049 MB at most -> 524 MB 2.0 s later (freed once no reader can hold them)
