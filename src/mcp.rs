@@ -272,7 +272,7 @@ fn token(sql: &Sql, st: &McpState, mcp: &crate::config::McpPolicy, req: &Req) ->
     }
 }
 
-// ---- the pages (sign in, allow): no frames, no referrer, scripts only with this page's nonce
+// ---- the pages (sign in, allow): no frames, a referrer only to this origin (so its forms post with their Origin), scripts only with this page's nonce
 
 pub(crate) fn page(status: u16, title: &str, body: &str, script: Option<&str>) -> Vec<u8> {
     let nonce = random_hex(16);
@@ -288,7 +288,7 @@ button.alt {{ background:transparent; color:var(--fg); border-color:var(--line);
 .err {{ color:var(--bad); font-size:14px }} .small {{ font-size:12px; margin-top:16px }} form {{ margin:0 }}
 </style></head><body><main>{body}</main>{s}</body></html>"#, t = esc(title), s = script.map(|js| format!("<script nonce=\"{nonce}\">{js}</script>")).unwrap_or_default());
     let csp = format!("default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'");
-    respond(status, "text/html; charset=utf-8", html.as_bytes(), &[("Content-Security-Policy".into(), csp), ("X-Frame-Options".into(), "DENY".into()), ("Cache-Control".into(), "no-store".into()), ("Referrer-Policy".into(), "no-referrer".into())])
+    respond(status, "text/html; charset=utf-8", html.as_bytes(), &[("Content-Security-Policy".into(), csp), ("X-Frame-Options".into(), "DENY".into()), ("Cache-Control".into(), "no-store".into()), ("Referrer-Policy".into(), "same-origin".into())])
 }
 fn error_page(msg: &str) -> Vec<u8> { page(400, "Can't connect", &format!("<h1>Can't connect</h1><p>{}</p>", esc(msg)), None) }
 fn sign_in_page(sql: &Sql, id: &str, p: &Pending, err: Option<&str>) -> Vec<u8> {

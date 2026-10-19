@@ -31,7 +31,7 @@ pub struct JoinStep { pub build: Arc<Table>, pub build_key: usize, pub key_vidx:
 pub struct JoinPlan { pub probe: Arc<Table>, pub probe_access: Access, pub probe_preds: Vec<Pred>, pub steps: Vec<JoinStep>, pub index_first: Option<Arc<SecIndex>>,
     /// any outer or one-to-many step: run by `run_joins_general`
     pub general: bool }
-pub struct SelectPlan { pub table: Arc<Table>, pub schema: Schema, pub access: Access, pub preds: Vec<Pred>, pub proj: Vec<Proj>, pub names: Vec<String>, pub group_by: Option<usize>, pub order: Option<(usize, bool)>, pub limit: Option<usize>, pub join: Option<JoinPlan>, pub corr: Option<(usize, usize)>, pub subs: Vec<(Arc<SelectPlan>, Option<usize>)>,
+pub struct SelectPlan { pub table: Arc<Table>, pub schema: Schema, pub access: Access, pub preds: Vec<Pred>, pub proj: Vec<Proj>, pub names: Vec<String>, pub group_by: Option<usize>, pub order: Option<(usize, bool)>, pub limit: Option<Count>, pub join: Option<JoinPlan>, pub corr: Option<(usize, usize)>, pub subs: Vec<(Arc<SelectPlan>, Option<usize>)>,
     /// What runs after the scan's own aggregation and top k; None keeps the single-pass path
     pub post: Option<Arc<Post>>,
     /// Row expressions for `Proj::Expr`, and WHERE conditions the compiled predicates cannot express (E55)
@@ -40,7 +40,7 @@ pub struct SelectPlan { pub table: Arc<Table>, pub schema: Schema, pub access: A
 /// for them, applied to the rows the scan produced. With `grouping`, the grouping itself also happens here (several GROUP
 /// BY columns, aggregates over DISTINCT values). Rows carry hidden helper columns after `visible` (ORDER BY or HAVING
 /// items that are not selected), dropped at the end.
-pub struct Post { grouping: Option<GenAgg>, exprs: Vec<(usize, SExpr)>, having: Option<SExpr>, distinct: bool, order: Vec<(usize, bool)>, offset: usize, limit: Option<usize>, visible: usize, pub types: Vec<Option<ColType>> }
+pub struct Post { grouping: Option<GenAgg>, exprs: Vec<(usize, SExpr)>, having: Option<SExpr>, distinct: bool, order: Vec<(usize, bool)>, offset: Count, limit: Option<Count>, visible: usize, pub types: Vec<Option<ColType>> }
 #[derive(Clone, Copy, Debug, PartialEq)] enum GenFn { Count, Sum, Avg, Min, Max, Concat }
 /// One output of the general aggregation: a grouping key, an aggregate over a raw column (None: count(*)), or a value
 /// the post step fills in (an expression over aggregates).
@@ -218,6 +218,24 @@ fn coerce(x: SExpr, other: &SExpr, ty_of: &dyn Fn(usize) -> Option<ColType>) -> 
     Ok(x)
 }
 /// A non-negative integer literal (ORDER BY 2, LIMIT 10).
+/// A LIMIT or OFFSET: a number, or the value of a parameter (`LIMIT ?`), read when the statement runs; plus `n`
+/// (the scan's limit counts the rows a literal OFFSET skips).
+#[derive(Clone, Copy, Debug, PartialEq)] pub struct Count { param: Option<usize>, n: usize }
+impl Count {
+    const ZERO: Count = Count { param: None, n: 0 };
+    /// Its value with these parameters; None for a NULL parameter (LIMIT NULL: no limit; OFFSET NULL: none).
+    fn get(&self, params: &[Value], what: &str) -> Result<Option<usize>, String> {
+        let Some(i) = self.param else { return Ok(Some(self.n)) };
+        let v = match params.get(i) {
+            Some(Value::Null) => return Ok(None),
+            Some(Value::Int(v)) if *v >= 0 => *v as usize,
+            Some(Value::Float(f)) if *f >= 0.0 && f.fract() == 0.0 && *f < 9.0e15 => *f as usize,
+            Some(v) => return Err(format!("{what} takes a whole number of 0 or more, not {v:?}")),
+            None => return Err(format!("{what}: no value for parameter {}", i + 1)),
+        };
+        Ok(Some(v.saturating_add(self.n)))
+    }
+}
 fn int_lit(e: &ast::Expr) -> Option<i64> { if let ast::Expr::Value(v) = e { if let ast::Value::Number(n, _) = &v.value { return n.parse().ok(); } } None }
 /// An expression's text for matching ORDER BY or HAVING items against the select list.
 fn norm_sql(e: &ast::Expr) -> String { e.to_string().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ") }
@@ -587,6 +605,11 @@ impl<'a> Planner<'a> {
         match jcol(srcs, e) { Ok(Some((s, c))) => Ok(Ref::Inner(s, c)), Ok(None) => Ok(Ref::None), Err(err) => { if !self.outer.is_empty() { if let Ok(Some((s, c))) = jcol(&self.outer, e) { return Ok(Ref::Outer(s, c)); } } Err(err) } }
     }
     /// Plan a subquery with the given outer scope; `exists` ignores its projection and selects the correlated column.
+    /// A LIMIT or OFFSET: a number, or a parameter.
+    fn count(&mut self, e: &ast::Expr, what: &str) -> Result<Count, String> {
+        if let Some(n) = int_lit(e).filter(|n| *n >= 0) { return Ok(Count { param: None, n: n as usize }); }
+        match e { ast::Expr::Value(v) if matches!(v.value, ast::Value::Placeholder(_)) => match self.expr(e)? { Expr::Param(i) => Ok(Count { param: Some(i), n: 0 }), _ => unreachable!() }, _ => Err(format!("{what} takes a number of 0 or more, or a parameter (?)")) }
+    }
     fn plan_sub(&mut self, q: &ast::Query, outer: &[Src], exists: bool) -> Result<SelectPlan, String> {
         let saved = (std::mem::replace(&mut self.outer, outer.to_vec()), self.corr.take(), std::mem::replace(&mut self.exists_mode, exists));
         let r = self.plan_query(q);
@@ -1217,8 +1240,7 @@ impl<'a> Planner<'a> {
                 } else { match self.post_sexpr(e, &mut items, &mut itexts, &keys, &names, &srcs, &mut vidx, &types)? { SExpr::Out(i) => i, x => { items.push(UItem::Later(x)); itexts.push(t); items.len() - 1 } } };
             order.push((idx, format!("{}", o.options).to_uppercase().contains("DESC")));
         } } }
-        let count = |e: &ast::Expr, what: &str| -> Result<usize, String> { match int_lit(e) { Some(n) if n >= 0 => Ok(n as usize), _ => Err(format!("{what} must be a number")) } };
-        let (limit, offset) = match &q.limit_clause { Some(LimitClause::LimitOffset { limit, offset, .. }) => (limit.as_ref().map(|e| count(e, "LIMIT")).transpose()?, offset.as_ref().map(|o| count(&o.value, "OFFSET")).transpose()?.unwrap_or(0)), _ => (None, 0) };
+        let (limit, offset) = match &q.limit_clause { Some(LimitClause::LimitOffset { limit, offset, .. }) => (limit.as_ref().map(|e| self.count(e, "LIMIT")).transpose()?, offset.as_ref().map(|o| self.count(&o.value, "OFFSET")).transpose()?.unwrap_or(Count::ZERO)), _ => (None, Count::ZERO) };
         let distinct = matches!(sel.distinct, Some(ast::Distinct::Distinct));
         if distinct && order.iter().any(|(i, _)| *i >= visible) { return Err("with SELECT DISTINCT, ORDER BY items must be in the select list".into()); }
         // aggregation: the scan's own path takes one GROUP BY column and plain aggregates over columns; the rest is grouped in the post step
@@ -1268,8 +1290,10 @@ impl<'a> Planner<'a> {
         let sorts = |i: usize| if aggregating { !generic && matches!(items[i], UItem::Key(_) | UItem::Agg(_)) } else { matches!(proj[i], Proj::Col(_)) };
         let sink_sorts = order.len() == 1 && sorts(order[0].0);
         let wait = generic || having.is_some() || distinct || order.len() > 1 || (order.len() == 1 && !sink_sorts);   // needs every row before ORDER BY and LIMIT
-        let post_needed = wait || offset > 0 || hidden || !post_exprs.is_empty();
-        let (order_by, limit_sink) = if !post_needed { (order.first().copied(), limit) } else if wait { (None, None) } else { (order.first().copied(), limit.map(|l| l + offset)) };
+        let post_needed = wait || offset != Count::ZERO || hidden || !post_exprs.is_empty();
+        // the scan keeps LIMIT + OFFSET rows (in order); an OFFSET from a parameter isn't known yet: then all of them
+        let (order_by, limit_sink) = if !post_needed { (order.first().copied(), limit) } else if wait { (None, None) }
+            else { (order.first().copied(), limit.filter(|_| offset.param.is_none()).map(|l| Count { param: l.param, n: l.n + offset.n })) };
         let mut post = if post_needed { Some(Post { grouping, exprs: post_exprs, having, distinct, order: order.clone(), offset, limit, visible, types: if aggregating { out_types[..visible].to_vec() } else { vec![] } }) } else { None };
         let limit = limit_sink;
         if post.is_some() && (corr_spec.is_some() || exists) { return Err(unsup("HAVING, DISTINCT, OFFSET, ORDER BY on several columns, or expressions over aggregates inside a correlated subquery")); }
@@ -2505,6 +2529,8 @@ impl Sql {
     #[inline(never)] fn post(&self, sess: &Session, p: &Post, rows: Vec<Vec<Value>>, params: &[Value]) -> Result<Vec<Vec<Value>>, String> {
         use std::cmp::Ordering::Equal;
         let mut rows = match &p.grouping { Some(g) => g.run(rows)?, None => rows };
+        let offset = p.offset.get(params, "OFFSET")?.unwrap_or(0);
+        let limit = match &p.limit { Some(c) => c.get(params, "LIMIT")?, None => None };
         // expressions over aggregates, in item order (one may read an earlier one), then HAVING
         if !p.exprs.is_empty() {
             let xs = self.bind(sess, &p.exprs.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>(), params)?;
@@ -2519,7 +2545,7 @@ impl Sql {
         if p.distinct { let mut seen = std::collections::HashSet::new(); let mut kb = vec![]; rows.retain(|r| { kb.clear(); for v in &r[..p.visible] { canon(v, &mut kb); } seen.insert(kb.clone()) }); }
         if !p.order.is_empty() {
             let cmp = |a: &Vec<Value>, b: &Vec<Value>| { for &(i, desc) in &p.order { let o = value_order(&a[i], &b[i]); let o = if desc { o.reverse() } else { o }; if o.is_ne() { return o; } } Equal };
-            match p.limit.map(|l| p.offset.saturating_add(l)) {
+            match limit.map(|l| offset.saturating_add(l)) {
                 // a few of many (the nearest 10 vectors, the newest 20 rows): find those, then sort just them; ties
                 // keep their input order, so the rows are the ones a full sort would give
                 Some(k) if k > 0 && k < rows.len() / 4 => {
@@ -2531,7 +2557,7 @@ impl Sql {
                 _ => rows.sort_by(cmp),
             }
         }
-        Ok(rows.into_iter().skip(p.offset).take(p.limit.unwrap_or(usize::MAX)).map(|mut r| { r.truncate(p.visible); r }).collect())
+        Ok(rows.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).map(|mut r| { r.truncate(p.visible); r }).collect())
     }
     #[inline(always)] fn select_rows(&self, sess: &Session, s: &SelectPlan, params: &[Value], txn: Option<&mut Txn>, mut policies: Vec<Vec<CPred>>) -> Result<Vec<Vec<Value>>, String> {
         let schema = &s.schema;
@@ -2562,7 +2588,8 @@ impl Sql {
             });
         }
         let (exprs, filters) = if s.exprs.is_empty() && s.filters.is_empty() { (vec![], vec![]) } else { (self.bind(sess, &s.exprs, params)?, self.bind(sess, &s.filters, params)?) };
-        let mut sink = Sink::new(schema, &s.proj, s.group_by, s.order, s.limit, subs, exprs, filters);
+        let limit = match &s.limit { Some(c) => c.get(params, "LIMIT")?, None => None };
+        let mut sink = Sink::new(schema, &s.proj, s.group_by, s.order, limit, subs, exprs, filters);
         if let Some(j) = &s.join { self.run_joins(sess, j, params, &preds, &mut sink, policies)?; if let Some(e) = sink.err.take() { return Err(e); } return Ok(sink.finish()); }
         preds.append(&mut policies.pop().unwrap_or_default());
         let t = &s.table;
@@ -3362,6 +3389,27 @@ mod unsupported_tests {
         let s = Sql::open_with(&d, Config::default()).unwrap();
         for q in ["CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40), age INT, grp INT)", "INSERT INTO users VALUES (1, 'alice', 30, 1), (2, 'bob', 25, 1), (3, 'carol', 35, 2)", "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INT, amount INT)", "INSERT INTO orders VALUES (1, 1, 10), (2, 1, 20)"] { s.exec_s(&mut Session::default(), q, &[]).unwrap(); }
         (s, d)
+    }
+    /// LIMIT and OFFSET take parameters too (`LIMIT ?`), read when the statement runs: one plan, any page.
+    #[test] fn limit_and_offset_take_parameters() {
+        let (s, d) = db("limitp");
+        let q = |sql: &str, p: &[Value]| s.exec_s(&mut Session::default(), sql, p);
+        let ids = |r: Vec<Vec<Value>>| r.into_iter().map(|r| r[0].clone()).collect::<Vec<_>>();
+        let i = Value::Int;
+        assert_eq!(q("SELECT id FROM users LIMIT ?", &[i(2)]).unwrap().len(), 2);
+        assert_eq!(ids(q("SELECT id FROM users ORDER BY age LIMIT ? OFFSET ?", &[i(1), i(1)]).unwrap()), vec![i(1)], "bob 25, alice 30, carol 35");
+        assert_eq!(ids(q("SELECT id FROM users WHERE age > ? ORDER BY age DESC LIMIT ?", &[i(26), i(1)]).unwrap()), vec![i(3)], "the parameters in text order");
+        assert_eq!(ids(q("SELECT id FROM users ORDER BY id LIMIT $2 OFFSET $1", &[i(1), i(5)]).unwrap()), vec![i(2), i(3)]);
+        assert_eq!(ids(q("SELECT grp, count(*) FROM users GROUP BY grp ORDER BY grp LIMIT ?", &[i(1)]).unwrap()), vec![i(1)]);
+        assert_eq!(q("SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id ORDER BY o.id LIMIT ?", &[i(1)]).unwrap().len(), 1);
+        assert_eq!(q("SELECT id FROM users ORDER BY id LIMIT ?", &[Value::Null]).unwrap().len(), 3, "LIMIT NULL: no limit");
+        assert_eq!(ids(q("SELECT id FROM users ORDER BY id LIMIT 2 OFFSET ?", &[Value::Null]).unwrap()), vec![i(1), i(2)], "OFFSET NULL: none");
+        assert_eq!(q("SELECT id FROM users ORDER BY id LIMIT ?", &[Value::Float(2.0)]).unwrap().len(), 2, "a whole number, as JavaScript sends it");
+        for bad in [i(-1), Value::Text("2".into()), Value::Float(1.5)] { assert!(q("SELECT id FROM users LIMIT ?", &[bad.clone()]).unwrap_err().contains("whole number"), "{bad:?}"); }
+        assert!(q("SELECT id FROM users LIMIT age", &[]).unwrap_err().contains("LIMIT takes a number"));
+        let p = s.prepare("SELECT id FROM users ORDER BY id LIMIT ? OFFSET ?").unwrap();
+        for (l, o, want) in [(1, 0, vec![i(1)]), (2, 1, vec![i(2), i(3)]), (5, 3, vec![])] { assert_eq!(ids(s.execute_s(&mut Session::default(), &p, &[i(l), i(o)]).unwrap()), want, "LIMIT {l} OFFSET {o}"); }
+        drop(s); std::fs::remove_dir_all(&d).unwrap();
     }
     /// E54: each of these used to be parsed and then skipped, giving a wrong answer without an error.
     #[test] fn what_is_not_implemented_is_an_error_not_a_wrong_answer() {

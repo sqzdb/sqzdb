@@ -26,17 +26,25 @@ pub fn session_name(sql: &Sql) -> &'static str { if https(sql) { "__Host-sqz_ses
 /// The session cookie for `token`, lasting as long as sessions do.
 pub(crate) fn session_cookie(sql: &Sql, token: &str) -> String { format!("{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}", session_name(sql), sql.cfg.auth.session_ttl.as_secs(), secure(sql)) }
 pub(crate) fn clear_session(sql: &Sql) -> String { format!("{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}", session_name(sql), secure(sql)) }
+/// Whether a request's Origin is the API's own site: its host, or `app.publicUrl`. A browser sends `Origin: null`
+/// from a page whose Referrer-Policy is no-referrer, and from sandboxed frames and data: pages: then only its
+/// Sec-Fetch-Site (which no script can set) can say the request comes from this very origin.
+fn own_site(sql: &Sql, origin: &str, host: Option<&str>, fetch_site: Option<&str>) -> bool {
+    if origin == "null" { return fetch_site == Some("same-origin"); }
+    let o = origin.trim_end_matches('/');
+    o.split_once("://").is_some_and(|(_, h)| host.is_some_and(|x| x.eq_ignore_ascii_case(h))) || sql.cfg.app.public_url.as_deref() == Some(o)
+}
 /// Whether a request may act on the session cookie. Browsers send Origin with what they post, and with fetches and
 /// sockets across origins: the cookie counts only without one (a navigation; not a browser) or from the API's own
-/// site: its host, `app.publicUrl`, or an origin `app.origins` names ("*" lets any page call the API, never act as
-/// its visitor).
-pub(crate) fn cookie_origin_ok(sql: &Sql, origin: Option<&str>, host: Option<&str>) -> bool {
-    let Some(o) = origin.map(|o| o.trim_end_matches('/')) else { return true };
-    o.split_once("://").is_some_and(|(_, h)| host.is_some_and(|x| x.eq_ignore_ascii_case(h))) || sql.cfg.app.public_url.as_deref() == Some(o) || sql.cfg.app.origins.iter().any(|x| x != "*" && x.eq_ignore_ascii_case(o))
+/// site (`own_site`), or an origin `app.origins` names ("*" lets any page call the API, never act as its visitor).
+pub(crate) fn cookie_origin_ok(sql: &Sql, origin: Option<&str>, host: Option<&str>, fetch_site: Option<&str>) -> bool {
+    let Some(o) = origin else { return true };
+    own_site(sql, o, host, fetch_site) || sql.cfg.app.origins.iter().any(|x| x != "*" && x.eq_ignore_ascii_case(o.trim_end_matches('/')))
 }
 /// The session a request carries: `Authorization: Bearer …`, or the session cookie (from the API's own site).
 pub(crate) fn token_of(sql: &Sql, req: &Req) -> Option<String> {
-    let from_cookie = || cookie(req, session_name(sql)).filter(|_| cookie_origin_ok(sql, req.headers.get("origin").map(String::as_str), req.headers.get("host").map(String::as_str)));
+    let h = |k: &str| req.headers.get(k).map(String::as_str);
+    let from_cookie = || cookie(req, session_name(sql)).filter(|_| cookie_origin_ok(sql, h("origin"), h("host"), h("sec-fetch-site")));
     crate::app::bearer(req).or_else(from_cookie).filter(|t| !t.is_empty())
 }
 /// Where to go back to after signing in or out: a path on this site, or a page on one of `app.origins` (never another
@@ -53,7 +61,8 @@ fn see_other(to: &str, cookies: &[String]) -> Vec<u8> {
 /// A form posted from this API's own pages: the browser's own value back (`form`), and no other origin.
 fn same_browser(sql: &Sql, req: &Req, f: &std::collections::HashMap<String, String>) -> bool {
     let held = cookie(req, FORM_COOKIE).unwrap_or_default();
-    let origin_ok = match req.headers.get("origin") { None => true, Some(o) => { let o = o.trim_end_matches('/'); sql.cfg.app.public_url.as_deref() == Some(o) || o.split_once("://").is_some_and(|(_, h)| req.headers.get("host").is_some_and(|x| x.eq_ignore_ascii_case(h))) } };
+    let h = |k: &str| req.headers.get(k).map(String::as_str);
+    let origin_ok = h("origin").is_none_or(|o| own_site(sql, o, h("host"), h("sec-fetch-site")));
     origin_ok && held.len() == 32 && crate::net::same_secret(held.as_bytes(), f.get("form").map(String::as_bytes).unwrap_or(b""))
 }
 fn form(req: &Req) -> std::collections::HashMap<String, String> {
@@ -145,7 +154,7 @@ mod tests {
     }
     #[test] fn the_cookie_counts_only_from_the_site_itself() {
         let s = sql(Some("https://tasks.example"), &["*", "https://admin.example"]);
-        let ok = |o: Option<&str>, h: Option<&str>| cookie_origin_ok(&s, o, h);
+        let ok = |o: Option<&str>, h: Option<&str>| cookie_origin_ok(&s, o, h, None);
         assert!(ok(None, Some("tasks.example")), "a navigation, or not a browser");
         assert!(ok(Some("https://tasks.example"), None), "publicUrl");
         assert!(ok(Some("https://tasks.example/"), None));
@@ -153,6 +162,9 @@ mod tests {
         assert!(ok(Some("https://ADMIN.example"), Some("tasks.example")), "an origin app.origins names");
         assert!(!ok(Some("https://evil.example"), Some("tasks.example")), "\"*\" lets other pages call the API, not act as its visitor");
         assert!(!ok(Some("null"), Some("tasks.example")));
+        // Origin: null from this very origin (a page with Referrer-Policy: no-referrer): the browser's Sec-Fetch-Site says so
+        assert!(cookie_origin_ok(&s, Some("null"), Some("tasks.example"), Some("same-origin")));
+        for site in ["same-site", "cross-site", "none"] { assert!(!cookie_origin_ok(&s, Some("null"), Some("tasks.example"), Some(site)), "{site}"); }
         assert!(!ok(Some("https://tasks.example.evil"), Some("tasks.example")));
         assert!(!ok(Some("https://evil.example"), None));
         // the token: a bearer header always, the cookie only from the site

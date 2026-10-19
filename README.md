@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.11.0` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.11.1` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -427,7 +427,9 @@ w.close()
 ```
 
 `subscribe` takes a single-table query. `watch` takes any query and re-runs it when a table it reads
-changes, debounced by `live.debounce`. Events reach a Node callback about 15 µs after the commit.
+changes, debounced by `live.debounce`. A single-table query with the primary key among its columns re-runs only
+for the rows it has or would have; without the key, on any update to its table. Events reach a Node callback
+about 15 µs after the commit.
 Subscriptions respect access control: each one sees only the rows its session may see. A subscriber
 that falls behind by more than `live.queue` events receives an overflow notice and is dropped, so a
 slow consumer never slows the writers.
@@ -1256,7 +1258,8 @@ token = "${DB_TOKEN}"
 
 - `SELECT` with `WHERE` (comparisons, `AND`, `OR`, `NOT`, `IN`, `NOT IN`, `IS NULL`, `BETWEEN`, `LIKE`,
   `ILIKE`), `DISTINCT`, `GROUP BY` any number of columns or expressions, `HAVING`, `ORDER BY` several
-  columns, positions or aliases, `LIMIT` and `OFFSET`. `LIKE` is case-sensitive; `ILIKE` is not.
+  columns, positions or aliases, `LIMIT` and `OFFSET` (numbers or parameters: `LIMIT ? OFFSET ?`, where NULL
+  means no limit). `LIKE` is case-sensitive; `ILIKE` is not.
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT …)` and the other `DISTINCT` forms,
   `group_concat` and `string_agg`, over columns or expressions, and expressions over aggregates.
 - Expressions wherever a value goes: arithmetic, `||`, `CASE`, `CAST`, JSON `->` and `->>`, and functions
@@ -1407,7 +1410,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.11.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.11.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

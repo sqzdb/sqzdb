@@ -523,7 +523,7 @@ fn handler_session(sql: &Sql, headers: &hyper::HeaderMap, host: Option<&str>) ->
 fn token_in(sql: &Sql, headers: &hyper::HeaderMap, host: Option<&str>) -> Option<String> {
     let bearer = headers.get(hyper::header::AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(|t| t.trim().to_string());
     let name = crate::signin::session_name(sql);
-    let ok = || crate::signin::cookie_origin_ok(sql, headers.get(hyper::header::ORIGIN).and_then(|o| o.to_str().ok()), host);
+    let ok = || crate::signin::cookie_origin_ok(sql, headers.get(hyper::header::ORIGIN).and_then(|o| o.to_str().ok()), host, headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()));
     let cookie = || headers.get_all(hyper::header::COOKIE).iter().map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()).flat_map(|v| v.split(';').map(|c| c.trim().to_string()).collect::<Vec<_>>())
         .find_map(|c| c.split_once('=').filter(|(k, _)| *k == name).map(|(_, v)| url_decode(v))).filter(|_| ok());
     bearer.or_else(cookie).filter(|t| !t.is_empty())

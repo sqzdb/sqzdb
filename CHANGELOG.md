@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.1 — 2026-10-19
+
+### Added
+- **`LIMIT ?` and `OFFSET ?`.** Both take parameters, so one prepared statement serves every page. A NULL limit
+  means no limit, and a NULL offset none. Before, they took only numbers written in the query.
+
+### Fixed
+- **sqzdb's sign-in page signed no one in from a browser.** Its pages sent `Referrer-Policy: no-referrer`, under
+  which browsers post forms with `Origin: null`, and the page took that for another site. Its pages now send
+  `same-origin`. A session cookie also counts with `Origin: null` when the browser's `Sec-Fetch-Site` says the
+  request comes from the same origin (a page of the app's with `no-referrer`). Any other null origin is still
+  refused.
+- **A live query without the primary key in its result kept rows that stopped matching.** For example,
+  `SELECT job_id FROM runs WHERE status = 'working'`, or a count by group, kept a run that had finished. Such a
+  query now re-runs on any update to its table.
+
 ## 0.11.0 — 2026-10-19
 
 **Functions: an app's rules in the database.** You write them in TypeScript or JavaScript, in a folder of your

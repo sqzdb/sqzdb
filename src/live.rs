@@ -151,8 +151,11 @@ impl Reactor {
                     }
                     for live in st.lives.iter_mut() {
                         if live.dirty_since.is_some() || !live.tables.contains(&t.id) { continue; }
+                        // a row that matches now changes the result, and so does one that was in it (an update or delete
+                        // may take it out). Without the key in its result, a query can't tell whether the row was: any
+                        // update or key-only delete may have changed it (a full delete carries the row it removed)
                         let dirty = match &live.single {
-                            Some((tid, preds, pols)) if *tid == t.id => { let pk = if is_row { t.pk_of(payload) } else { t.schema.delete_key(payload) }; (is_row && preds.iter().all(|p| p.eval(payload)) && pols.iter().all(|p| p.eval(payload))) || (live.key_col.is_some() && live.keys.contains(&pk)) || (!is_row && live.key_col.is_none()) }
+                            Some((tid, preds, pols)) if *tid == t.id => { let pk = if is_row { t.pk_of(payload) } else { t.schema.delete_key(payload) }; (is_row && preds.iter().all(|p| p.eval(payload)) && pols.iter().all(|p| p.eval(payload))) || (live.key_col.is_some() && live.keys.contains(&pk)) || (live.key_col.is_none() && (!is_row || *op == OP_UPDATE)) }
                             _ => true,
                         };
                         if dirty { live.dirty_since = Some(now); }
@@ -224,6 +227,7 @@ mod tests {
     use crate::config::Config;
     use crate::sql::{Session, Sql};
     use crate::table::{encode_row, Value, OP_INSERT};
+    use super::Subscription;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
@@ -250,5 +254,34 @@ mod tests {
             }
         }
         drop(sub); drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The rows a live query returns, once they are `want` (or it fails after 2 s).
+    fn until(sub: &Subscription, want: &[Vec<Value>]) {
+        let deadline = Instant::now() + Duration::from_secs(2); let mut last = None;
+        loop {
+            match sub.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Some(Event::Live { rows, .. }) => { if rows == want { return; } last = Some(rows); }
+                Some(_) => {}
+                None => panic!("the live query still has {last:?}, not {want:?}"),
+            }
+        }
+    }
+    /// A row that stops matching leaves the result, though the result has no key to say it was in it: a projection
+    /// without the primary key, or a count by group.
+    #[test] fn a_row_that_stops_matching_leaves_a_result_without_its_key() {
+        let d = std::env::temp_dir().join(format!("sqzdb-live-{}-keyless", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let mut cfg = Config::default(); cfg.live.debounce = Duration::ZERO;
+        let s = Sql::open_with(&d, cfg).unwrap(); let mut sess = Session::default();
+        s.exec_s(&mut sess, "CREATE TABLE runs (id INT PRIMARY KEY, job INT, status TEXT, archived BOOL)", &[]).unwrap();
+        s.exec_s(&mut sess, "INSERT INTO runs VALUES (1, 7, 'working', false), (2, 8, 'done', false)", &[]).unwrap();
+        let (busy, rows) = s.reactor().watch(&sess, "SELECT job, status FROM runs WHERE status IN ('pending', 'working')", &[]).unwrap();
+        assert_eq!(rows, vec![vec![Value::Int(7), Value::Text("working".into())]]);
+        let (counts, _) = s.reactor().watch(&sess, "SELECT status, count(*) AS n FROM runs WHERE archived = false GROUP BY status ORDER BY status", &[]).unwrap();
+        s.exec_s(&mut sess, "UPDATE runs SET status = 'canceled' WHERE id = 1", &[]).unwrap();
+        until(&busy, &[]);
+        s.exec_s(&mut sess, "UPDATE runs SET archived = true WHERE id = 2", &[]).unwrap();
+        until(&counts, &[vec![Value::Text("canceled".into()), Value::Int(1)]]);
+        drop(busy); drop(counts); drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 }

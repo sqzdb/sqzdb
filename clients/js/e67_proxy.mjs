@@ -153,8 +153,15 @@ try {
   assert.equal(r.status, 400); assert.match(await r.text(), /came from another page/);
   r = await fetch(base + '/_sqz/sign-in', { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ form: f, action: 'sign-up', login: 'ann@x.test', password: 'the password 1' }) });
   assert.equal(r.status, 400);
+  // as a browser posts it: its own Origin (the page's Referrer-Policy is same-origin), or, from a page of the app's
+  // with no-referrer, Origin: null with Sec-Fetch-Site: same-origin; a null origin from anywhere else is refused
+  page = await get('/_sqz/sign-in'); assert.equal(page.headers.get('referrer-policy'), 'same-origin');
+  r = await post('/_sqz/sign-in', { form: await formOf(page), action: 'sign-in', login: 'nobody@x.test', password: 'the password 1' }, { origin: 'null', 'sec-fetch-site': 'cross-site' });
+  assert.match(await r.text(), /came from another page/);
+  r = await post('/_sqz/sign-in', { form: await formOf(await get('/_sqz/sign-in')), action: 'sign-in', login: 'nobody@x.test', password: 'the password 1' }, { origin: 'null', 'sec-fetch-site': 'same-origin' });
+  assert.doesNotMatch(await r.text(), /came from another page/, 'past the form check (to a wrong password)');
   f = await formOf(await get('/_sqz/sign-in?mode=up'));   // (each page has a value of its own)
-  r = await post('/_sqz/sign-in', { form: f, action: 'sign-up', login: 'ann@x.test', password: 'the password 1', return: '/dashboard?tab=1' });
+  r = await post('/_sqz/sign-in', { form: f, action: 'sign-up', login: 'ann@x.test', password: 'the password 1', return: '/dashboard?tab=1' }, { origin: base });
   assert.equal(r.status, 303); assert.equal(r.headers.get('location'), '/dashboard?tab=1');
   const set = r.headers.getSetCookie().find((c) => c.startsWith('sqz_session=')); assert.match(set, /HttpOnly/); assert.match(set, /SameSite=Lax/); assert.match(set, /Path=\//);
   // the cookie is the session: for the API, and (as headers) for the app behind it
