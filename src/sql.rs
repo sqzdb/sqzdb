@@ -1752,8 +1752,9 @@ impl Sql {
         let existing = crate::table::check_dir(dir)? != crate::table::DirState::Empty;
         if !existing && !cfg.create { return Err(format!("no database in {} and create is off", dir.display())); }
         let lock = lock_dir(dir)?;   // one owner per directory, across processes and handles
+        let mut restored = false;
         if !existing {
-            if let Some(b) = &cfg.backup { if b.bootstrap { bootstrap_from_bucket(dir, b)?; } }
+            if let Some(b) = &cfg.backup { if b.bootstrap { restored = bootstrap_from_bucket(dir, b)?; } }
         }
         let db = Arc::new(Database::open(dir, cfg.durable == Durability::Fsync));
         crate::table::write_meta_if_missing(dir).map_err(|e| format!("{}: cannot write {}: {e}", dir.display(), crate::table::META_FILE))?;
@@ -1762,6 +1763,7 @@ impl Sql {
         db.log.st.lock().unwrap().sync_delay = cfg.log.sync_delay;
         match cfg.log.threads_idle_after { Some(d) => db.start_idle(d), None => db.start() }
         let sql = Arc::new(sql);
+        if restored { sql.check_restored_files(); }   // the bucket's files against the restored records
         for (name, _) in sql.db.tables_with_shadow() { sql.resume_copy(name); }   // resume an interrupted ALTER
         *sql.dir_lock.lock().unwrap() = Some(lock);
         let mut sv = Services::default();
@@ -2645,16 +2647,17 @@ enum Store { Empty, Set(KeySet), Dense { min: i64, max: i64, es: usize, data: Ve
 
 
 /// Restore the latest state of a bucket into an empty `dir` before the first open (`backup.bootstrap`). Downloads into
-/// a scratch directory and moves the files over; a bucket with nothing in it leaves `dir` empty.
-fn bootstrap_from_bucket(dir: &std::path::Path, b: &crate::config::Backup) -> Result<(), String> {
+/// a scratch directory and moves the files over; a bucket with nothing in it leaves `dir` empty. True when it restored
+/// something (its files are then checked once the database is open).
+fn bootstrap_from_bucket(dir: &std::path::Path, b: &crate::config::Backup) -> Result<bool, String> {
     let scratch = dir.join(".bootstrap");
     let (s0, chunks, bytes) = crate::cloud::download_log(&b.cloud(), &scratch)?;
-    if s0 == 0 && chunks == 0 { let _ = std::fs::remove_dir_all(&scratch); return Ok(()); }
+    if s0 == 0 && chunks == 0 { let _ = std::fs::remove_dir_all(&scratch); return Ok(false); }
     let (files, file_bytes) = crate::cloud::download_files(&b.cloud(), &scratch)?;
     for e in std::fs::read_dir(&scratch).map_err(|e| e.to_string())? { let e = e.map_err(|e| e.to_string())?; std::fs::rename(e.path(), dir.join(e.file_name())).map_err(|e| e.to_string())?; }
     let _ = std::fs::remove_dir_all(&scratch);
     eprintln!("sqweezdb: bootstrapped {} from the bucket ({chunks} log objects, {files} files, {:.1} MB)", dir.display(), (bytes + file_bytes) as f64 / 1e6);
-    Ok(())
+    Ok(true)
 }
 /// The snapshot policy thread: a snapshot once the log written since the last one exceeds max(`log_bytes`, size of that
 /// snapshot), or after `idle_after` without a write when something was written since the last one. Holds only a weak

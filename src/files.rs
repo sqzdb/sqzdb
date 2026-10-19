@@ -50,6 +50,11 @@ pub fn clean_type(t: &str) -> String {
     let t = t.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     if t.len() <= 127 && t.split('/').count() == 2 && !t.starts_with('/') && !t.ends_with('/') && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"/+-.".contains(&b)) { t } else { "application/octet-stream".into() }
 }
+fn sha256_of(p: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::Digest;
+    let mut f = std::fs::File::open(p)?; let (mut h, mut buf) = (sha2::Sha256::new(), vec![0u8; 64 << 10]);
+    loop { let n = f.read(&mut buf)?; if n == 0 { return Ok(h.finalize().into()); } h.update(&buf[..n]); }
+}
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 fn new_id() -> String { let mut b = [0u8; 16]; getrandom::fill(&mut b).expect("random"); b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80; crate::table::format_uuid(&b) }
 
@@ -108,6 +113,24 @@ impl Sql {
         let wait = self.cfg.durable == crate::config::Durability::Cloud;
         let rx = match self.services.lock().unwrap().as_ref().and_then(|s| s.files_backup.as_ref()) { Some(b) => b.put(id, wait), None => return Ok(()) };
         rx.map_or(Ok(()), |rx| rx.recv().unwrap_or_else(|_| Err("files: the backup stopped before the file reached the bucket".into())))
+    }
+    /// After a bootstrap: keep the downloaded files that are what `_sqz_files` recorded (their SHA-256), and remove the
+    /// others, so that the backup's check at start fetches them again (and reports them if the bucket's copy is
+    /// wrong). Returns (files checked, files removed).
+    pub(crate) fn check_restored_files(&self) -> (usize, usize) {
+        let mut rows = HashMap::new();
+        if let Some(t) = self.db.table(FILES) { t.scan(|r| { if let Some(m) = meta_of(&t.schema, r) { rows.insert(m.id, m.sha256); } true }); }
+        let (mut checked, mut removed) = (0, 0);
+        let Ok(dirs) = std::fs::read_dir(self.files_dir()) else { return (0, 0) };
+        for d in dirs.flatten().filter(|d| d.file_name() != "tmp" && d.path().is_dir()) {
+            for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+                checked += 1;
+                let id = f.file_name().to_string_lossy().into_owned();
+                if rows.get(&id).is_some_and(|sha| sha256_of(&f.path()).is_ok_and(|h| h == *sha)) { continue; }
+                eprintln!("files: {id} from the bucket is not a file this database recorded; removed"); let _ = std::fs::remove_file(f.path()); removed += 1;
+            }
+        }
+        (checked, removed)
     }
     pub fn file_meta(&self, id: &str) -> Option<FileMeta> {
         let t = self.db.table(FILES)?; let k = t.schema.key_from_value(&Value::Text(id.to_string())).ok()?;
@@ -204,14 +227,15 @@ pub fn copy_files(src: &Path, dest: &Path) -> Result<u64, String> {
 // ---- files in the backup bucket
 
 /// The files half of the backup (`[backup]`): a new file is uploaded as it arrives (`cloud::put_file`, 8 at a time),
-/// and a file the sweep deletes is deleted from the bucket too. At start the bucket is compared with `_sqz_files`:
+/// and a file the sweep deletes is deleted from the bucket too; closing finishes what is queued unless the bucket fails. At start the bucket is compared with `_sqz_files`:
 /// files it lacks are uploaded, files this directory lacks are fetched back, and objects of files that are gone are
 /// deleted. Its failures count in the backup's health.
 pub struct FilesBackup { q: Arc<(Mutex<Queue>, Condvar)>, stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>>, pub stats: Arc<FilesStats> }
 /// Since start: files uploaded (and their bytes in the bucket), deleted there, fetched back from it; files waiting; files
 /// that are in neither place.
 #[derive(Default)] pub struct FilesStats { pub uploaded: AtomicU64, pub bytes: AtomicU64, pub deleted: AtomicU64, pub fetched: AtomicU64, pub pending: AtomicU64, pub missing: AtomicU64 }
-enum Op { Put(String), Delete(String), Fetch(String, OPath), Drop(OPath) }
+/// Fetch carries the SHA-256 `_sqz_files` recorded, which the download must match.
+enum Op { Put(String), Delete(String), Fetch(String, OPath, [u8; 32]), Drop(OPath) }
 /// Work waiting for the thread, and who waits for which upload (`durable = "cloud"`). `dead` once it can't run.
 #[derive(Default)] struct Queue { ops: VecDeque<Op>, waiting: HashMap<String, Vec<mpsc::Sender<Result<(), String>>>>, dead: Option<String> }
 const AT_ONCE: usize = 8;
@@ -255,7 +279,7 @@ fn backup_files(db: &Database, cfg: &CloudConfig, store: &dyn ObjectStore, q: &(
     loop {
         if stop.load(Ordering::Relaxed) { return; }
         match rt.block_on(crate::cloud::list_files(store, cfg)) {
-            Ok(listed) => { health.contact(); reconcile(db, listed, q, st); break; }
+            Ok(listed) => { health.contact(); reconcile(db, cfg, listed, q, st); break; }
             Err(e) => { health.fail(format!("listing the files in the bucket: {e}")); failures += 1; if !pause(stop, failures) { return; } }
         }
     }
@@ -264,55 +288,68 @@ fn backup_files(db: &Database, cfg: &CloudConfig, store: &dyn ObjectStore, q: &(
         let batch: Vec<Op> = {
             let mut g = q.0.lock().unwrap();
             while g.ops.is_empty() && !stop.load(Ordering::Relaxed) { g = q.1.wait(g).unwrap(); }
-            if stop.load(Ordering::Relaxed) { return; }
+            // closing: finish what is queued, as the log's uploader does (and give up at the first failure, below)
+            if g.ops.is_empty() { return; }
             let n = g.ops.len().min(64); g.ops.drain(..n).collect()
         };
-        let done: Vec<(Op, Result<u64, String>)> = rt.block_on(async {
+        let done: Vec<(Op, Result<Option<u64>, String>)> = rt.block_on(async {
             use futures_util::StreamExt;
-            futures_util::stream::iter(batch).map(|op| async move { let r = run(db, cfg, store, &op, stop, st).await; (op, r) }).buffer_unordered(AT_ONCE).collect().await
+            futures_util::stream::iter(batch).map(|op| async move { let r = run(db, cfg, store, &op, st).await; (op, r) }).buffer_unordered(AT_ONCE).collect().await
         });
         let (mut error, mut put) = (None, false); let mut g = q.0.lock().unwrap();
         for (op, r) in done {
             match (r, op) {
-                (Ok(n), Op::Put(id)) => { put = true; st.uploaded.fetch_add(1, Ordering::Relaxed); st.bytes.fetch_add(n, Ordering::Relaxed); for w in g.waiting.remove(&id).unwrap_or_default() { let _ = w.send(Ok(())); } }
-                (Ok(_), Op::Delete(_) | Op::Drop(_)) => { st.deleted.fetch_add(1, Ordering::Relaxed); }
-                (Ok(_), Op::Fetch(..)) => { st.fetched.fetch_add(1, Ordering::Relaxed); }
+                (Ok(Some(n)), Op::Put(id)) => { put = true; st.uploaded.fetch_add(1, Ordering::Relaxed); st.bytes.fetch_add(n, Ordering::Relaxed); for w in g.waiting.remove(&id).unwrap_or_default() { let _ = w.send(Ok(())); } }
+                (Ok(None), Op::Put(id)) => { for w in g.waiting.remove(&id).unwrap_or_default() { let _ = w.send(Err(format!("files: {id} is gone"))); } }
+                (Ok(Some(_)), Op::Delete(_) | Op::Drop(_)) => { st.deleted.fetch_add(1, Ordering::Relaxed); }
+                (Ok(Some(_)), Op::Fetch(..)) => { st.fetched.fetch_add(1, Ordering::Relaxed); }
+                (Ok(_), _) => {}   // given up (reported)
                 (Err(e), op) => { error = Some(e); g.ops.push_front(op); }   // again, after a pause
             }
         }
         st.pending.store(g.ops.len() as u64, Ordering::Relaxed); drop(g);
         match error {
             None => { if put { health.uploaded(); } else { health.contact(); } failures = 0; }
-            Some(e) => { health.fail(e); failures += 1; if !pause(stop, failures) { return; } }
+            Some(e) => { health.fail(e); failures += 1; if !pause(stop, failures) { return; } }   // closing: give up
         }
     }
 }
-/// One piece of work; Ok with the bytes moved.
-async fn run(db: &Database, cfg: &CloudConfig, store: &dyn ObjectStore, op: &Op, stop: &AtomicBool, st: &FilesStats) -> Result<u64, String> {
+/// One piece of work: Ok with the bytes moved, Ok(None) when there is nothing it could do (reported), Err to try again.
+async fn run(db: &Database, cfg: &CloudConfig, store: &dyn ObjectStore, op: &Op, st: &FilesStats) -> Result<Option<u64>, String> {
     match op {
         Op::Put(id) => {
             let path = file_path_in(&db.dir, id);
             // deleted before it got there (the bucket was down for a day): nothing to upload
-            if !path.exists() { st.missing.fetch_add(1, Ordering::Relaxed); eprintln!("files: {id} left {} before reaching the bucket", db.dir.display()); return Ok(0); }
-            crate::cloud::put_file(store, cfg, id, &path, stop).await
+            if !path.exists() { st.missing.fetch_add(1, Ordering::Relaxed); eprintln!("files: {id} left {} before reaching the bucket", db.dir.display()); return Ok(None); }
+            crate::cloud::put_file(store, cfg, id, &path).await.map(Some)
         }
-        Op::Delete(id) => crate::cloud::delete_file(store, cfg, id).await.map(|()| 0),
-        Op::Fetch(id, key) => crate::cloud::get_file(store, cfg, key, &file_path_in(&db.dir, id)).await,
-        Op::Drop(key) => crate::cloud::delete_object(store, key).await.map(|()| 0),
+        Op::Delete(id) => crate::cloud::delete_file(store, cfg, id).await.map(|()| Some(0)),
+        Op::Fetch(id, key, sha) => match crate::cloud::get_file(store, cfg, key, &file_path_in(&db.dir, id), Some(sha)).await {
+            Ok(n) => Ok(Some(n)),
+            Err(crate::cloud::FetchError::Retry(e)) => Err(e),
+            // damaged or altered in the bucket: fetching it again won't help
+            Err(crate::cloud::FetchError::Refused(e)) => { st.missing.fetch_add(1, Ordering::Relaxed); eprintln!("files: {id} was not fetched back: {e}"); Ok(None) }
+        },
+        Op::Drop(key) => crate::cloud::delete_object(store, key).await.map(|()| Some(0)),
     }
 }
 /// Queue what makes the bucket and `_sqz_files` agree.
-fn reconcile(db: &Database, listed: Vec<(String, OPath)>, q: &(Mutex<Queue>, Condvar), st: &FilesStats) {
+fn reconcile(db: &Database, cfg: &CloudConfig, listed: Vec<(String, OPath)>, q: &(Mutex<Queue>, Condvar), st: &FilesStats) {
     // no file was ever uploaded here: leave the bucket alone (it may not be this database's)
     let Some(t) = db.table(FILES) else { return };
-    let mut rows = HashSet::new(); t.scan(|r| { if let Value::Text(id) = decode_col(&t.schema, r, 0) { rows.insert(id); } true });
+    let mut rows = HashMap::new(); t.scan(|r| { if let Some(m) = meta_of(&t.schema, r) { rows.insert(m.id, m.sha256); } true });
     let (mut ops, mut there) = (vec![], HashSet::new());
     for (id, k) in listed {
-        if !rows.contains(&id) { ops.push(Op::Drop(k)); }
-        else if there.insert(id.clone()) && !file_path_in(&db.dir, &id).exists() { ops.push(Op::Fetch(id, k)); }
+        // with a passphrase, an object that isn't encrypted is no copy of ours (it was put there before the passphrase
+        // was, or by someone else): replaced by an encrypted one
+        let plain = cfg.key.is_some() && !crate::cloud::parse_file_key(k.as_ref()).is_some_and(|(_, _, e)| e);
+        match rows.get(&id) {
+            Some(sha) if !plain => { if there.insert(id.clone()) && !file_path_in(&db.dir, &id).exists() { ops.push(Op::Fetch(id, k, *sha)); } }
+            _ => ops.push(Op::Drop(k)),
+        }
     }
     let mut missing = 0;
-    for id in rows { if !there.contains(&id) { if file_path_in(&db.dir, &id).exists() { ops.push(Op::Put(id)); } else { missing += 1; } } }
+    for id in rows.into_keys() { if !there.contains(&id) { if file_path_in(&db.dir, &id).exists() { ops.push(Op::Put(id)); } else { missing += 1; } } }
     if missing > 0 { st.missing.fetch_add(missing, Ordering::Relaxed); eprintln!("files: {missing} files are neither in {} nor in the bucket", db.dir.display()); }
     let mut g = q.0.lock().unwrap(); g.ops.extend(ops); st.pending.store(g.ops.len() as u64, Ordering::Relaxed); q.1.notify_all();
 }
@@ -437,14 +474,28 @@ mod tests {
         let (ann, _) = user(&s, "ann@x");
         let (up, lost, before) = (put(&s, &ann, b"backed up"), put(&s, &ann, b"lost here"), put(&s, &ann, b"from before the backup"));
         // `up` and `lost` are in the bucket, `before` is not, and an object of a file that is gone is
-        let c = CloudConfig::local("b", "db").with_passphrase("pw"); let (rt, stop) = (crate::cloud::rt(), AtomicBool::new(false));
-        for f in [&up, &lost] { rt.block_on(crate::cloud::put_file(&*store, &c, &f.id, &s.file_path(&f.id), &stop)).unwrap(); }
-        let gone = "0123abcd-89ab-4def-8123-456789abcdef"; rt.block_on(crate::cloud::put_file(&*store, &c, gone, &s.file_path(&up.id), &stop)).unwrap();
+        let c = CloudConfig::local("b", "db").with_passphrase("pw"); let rt = crate::cloud::rt();
+        for f in [&up, &lost] { rt.block_on(crate::cloud::put_file(&*store, &c, &f.id, &s.file_path(&f.id))).unwrap(); }
+        let gone = "0123abcd-89ab-4def-8123-456789abcdef"; rt.block_on(crate::cloud::put_file(&*store, &c, gone, &s.file_path(&up.id))).unwrap();
         std::fs::remove_file(s.file_path(&lost.id)).unwrap();
         let st = bucket(&s, &store);
         until("reconciled", || st.uploaded.load(Ordering::Relaxed) == 1 && st.fetched.load(Ordering::Relaxed) == 1 && st.deleted.load(Ordering::Relaxed) == 1);
         let mut ids = in_bucket(&store); ids.sort(); let mut want = vec![up.id.clone(), lost.id.clone(), before.id.clone()]; want.sort(); assert_eq!(ids, want);
         assert_eq!(std::fs::read(s.file_path(&lost.id)).unwrap(), b"lost here", "fetched back");
+        // an object altered in the bucket is not fetched back, and not tried again and again
+        let c2 = c.clone(); let key = crate::cloud::file_key(&lost.id, false, &c2);
+        let other = rt.block_on(async { object_store::ObjectStoreExt::get(&*store, &crate::cloud::file_key(&up.id, false, &c2)).await.unwrap().bytes().await.unwrap() });
+        rt.block_on(object_store::ObjectStoreExt::put(&*store, &key, other.into())).unwrap();
+        std::fs::remove_file(s.file_path(&lost.id)).unwrap();
+        let st = bucket(&s, &store);
+        until("refused", || st.missing.load(Ordering::Relaxed) == 1 && st.pending.load(Ordering::Relaxed) == 0);
+        assert!(!s.file_path(&lost.id).exists()); assert_eq!(st.fetched.load(Ordering::Relaxed), 0);
+        // a plain object with a passphrase set: replaced by an encrypted one
+        rt.block_on(object_store::ObjectStoreExt::put(&*store, &crate::cloud::file_key(&up.id, false, &CloudConfig::local("b", "db")), b"plain".to_vec().into())).unwrap();
+        let st = bucket(&s, &store);
+        until("replaced", || st.deleted.load(Ordering::Relaxed) == 1);
+        let keys: Vec<String> = crate::cloud::rt().block_on(crate::cloud::list_files(&*store, &c)).unwrap().into_iter().filter(|(i, _)| *i == up.id).map(|(_, k)| k.as_ref().to_string()).collect();
+        assert_eq!(keys.len(), 1); assert!(keys[0].ends_with(".enc"), "{keys:?}");
         // with durable = "cloud", an upload returns once its file is in the bucket
         let rx = s.services.lock().unwrap().as_ref().unwrap().files_backup.as_ref().unwrap().put(&before.id, true).unwrap();
         assert_eq!(rx.recv().unwrap(), Ok(()));

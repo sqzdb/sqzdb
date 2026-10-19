@@ -44,7 +44,7 @@ fn main() {
     println!("=== E63: uploaded files in the backup bucket ===");
     let mut s3 = s3_server();
     // (the server's listings lag a deletion by up to a second)
-    for p in ["e63", "e63-cloud", "e63-visible"] { clear_prefix(&backup_in(p, false).cloud()); } std::thread::sleep(Duration::from_millis(1500));
+    for p in ["e63", "e63-cloud", "e63-visible", "e63-tamper"] { clear_prefix(&backup_in(p, false).cloud()); } std::thread::sleep(Duration::from_millis(1500));
     let dir = fresh("primary"); let sql = open(&dir, false, Durability::Visible);
     app(&sql, "CREATE TABLE notes (id SERIAL PRIMARY KEY, body TEXT, attachment FILE)", &[]);
 
@@ -96,7 +96,7 @@ fn main() {
 
     // ---- (e) a restart repairs the difference
     drop(node); std::fs::remove_file(sqweezdb::files::file_path_in(&dir2, &notes)).unwrap();
-    let orphan = "0123abcd-89ab-4def-8123-456789abcdef"; { let c = backup(false).cloud(); let store = c.store(); let src = Path::new(ROOT).join("orphan"); std::fs::write(&src, b"no row has me").unwrap(); rt().block_on(sqweezdb::cloud::put_file(&*store, &c, orphan, &src, &Default::default())).unwrap(); }
+    let orphan = "0123abcd-89ab-4def-8123-456789abcdef"; { let c = backup(false).cloud(); let store = c.store(); let src = Path::new(ROOT).join("orphan"); std::fs::write(&src, b"no row has me").unwrap(); rt().block_on(sqweezdb::cloud::put_file(&*store, &c, orphan, &src)).unwrap(); }
     let node = open(&dir2, false, Durability::Visible);
     until("agreement", || stats(&node).fetched.load(Relaxed) == 1 && stats(&node).deleted.load(Relaxed) == 1);
     println!("(e) restarted without one of its files, and with an object of a file it never had in the bucket: fetched back {}, deleted {}; the file reads the same: {}", stats(&node).fetched.load(Relaxed), stats(&node).deleted.load(Relaxed), std::fs::read(node.file_path(&notes)).unwrap() == text);
@@ -113,6 +113,19 @@ fn main() {
     println!("(f) a 100 KB upload returns after {:.2} ms (p50) by default, {:.1} ms with durable = \"cloud\", where every file is in the bucket by then ({in_bucket} of 100)", pct(&mut vis, 0.5), pct(&mut cl, 0.5));
     assert_eq!(in_bucket, 100);
 
-    for p in ["e63", "e63-cloud", "e63-visible"] { clear_prefix(&backup_in(p, false).cloud()); } let _ = std::fs::remove_dir_all(ROOT);
+    // ---- (g) someone with write access to the bucket (not the passphrase) moves one file's object over another's
+    let dir5 = fresh("tamper-primary"); let p = open_in("e63-tamper", &dir5, false, Durability::Visible);
+    for i in 0..10u8 { let mut f = noise(10 << 10); f[0] = i; put(&p, "f.bin", "application/octet-stream", &f); }
+    drop(p);
+    { use object_store::ObjectStoreExt;
+      let c = backup_in("e63-tamper", false).cloud(); let store = c.store(); let objs = rt().block_on(list_files(&*store, &c)).unwrap(); assert_eq!(objs.len(), 10, "closing finishes the uploads");
+      let body = rt().block_on(async { store.get(&objs[0].1).await.unwrap().bytes().await.unwrap() }); rt().block_on(store.put(&objs[1].1, body.into())).unwrap(); }
+    let dir6 = fresh("tampered"); let t = open_in("e63-tamper", &dir6, true, Durability::Visible);
+    until("the check", || stats(&t).missing.load(Relaxed) == 1 && stats(&t).pending.load(Relaxed) == 0);
+    let here = std::fs::read_dir(dir6.join("files")).unwrap().flatten().filter(|d| d.file_name() != "tmp" && d.path().is_dir()).map(|d| std::fs::read_dir(d.path()).unwrap().count()).sum::<usize>();
+    println!("(g) one object copied over another's in the bucket (it decrypts): a new node keeps {here} of 10 files and reports the other, whose SHA-256 is not the one recorded");
+    assert_eq!(here, 9); drop(t);
+
+    for p in ["e63", "e63-cloud", "e63-visible", "e63-tamper"] { clear_prefix(&backup_in(p, false).cloud()); } let _ = std::fs::remove_dir_all(ROOT);
     if let Some(c) = s3.as_mut() { c.kill().ok(); }
 }

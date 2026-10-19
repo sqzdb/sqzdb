@@ -280,7 +280,8 @@ pub fn clear_prefix(cfg: &CloudConfig) -> usize {
     for k in keys { if rt.block_on(store.delete(&k)).is_ok() { n += 1; } } n
 }
 /// Rebuild a database directory from the bucket: the latest snapshot plus every chunk after it, in order, and the
-/// uploaded files. Returns (snapshot s0, chunks downloaded, bytes). The caller opens it with `Sql::open` / `recover_upto`.
+/// uploaded files (not checked against the database's records: `backup.bootstrap` does that). Returns (snapshot s0,
+/// chunks downloaded, bytes). The caller opens it with `Sql::open` / `recover_upto`.
 pub fn download(cfg: &CloudConfig, dest: &Path) -> Result<(u64, usize, u64), String> {
     let (s0, n, bytes) = download_log(cfg, dest)?; let (_, fb) = download_files(cfg, dest)?;
     Ok((s0, n, bytes + fb))
@@ -351,9 +352,11 @@ impl Write for Pack {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { match self { Pack::Plain(s) => s.write(b), Pack::Z(z) => z.write(b) } }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
-/// `unpack` as a stream: an object's bytes in as they arrive, the file's bytes out.
+/// `unpack` as a stream: an object's bytes in as they arrive, the file's bytes out, hashed.
 struct Unseal { cipher: Option<aes_gcm::Aes256Gcm>, buf: Vec<u8>, magic: bool, out: Unpack }
-enum Unpack { Plain(File), Z(zstd::stream::zio::Writer<File, zstd::stream::raw::Decoder<'static>>) }
+enum Unpack { Plain(Hashed), Z(zstd::stream::zio::Writer<Hashed, zstd::stream::raw::Decoder<'static>>) }
+/// The file being written, and the SHA-256 of what was written.
+struct Hashed { f: File, h: sha2::Sha256 }
 impl Unseal {
     fn push(&mut self, b: &[u8]) -> Result<(), String> {
         let Some(c) = &self.cipher else { return self.out.write_all(b).map_err(|e| e.to_string()) };
@@ -362,25 +365,30 @@ impl Unseal {
         let mut p = 0; while let Some((pt, n)) = open_frame(c, &self.buf[p..])? { self.out.write_all(&pt).map_err(|e| e.to_string())?; p += n; }
         self.buf.drain(..p); Ok(())
     }
-    /// The end of the object: it must not stop inside a frame, encrypted or compressed.
-    fn finish(self) -> Result<(), String> {
+    /// The end of the object (it must not stop inside a frame, encrypted or compressed): the SHA-256 of the file.
+    fn finish(self) -> Result<[u8; 32], String> {
+        use sha2::Digest;
         if self.cipher.is_some() && (!self.magic || !self.buf.is_empty()) { return Err("truncated encrypted object".into()); }
-        if let Unpack::Z(mut z) = self.out { z.finish().map_err(|e| format!("object failed to decompress: {e}"))?; }
-        Ok(())
+        let hashed = match self.out { Unpack::Plain(h) => h, Unpack::Z(mut z) => { z.finish().map_err(|e| format!("object failed to decompress: {e}"))?; z.into_inner().0 } };
+        Ok(hashed.h.finalize().into())
     }
 }
 impl Write for Unpack {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { match self { Unpack::Plain(f) => f.write(b), Unpack::Z(z) => z.write(b) } }
     fn flush(&mut self) -> std::io::Result<()> { match self { Unpack::Plain(f) => f.flush(), Unpack::Z(z) => z.flush() } }
 }
-/// Upload the file at `path` as file `id`, giving up between parts once `stop` is set. Returns the bytes sent.
-pub async fn put_file(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, path: &Path, stop: &AtomicBool) -> Result<u64, String> {
+impl Write for Hashed {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { let n = self.f.write(b)?; sha2::Digest::update(&mut self.h, &b[..n]); Ok(n) }
+    fn flush(&mut self) -> std::io::Result<()> { self.f.flush() }
+}
+/// Upload the file at `path` as file `id`. Returns the bytes sent.
+pub async fn put_file(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, path: &Path) -> Result<u64, String> {
     let mut upload = None;
-    let r = put_file_parts(store, cfg, id, path, stop, &mut upload).await;
+    let r = put_file_parts(store, cfg, id, path, &mut upload).await;
     if r.is_err() { if let Some(mut u) = upload { let _ = u.abort().await; } }
     r
 }
-async fn put_file_parts(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, path: &Path, stop: &AtomicBool, upload: &mut Option<Box<dyn object_store::MultipartUpload>>) -> Result<u64, String> {
+async fn put_file_parts(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, path: &Path, upload: &mut Option<Box<dyn object_store::MultipartUpload>>) -> Result<u64, String> {
     let err = |e: std::io::Error| format!("{}: {e}", path.display()); let up = |e: object_store::Error| format!("uploading a file: {e}");
     let mut f = File::open(path).map_err(err)?; let mut buf = vec![0u8; 1 << 20]; let mut n = f.read(&mut buf).map_err(err)?;
     let z = cfg.compress && n > 0 && zstd::bulk::compress(&buf[..n], 3).is_ok_and(|c| c.len() * 10 < n * 9);
@@ -390,7 +398,6 @@ async fn put_file_parts(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, pa
     while n > 0 {
         pack.write_all(&buf[..n]).map_err(err)?;
         while pack.sink().out.len() >= PART {
-            if stop.load(Ordering::Relaxed) { return Err("stopping".into()); }
             let rest = pack.sink().out.split_off(PART); let part = std::mem::replace(&mut pack.sink().out, rest);
             if upload.is_none() { *upload = Some(store.put_multipart(&key).await.map_err(up)?); }
             upload.as_mut().unwrap().put_part(PutPayload::from(part)).await.map_err(up)?; sent += PART as u64;
@@ -404,26 +411,38 @@ async fn put_file_parts(store: &dyn ObjectStore, cfg: &CloudConfig, id: &str, pa
     }
     Ok(sent)
 }
-/// Download the file object `key` (as listed under `files/`) to `dest`, by way of `dest.part`. Returns the bytes received.
-pub async fn get_file(store: &dyn ObjectStore, cfg: &CloudConfig, key: &OPath, dest: &Path) -> Result<u64, String> {
+/// Why a file could not be fetched: the bucket or this disk (worth trying again), or the object itself (unreadable with
+/// this key, damaged, altered, or not the file that was recorded: fetching it again won't help).
+#[derive(Debug)] pub enum FetchError { Retry(String), Refused(String) }
+impl std::fmt::Display for FetchError { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { match self { FetchError::Retry(e) | FetchError::Refused(e) => f.write_str(e) } } }
+/// Download the file object `key` (as listed under `files/`) to `dest`, by way of `dest.part`. With `expect`, the file
+/// must have that SHA-256 (the one recorded when it was uploaded): that is what tells a cut, reordered or swapped object
+/// from the file. Returns the bytes received.
+pub async fn get_file(store: &dyn ObjectStore, cfg: &CloudConfig, key: &OPath, dest: &Path, expect: Option<&[u8; 32]>) -> Result<u64, FetchError> {
     let part = dest.with_extension("part");
-    let r = get_file_to(store, cfg, key, &part).await.map_err(|e| format!("{}: {e}", key.as_ref()))
-        .and_then(|n| fs::rename(&part, dest).map(|()| n).map_err(|e| format!("{}: {e}", dest.display())));
+    let r = match get_file_to(store, cfg, key, &part, expect).await {
+        Ok(n) => fs::rename(&part, dest).map(|()| n).map_err(|e| FetchError::Retry(format!("{}: {e}", dest.display()))),
+        Err(FetchError::Retry(e)) => Err(FetchError::Retry(format!("{}: {e}", key.as_ref()))),
+        Err(FetchError::Refused(e)) => Err(FetchError::Refused(format!("{}: {e}", key.as_ref()))),
+    };
     if r.is_err() { let _ = fs::remove_file(&part); }
     r
 }
-async fn get_file_to(store: &dyn ObjectStore, cfg: &CloudConfig, key: &OPath, path: &Path) -> Result<u64, String> {
-    use aes_gcm::aead::KeyInit; use futures_util::StreamExt;
-    let (_, z, e) = parse_file_key(key.as_ref()).ok_or("not a file's object")?;
-    if e && cfg.key.is_none() { return Err("object is encrypted and no key was given".into()); }
-    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+async fn get_file_to(store: &dyn ObjectStore, cfg: &CloudConfig, key: &OPath, path: &Path, expect: Option<&[u8; 32]>) -> Result<u64, FetchError> {
+    use aes_gcm::aead::KeyInit; use futures_util::StreamExt; use FetchError::{Refused, Retry};
+    let (_, z, e) = parse_file_key(key.as_ref()).ok_or_else(|| Refused("not a file's object".into()))?;
+    if e && cfg.key.is_none() { return Err(Refused("object is encrypted and no key was given".into())); }
+    // with a passphrase, this backup encrypts every file: an object that isn't encrypted was put there by someone else
+    if !e && cfg.key.is_some() { return Err(Refused("object is not encrypted, though the backup has a passphrase".into())); }
+    let err = |e: std::io::Error| Retry(format!("{}: {e}", path.display()));
     if let Some(d) = path.parent() { fs::create_dir_all(d).map_err(err)?; }
-    let f = File::create(path).map_err(err)?;
+    let f = Hashed { f: File::create(path).map_err(err)?, h: Default::default() };
     let out = if z { Unpack::Z(zstd::stream::zio::Writer::new(f, zstd::stream::raw::Decoder::new().map_err(err)?)) } else { Unpack::Plain(f) };
     let mut un = Unseal { cipher: if e { cfg.key.as_ref().map(|k| aes_gcm::Aes256Gcm::new(k.into())) } else { None }, buf: vec![], magic: false, out };
-    let mut s = store.get(key).await.map_err(|e| e.to_string())?.into_stream(); let mut n = 0u64;
-    while let Some(b) = s.next().await { let b = b.map_err(|e| e.to_string())?; n += b.len() as u64; un.push(&b)?; }
-    un.finish()?;
+    let mut s = store.get(key).await.map_err(|e| Retry(e.to_string()))?.into_stream(); let mut n = 0u64;
+    while let Some(b) = s.next().await { let b = b.map_err(|e| Retry(e.to_string()))?; n += b.len() as u64; un.push(&b).map_err(Refused)?; }
+    let sha = un.finish().map_err(Refused)?;
+    if expect.is_some_and(|x| *x != sha) { return Err(Refused("not the file that was uploaded under this id (its SHA-256 differs)".into())); }
     Ok(n)
 }
 /// Delete a file's object, compressed or not; one that is not there is no error.
@@ -438,13 +457,14 @@ pub async fn delete_object(store: &dyn ObjectStore, key: &OPath) -> Result<(), S
 pub async fn list_files(store: &dyn ObjectStore, cfg: &CloudConfig) -> Result<Vec<(String, OPath)>, String> {
     Ok(futures_lite_shim::try_list_sized(store, &cfg.key("files")).await?.into_iter().filter_map(|(k, _)| parse_file_key(k.as_ref()).map(|(id, ..)| (id, k))).collect())
 }
-/// Download every file in the bucket into `dest`'s `files/`, 16 at a time. Returns (files, bytes).
+/// Download every file in the bucket into `dest`'s `files/`, 16 at a time. Returns (files, bytes). Nothing here knows
+/// what each file should be: `bootstrap` checks them against the database's records once it is open.
 pub fn download_files(cfg: &CloudConfig, dest: &Path) -> Result<(usize, u64), String> {
     use futures_util::StreamExt;
     let rt = rt(); let store = cfg.store();
     rt.block_on(async {
         let files = list_files(&*store, cfg).await?;
-        let got: Vec<Result<u64, String>> = futures_util::stream::iter(&files).map(|(id, k)| { let (store, to) = (&*store, crate::files::file_path_in(dest, id)); async move { get_file(store, cfg, k, &to).await } }).buffer_unordered(16).collect().await;
+        let got: Vec<Result<u64, String>> = futures_util::stream::iter(&files).map(|(id, k)| { let (store, to) = (&*store, crate::files::file_path_in(dest, id)); async move { get_file(store, cfg, k, &to, None).await.map_err(|e| e.to_string()) } }).buffer_unordered(16).collect().await;
         let mut bytes = 0; for r in got { bytes += r?; }
         Ok((files.len(), bytes))
     })
@@ -499,13 +519,13 @@ mod file_tests {
     const ID: &str = "0123abcd-89ab-4def-8123-456789abcdef";
 
     #[test] fn files_go_up_and_come_back_streamed() {
-        let d = tmp("roundtrip"); let rt = rt(); let stop = AtomicBool::new(false);
+        let d = tmp("roundtrip"); let rt = rt();
         let text: Vec<u8> = (0..300_000).flat_map(|i: u32| format!("line {i} of a note that compresses well\n").into_bytes()).take(3 << 20).collect();
         // empty, small text, a photo-like 20 MB (multipart, past an encryption frame), text past a part
         for (name, data) in [("empty", vec![]), ("small", b"hello".to_vec()), ("photo", noise(20 << 20)), ("text", text)] {
             for pass in [None, Some("pw")] {
                 let (store, c) = (InMemory::new(), cfg(pass)); let src = d.join(name); fs::write(&src, &data).unwrap();
-                let sent = rt.block_on(put_file(&store, &c, ID, &src, &stop)).unwrap();
+                let sent = rt.block_on(put_file(&store, &c, ID, &src)).unwrap();
                 let listed = rt.block_on(list_files(&store, &c)).unwrap(); assert_eq!(listed.len(), 1, "{name}");
                 let (id, key) = &listed[0]; assert_eq!(id, ID);
                 let (z, e) = flags(key.as_ref());
@@ -513,8 +533,8 @@ mod file_tests {
                 let obj = rt.block_on(async { store.get(key).await.unwrap().bytes().await.unwrap() });
                 assert_eq!(obj.len() as u64, sent);
                 assert_eq!(unpack(&obj, z, e, &c).unwrap(), data, "{name}: the format `unpack` reads");
-                let back = d.join("back").join(name);
-                assert_eq!(rt.block_on(get_file(&store, &c, key, &back)).unwrap(), sent);
+                let back = d.join("back").join(name); let sha: [u8; 32] = { use sha2::Digest; sha2::Sha256::digest(&data).into() };
+                assert_eq!(rt.block_on(get_file(&store, &c, key, &back, Some(&sha))).unwrap(), sent);
                 assert!(fs::read(&back).unwrap() == data, "{name} {pass:?}"); assert!(!back.with_extension("part").exists());
                 rt.block_on(delete_file(&store, &c, ID)).unwrap(); assert!(rt.block_on(list_files(&store, &c)).unwrap().is_empty());
                 rt.block_on(delete_file(&store, &c, ID)).unwrap();   // gone already: no error
@@ -522,21 +542,45 @@ mod file_tests {
         }
     }
     #[test] fn a_damaged_file_object_is_refused() {
-        let d = tmp("damaged"); let rt = rt(); let stop = AtomicBool::new(false); let src = d.join("f");
+        let d = tmp("damaged"); let rt = rt(); let src = d.join("f");
         let text: Vec<u8> = (0..100_000).flat_map(|i: u32| format!("row {i}\n").into_bytes()).collect(); fs::write(&src, &text).unwrap();
         for pass in [None, Some("pw")] {
-            let (store, c) = (InMemory::new(), cfg(pass)); rt.block_on(put_file(&store, &c, ID, &src, &stop)).unwrap();
+            let (store, c) = (InMemory::new(), cfg(pass)); rt.block_on(put_file(&store, &c, ID, &src)).unwrap();
             let (_, key) = rt.block_on(list_files(&store, &c)).unwrap().remove(0);
             let obj = rt.block_on(async { store.get(&key).await.unwrap().bytes().await.unwrap() });
             let dest = d.join("out");
             // cut short, or one bit changed
             for bad in [obj[..obj.len() - 7].to_vec(), { let mut b = obj.to_vec(); let i = b.len() / 2; b[i] ^= 1; b }] {
                 rt.block_on(store.put(&key, PutPayload::from(bad))).unwrap();
-                assert!(rt.block_on(get_file(&store, &c, &key, &dest)).is_err(), "{pass:?}");
+                assert!(matches!(rt.block_on(get_file(&store, &c, &key, &dest, None)), Err(FetchError::Refused(_))), "{pass:?}");
                 assert!(!dest.exists() && !dest.with_extension("part").exists());
             }
-            if pass.is_some() { rt.block_on(store.put(&key, PutPayload::from(obj.clone()))).unwrap(); assert!(rt.block_on(get_file(&store, &cfg(Some("other")), &key, &dest)).unwrap_err().contains("authentication")); }
+            if pass.is_some() { rt.block_on(store.put(&key, PutPayload::from(obj.clone()))).unwrap(); assert!(rt.block_on(get_file(&store, &cfg(Some("other")), &key, &dest, None)).unwrap_err().to_string().contains("authentication")); }
         }
+    }
+    #[test] fn someone_with_the_bucket_cannot_pass_off_a_file() {
+        // they can't encrypt, but they can move objects, cut them, and put up plain ones
+        let d = tmp("forged"); let rt = rt(); let (store, c) = (InMemory::new(), cfg(Some("pw")));
+        let (a, b) = ("0123abcd-89ab-4def-8123-00000000000a", "0123abcd-89ab-4def-8123-00000000000b");
+        let (da, db) = (noise(3 << 20), b"the real b".to_vec()); let sha = |x: &[u8]| -> [u8; 32] { use sha2::Digest; sha2::Sha256::digest(x).into() };
+        for (id, data) in [(a, &da), (b, &db)] { fs::write(d.join(id), data).unwrap(); rt.block_on(put_file(&store, &c, id, &d.join(id))).unwrap(); }
+        let get = |k: &OPath, id: &str, want: &[u8]| rt.block_on(get_file(&store, &c, k, &d.join("out").join(id), Some(&sha(want))));
+        let obj = |id: &str| rt.block_on(async { store.get(&file_key(id, false, &c)).await.unwrap().bytes().await.unwrap() });
+        let (oa, ob) = (obj(a), obj(b));
+        // a's object as b's: it decrypts, and is not b
+        rt.block_on(store.put(&file_key(b, false, &c), PutPayload::from(oa.clone()))).unwrap();
+        assert!(matches!(get(&file_key(b, false, &c), b, &db), Err(FetchError::Refused(e)) if e.contains("SHA-256")));
+        // a's object without its last frames (a frame is 1 MB): every frame left decrypts
+        let first = 4 + 16 + u32::from_le_bytes(oa[4..8].try_into().unwrap()) as usize + 16;
+        rt.block_on(store.put(&file_key(a, false, &c), PutPayload::from(oa.slice(..first)))).unwrap();
+        assert!(matches!(get(&file_key(a, false, &c), a, &da), Err(FetchError::Refused(_))));
+        // a plain object where an encrypted one would be, even with the right bytes
+        rt.block_on(store.put(&file_key(b, false, &cfg(None)), PutPayload::from(db.clone()))).unwrap();
+        assert!(matches!(get(&file_key(b, false, &cfg(None)), b, &db), Err(FetchError::Refused(e)) if e.contains("not encrypted")));
+        assert!(!d.join("out").join(a).exists() && !d.join("out").join(b).exists(), "nothing refused is left behind");
+        // and the real ones still come back
+        rt.block_on(store.put(&file_key(b, false, &c), PutPayload::from(ob))).unwrap(); get(&file_key(b, false, &c), b, &db).unwrap();
+        assert_eq!(fs::read(d.join("out").join(b)).unwrap(), db);
     }
 }
 

@@ -130,7 +130,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQWEEZDB_VERSION=v0.8.0` | Install a specific release instead of the latest. |
+| `SQWEEZDB_VERSION=v0.8.1` | Install a specific release instead of the latest. |
 | `SQWEEZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQWEEZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -733,8 +733,10 @@ Everything is built on the change log, so backups never pause the database.
   photos, video or archives, which already are), encrypted, and streamed, so a large file is never held
   in memory whole. A file deleted here is deleted there. When the database opens, it checks the bucket
   against its files. It uploads what is missing there, fetches back what is missing here, and deletes
-  objects of files it no longer has. With `durable: 'cloud'`, an upload returns once its file is in the
-  bucket. On a local S3 server, a 100 KB file was in the bucket 0.8 ms after its upload (E63).
+  objects of files it no longer has. A file fetched from the bucket must have the SHA-256 recorded when
+  it was uploaded, so one altered or swapped in the bucket is refused and reported, not restored. With
+  `durable: 'cloud'`, an upload returns once its file is in the bucket. On a local S3 server, a 100 KB
+  file was in the bucket 0.8 ms after its upload (E63).
 - **Bootstrap.** With `backup.bootstrap: true`, opening an empty directory restores the latest state
   from the bucket first, files included; a 1M-row bucket was restored and answering queries in 0.28 s.
 - **Followers.** The `follow` option opens a read-only replica of another directory on the same host,
@@ -1039,7 +1041,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.8.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.8.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

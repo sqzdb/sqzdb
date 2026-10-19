@@ -1,12 +1,16 @@
 === E63: uploaded files in the backup bucket ===
 (a) a 2 MB photo is stored as files/<id>.enc (2.10 MB: not compressed again, encrypted)
     a 2.7 MB log file as files/<id>.zst.enc (0.04 MB: compressed, then encrypted)
-(b) one 100 KB upload until its file is in the bucket: p50 0.8 ms, p99 1.1 ms
-    1,000 files of 10 KB, uploaded as fast as they come: written in 29 ms, all in the bucket after 113 ms (8845 files/s)
-    one 50 MB video: uploaded and in the bucket after 0.34 s; the process's peak memory grew 6 MB meanwhile (it goes up in 8 MB parts)
+(b) one 100 KB upload until its file is in the bucket: p50 0.8 ms, p99 1.0 ms
+    1,000 files of 10 KB, uploaded as fast as they come: written in 36 ms, all in the bucket after 104 ms (9611 files/s)
+    one 50 MB video: uploaded and in the bucket after 0.26 s; the process's peak memory grew 6 MB meanwhile (it goes up in 8 MB parts)
 sqweezdb: bootstrapped data/nocow/e63/node from the bucket (2 log objects, 1203 files, 85.4 MB)
-(c) a new node with an empty directory and bootstrap = true: open in 0.13 s with 2 notes and 1203 of 1203 files, byte for byte the same: true
+(c) a new node with an empty directory and bootstrap = true: open in 0.20 s with 2 notes and 1203 of 1203 files, byte for byte the same: true
     it then finds the bucket in agreement: 0 uploaded, 0 fetched, 0 deleted
 (d) the sweep deletes 1202 files no row refers to (85 MB); the bucket deletes them too: 1 files left there, the photo gone: true
 (e) restarted without one of its files, and with an object of a file it never had in the bucket: fetched back 1, deleted 1; the file reads the same: true
 (f) a 100 KB upload returns after 0.07 ms (p50) by default, 0.9 ms with durable = "cloud", where every file is in the bucket by then (100 of 100)
+sqweezdb: bootstrapped data/nocow/e63/tampered from the bucket (1 log objects, 10 files, 0.1 MB)
+files: 0985a47a-7e11-4659-b3b4-f689725b1d11 from the bucket is not a file this database recorded; removed
+files: 0985a47a-7e11-4659-b3b4-f689725b1d11 was not fetched back: e63-tamper/files/0985a47a-7e11-4659-b3b4-f689725b1d11.enc: not the file that was uploaded under this id (its SHA-256 differs)
+(g) one object copied over another's in the bucket (it decrypts): a new node keeps 9 of 10 files and reports the other, whose SHA-256 is not the one recorded

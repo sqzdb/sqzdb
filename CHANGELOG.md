@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.1 — 2026-10-18
+
+### Fixed
+- **A file altered in the backup bucket could be restored as the real one.** Someone with write access to
+  the bucket, without the passphrase, could move one file's object over another's, cut off its end, or put
+  up an unencrypted object in its place. A bootstrap would then restore that as the file. Every file fetched
+  from the bucket is now checked against the SHA-256 recorded when it was uploaded. One that differs is
+  refused and reported, and the other files are restored. With a passphrase set, an unencrypted file object
+  is refused, and replaced by an encrypted copy when the database still has the file.
+- **Closing the database dropped file uploads still waiting.** Files uploaded just before a shutdown
+  reached the bucket only at the next start. Closing now finishes them first, as it does for the log,
+  unless the bucket fails.
+
 ## 0.8.0 — 2026-10-18
 
 ### Added
