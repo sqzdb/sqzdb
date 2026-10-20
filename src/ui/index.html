@@ -1371,7 +1371,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
       ['app.mcp.sql', 'SQL tools', 'bool', '', 'describe, query and execute, besides the functions'],
       ['app.mcp.tokenTtl', 'Access token lasts', 'text', '1h', ''],
       ['app.mcp.grantTtl', 'Unused sign-in lapses after', 'text', '30d', ''] ] },
-    { id: 'backup', title: 'Backup', toggle: 'backup', lead: 'Continuous, to any S3-compatible bucket. ${VAR} takes a value from the environment.', fields: [
+    { id: 'backup', title: 'Backup', toggle: 'backup', lead: 'Continuous, to any S3-compatible bucket. A ${VAR} already in the file takes its value from the server\u2019s environment (new ones are added in the file on the server).', fields: [
       ['backup.endpoint', 'Endpoint', 'text', 'https://s3.us-east-1.amazonaws.com', ''],
       ['backup.bucket', 'Bucket', 'text', '', ''],
       ['backup.prefix', 'Prefix', 'text', 'the database’s name', ''],

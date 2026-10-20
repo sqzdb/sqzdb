@@ -19,8 +19,9 @@
 
   A save is checked as the server would start with it, and keeps the file's comments. Secrets show only as set
   or not, in the form and in the file's text, where saving keeps them as they were. Changing where a secret is
-  sent (an endpoint or a URL) needs it typed again. An error never shows a secret or a value a `${VAR}` brought in
-  from the environment, and a file that doesn't parse isn't shown. **Restart now** applies the settings in place (same process, same console token). It is refused while
+  sent (an endpoint or a URL) needs it typed again as a value, and a save can't add a `${VAR}` reference: those
+  are added in the file on the server. Errors name the key and the line, never a value, and a file that doesn't
+  parse isn't shown. **Restart now** applies the settings in place (same process, same console token). It is refused while
   the file would keep the server from starting.
 - **`sqzdb serve` without `--config` uses `<dir>/sqzdb.toml`,** the file the Settings tab writes, with mode 600.
   It must belong to the user sqzdb runs as and be writable by no one else, or the server won't start. It is read

@@ -1180,8 +1180,9 @@ sign-up tables, origins, HTTPS, sign-in and providers, agents over MCP, backup a
 the whole file can be edited as text for anything else. Secrets show as set or not, never their values, and a
 save that changes where one is sent (its table's endpoint or a URL) needs it typed again. A save is checked as
 the server would start with it, then written with comments and the rest of the file kept. A `${VAR}` reference
-reads the server's environment when it starts, so the console's token is as powerful as that environment: keep
-it as secret.
+reads the server's environment, so references are added in the file on the server, never from the console, and a
+secret that comes from one doesn't follow a new address from here either. Errors name the key and the line,
+never a value.
 Settings apply when the server restarts: **Restart now** does that in place (same process, same console token),
 and is refused while the file would keep the server from starting. Its **Backup** tab
 shows whether uploads are healthy, how far the bucket is behind, the last error and a connection test;

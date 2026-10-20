@@ -42,19 +42,47 @@ fn unparsable(text: &str) -> Option<String> {
     let line = e.split("line ").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).filter(|l| !l.is_empty()).unwrap_or("?").to_string();
     Some(format!("the settings file doesn't parse (line {line}): fix it on the server, or replace it whole with the file's text here"))
 }
+/// The environment variables a text refers to (`${NAME}`).
+fn references(text: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new(); let mut rest = text;
+    while let Some(i) = rest.find("${") { let after = &rest[i + 2..]; let Some(j) = after.find('}') else { break }; out.insert(after[..j].to_string()); rest = &after[j + 1..]; }
+    out
+}
+/// A save that adds a `${NAME}` reference the file didn't have: refused. A reference reads the server's environment,
+/// and the console's token mustn't reach what only the server's shell can (add it in the file on the server).
+fn new_reference(current: &str, new: &str) -> Option<String> {
+    let had = references(current);
+    references(new).into_iter().find(|n| !had.contains(n)).map(|n| format!("${{{n}}}: a reference to the server's environment is added in the file on the server, not here"))
+}
+/// A configuration error as the console shows it: where and what, without the values the parser or the checks quote
+/// (one could be a secret, in whatever escaped form they print it) and without the parser's view of the source.
+fn plain_error(e: &str) -> String {
+    let unquote = |s: &str| { let mut out = String::new(); let mut q: Option<char> = None; for c in s.chars() { match q { Some(x) if c == x => { q = None; out.push('…'); } Some(_) => {} None if c == '"' || c == '`' || c == '\'' => q = Some(c), None => out.push(c) } } if q.is_some() { out.push('…'); } out };
+    match e.split_once("TOML parse error at ") {
+        Some((before, rest)) => {
+            let at = rest.lines().next().unwrap_or("").trim();
+            let why = rest.lines().rev().map(str::trim).find(|l| !l.is_empty() && !l.contains('|') && !l.starts_with('^')).unwrap_or("");
+            format!("{}the settings don't parse at {at}: {}", unquote(before), unquote(why))
+        }
+        None => unquote(e),
+    }
+}
 /// An error with every secret value these texts hold put out of sight.
 fn redact(err: &str, texts: &[&str]) -> String {
     let mut out = err.to_string();
     for t in texts { if let Ok(mut doc) = t.parse::<toml_edit::DocumentMut>() { secrets_in(&mut doc, |_, v| if let Some(x) = v.as_str().filter(|x| x.len() >= 3) { out = out.replace(x, "(hidden)"); }); } }
     out
 }
-/// A save that keeps a secret written in the file but changes where it is sent (its table's endpoint, issuer, kind
-/// or a …Url): refused, unless that secret is given again in the same save. Else whoever holds the console could
+/// A save that keeps a secret that is sent away (an S3 secret key, a provider's client secret, an API key), written in
+/// the file or a `${VAR}`, but changes where it is sent (its table's endpoint, issuer, kind or a …Url): refused,
+/// unless that secret is given again as a value in the same save. Else whoever holds the console could
 /// send the server's secrets to an address of theirs without ever seeing them.
 fn redirected(current: &str, new: &str) -> Option<String> {
     let (Ok(mut cur), Ok(mut next)) = (current.parse::<toml_edit::DocumentMut>(), new.parse::<toml_edit::DocumentMut>()) else { return None };
-    let mut had = std::collections::HashMap::new(); secrets_in(&mut cur, |k, v| { had.insert(k.to_string(), v.as_str().unwrap_or("").to_string()); });
-    let mut kept = vec![]; secrets_in(&mut next, |k, v| if had.get(k).map(String::as_str) == v.as_str() { kept.push(k.to_string()); });
+    let mut had = std::collections::HashMap::new(); secrets_with(&mut cur, true, |k, v| { had.insert(k.to_string(), v.as_str().unwrap_or("").to_string()); });
+    // (the secrets that go to the address: a passphrase or a token never leaves this machine)
+    let sent = |k: &str| { let n: String = k.rsplit('.').next().unwrap_or(k).chars().filter(|c| *c != '_').flat_map(char::to_lowercase).collect(); matches!(n.as_str(), "secretkey" | "clientsecret" | "apikey") };
+    let mut kept = vec![]; secrets_with(&mut next, true, |k, v| if sent(k) && had.get(k).map(String::as_str) == v.as_str() { kept.push(k.to_string()); });
     let addresses = |doc: &toml_edit::DocumentMut, at: &str| -> Vec<(String, String)> {
         let mut t: Option<&dyn toml_edit::TableLike> = Some(doc.as_table());
         for seg in at.split('.').filter(|s| !s.is_empty()) { t = t.and_then(|x| x.get(seg)).and_then(|i| i.as_table_like()); }
@@ -63,25 +91,27 @@ fn redirected(current: &str, new: &str) -> Option<String> {
     };
     kept.into_iter().find_map(|k| {
         let at = k.rsplit_once('.').map(|x| x.0).unwrap_or("");
-        (addresses(&cur, at) != addresses(&next, at)).then(|| format!("{k}: where {at} sends it changed, so give {k} again in the same save (a hidden value doesn't go to a new address)"))
+        (addresses(&cur, at) != addresses(&next, at)).then(|| format!("{k}: where {at} sends it changed, so give {k} again as a value in the same save (a hidden value, or one from the environment, doesn't go to a new address from here; or change the address in the file on the server)"))
     })
 }
 /// Secrets in JSON (the command line's options): masked, a `${VAR}` reference shown as it is.
 fn mask_json(v: &mut J) { if let J::Object(m) = v { for (k, x) in m.iter_mut() { if is_secret(k) { if let J::String(s) = x { if !s.trim_start().starts_with("${") { *x = json!(HIDDEN); } } } else { mask_json(x); } } } }
 /// Every secret in a file's text (outside `${VAR}` references), each with its dotted key: to mask, and to restore.
-fn secrets_in(doc: &mut toml_edit::DocumentMut, mut each: impl FnMut(&str, &mut toml_edit::Value)) {
-    fn walk(t: &mut dyn toml_edit::TableLike, at: &str, each: &mut dyn FnMut(&str, &mut toml_edit::Value)) {
+fn secrets_in(doc: &mut toml_edit::DocumentMut, each: impl FnMut(&str, &mut toml_edit::Value)) { secrets_with(doc, false, each) }
+/// The same, `refs`: with the secrets that are `${VAR}` references too.
+fn secrets_with(doc: &mut toml_edit::DocumentMut, refs: bool, mut each: impl FnMut(&str, &mut toml_edit::Value)) {
+    fn walk(t: &mut dyn toml_edit::TableLike, at: &str, refs: bool, each: &mut dyn FnMut(&str, &mut toml_edit::Value)) {
         for (k, item) in t.iter_mut() {
             let here = if at.is_empty() { k.get().to_string() } else { format!("{at}.{}", k.get()) };
             match item {
-                toml_edit::Item::Table(t) => walk(t, &here, each),
-                toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => walk(t, &here, each),
-                toml_edit::Item::Value(v) if is_secret(k.get()) && v.as_str().is_some_and(|s| !s.trim_start().starts_with("${")) => each(&here, v),
+                toml_edit::Item::Table(t) => walk(t, &here, refs, each),
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => walk(t, &here, refs, each),
+                toml_edit::Item::Value(v) if is_secret(k.get()) && v.as_str().is_some_and(|s| refs || !s.trim_start().starts_with("${")) => each(&here, v),
                 _ => {}
             }
         }
     }
-    walk(doc.as_table_mut(), "", &mut each);
+    walk(doc.as_table_mut(), "", refs, &mut each);
 }
 /// The file's text as the console shows it: secrets replaced by HIDDEN (comments and the rest as they are). A text
 /// that doesn't parse isn't shown at all: no masking of a text that isn't understood is sure to catch every secret.
@@ -297,8 +327,8 @@ fn api_save_settings(body: &[u8]) -> (u16, J) {
         (None, Some(set)) => match patch_toml(&current, set) { Ok(t) => t, Err(e) => return (400, json!({"error": e, "code": "CONFIG"})) },
         _ => return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})),
     };
-    if let Some(e) = redirected(&current, &text) { return (400, json!({"error": e, "code": "CONFIG"})); }
-    if let Err(e) = crate::config::Config::check(&text, Some(&sv.flags.to_string())) { return (400, json!({"error": redact(&crate::config::scrub(&e, &text), &[&current, &text]), "code": "CONFIG"})); }
+    if let Some(e) = new_reference(&current, &text).or_else(|| redirected(&current, &text)) { return (400, json!({"error": e, "code": "CONFIG"})); }
+    if let Err(e) = crate::config::Config::check(&text, Some(&sv.flags.to_string())) { return (400, json!({"error": plain_error(&redact(&crate::config::scrub(&e, &text), &[&current, &text])), "code": "CONFIG"})); }
     if text == current { return (200, json!({"saved": false, "text": masked_text(&text)})); }
     if sv.path.exists() { if let Err(e) = crate::config::private_file(&sv.path) { return (409, json!({"error": e, "code": "CONFIG"})); } }
     if let Err(e) = write_private(&sv.path, text.as_bytes()) { return (500, json!({"error": format!("{}: {e}", sv.path.display()), "code": "ERROR"})); }
@@ -313,7 +343,7 @@ fn restart_check() -> Result<(), (u16, String)> {
     crate::config::private_file(&sv.path).map_err(|e| (409, e))?;
     let text = std::fs::read_to_string(&sv.path).map_err(|e| (409, format!("{}: {e}", sv.path.display())))?;
     if let Some(e) = unparsable(&text) { return Err((400, e)); }
-    crate::config::Config::check(&text, Some(&sv.flags.to_string())).map(|_| ()).map_err(|e| (400, format!("{}: {}", sv.path.display(), redact(&crate::config::scrub(&e, &text), &[&text]))))
+    crate::config::Config::check(&text, Some(&sv.flags.to_string())).map(|_| ()).map_err(|e| (400, format!("{}: {}", sv.path.display(), plain_error(&redact(&crate::config::scrub(&e, &text), &[&text])))))
 }
 /// Change keys of a TOML file's text in place (comments, order and the rest untouched): a dotted key to a value,
 /// a table (an object), or nothing (null).
@@ -481,6 +511,16 @@ mod tests {
         let commented = shown.replace("# keys", "# the keys");
         assert_eq!(redirected(file, &unmasked_text(&commented, file).unwrap()), None, "no address changed");
         assert_eq!(redact("bad value s3cr3t-value near g-secret", &[file]), "bad value (hidden) near (hidden)");
+        // the environment: no new references from here, and one already there doesn't follow a new address either
+        assert!(new_reference(file, &format!("{file}[app]\npublicUrl = \"https://x/${{HOME}}\"\n")).unwrap().starts_with("${HOME}: a reference to the server's environment"));
+        assert_eq!(new_reference(file, &file.replace("# keys", "# the keys")), None, "the reference to DB_PASS was there");
+        let env_key = "[embed]\nurl = \"https://api.example/v1\"\nmodel = \"m\"\napiKey = \"${OPENAI_KEY}\"\n";
+        assert!(redirected(env_key, &env_key.replace("api.example", "evil.example")).unwrap().contains("embed.apiKey"));
+        assert_eq!(redirected(env_key, &env_key.replace("api.example", "evil.example").replace("${OPENAI_KEY}", "sk-typed-again")), None);
+        // errors say where and what, never the values they'd quote
+        let e = crate::config::Config::check("[backup]\nendpoint = 5\n", None).unwrap_err();
+        let p = plain_error(&e); assert!(p.starts_with("the settings don't parse at line 2") && !p.contains('5') && !p.contains('|'), "{e}\n→ {p}");
+        assert_eq!(plain_error("functions.timeout: not a number: \"s3cr3t\""), "functions.timeout: not a number: …");
         let mut flags = json!({"listen": {"token": "t0k3n", "http": "127.0.0.1:1"}}); mask_json(&mut flags);
         assert_eq!(flags, json!({"listen": {"token": HIDDEN, "http": "127.0.0.1:1"}}));
         // an error about a value from the environment names the reference, not the value
