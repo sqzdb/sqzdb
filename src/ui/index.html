@@ -1417,6 +1417,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     for (const el of $('stgrid').querySelectorAll('[data-key], [data-toggle]')) el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', stDirty);
     for (const el of $('stgrid').querySelectorAll('[data-toggle]')) el.addEventListener('change', () => { const sec = el.closest('.st-sec'); sec.classList.toggle('st-off', !el.checked); for (const f of sec.querySelectorAll('[data-key]')) f.disabled = !el.checked || flagOf(f.dataset.key) !== undefined; });
     for (const b of $('stgrid').querySelectorAll('[data-unset]')) b.onclick = (e) => { e.preventDefault(); b.dataset.removed = '1'; const f = $('st-' + b.dataset.unset.replace(/\./g, '-')); f.value = ''; f.placeholder = 'removed on save'; stDirty(); };
+    if (d.broken) { $('sterr').innerHTML = `<span class="ecode">CONFIG</span><span class="msg">${esc(d.broken + '\nIt isn\u2019t shown here: its secrets can\u2019t be told apart from the rest.')}</span>`; $('sterr').classList.remove('hidden'); }
     stText = d.text; $('sttext').value = d.text; $('sttext').readOnly = false; $('stnav').classList.remove('hidden'); stSync();
     stShow(stSec === 'file' || ST.some((x) => x.id === stSec) ? stSec : 'app'); stDirty();
   }

@@ -1177,8 +1177,11 @@ server deploys a folder (`--functions`), the tab shows that folder's files read-
 
 Its **Settings** tab edits the server's [settings file](#configuration). The form covers the public address,
 sign-up tables, origins, HTTPS, sign-in and providers, agents over MCP, backup and the functions' limits, and
-the whole file can be edited as text for anything else. Secrets show as set or not, never their values. A save
-is checked as the server would start with it, then written with comments and the rest of the file kept.
+the whole file can be edited as text for anything else. Secrets show as set or not, never their values, and a
+save that changes where one is sent (its table's endpoint or a URL) needs it typed again. A save is checked as
+the server would start with it, then written with comments and the rest of the file kept. A `${VAR}` reference
+reads the server's environment when it starts, so the console's token is as powerful as that environment: keep
+it as secret.
 Settings apply when the server restarts: **Restart now** does that in place (same process, same console token),
 and is refused while the file would keep the server from starting. Its **Backup** tab
 shows whether uploads are healthy, how far the bucket is behind, the last error and a connection test;
