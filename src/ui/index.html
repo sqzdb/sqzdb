@@ -204,6 +204,25 @@ table.data tr.flash td { animation:flash 1.4s ease-out }
 .acl-grid .w4 { grid-column:span 4 } .acl-grid .w2 { grid-column:span 2 } .acl-grid .w1 { grid-column:span 1 }
 @media (max-width: 1100px) { .acl-grid .w2, .acl-grid .w1 { grid-column:span 4 } }
 .acl-card { display:flex; flex-direction:column; min-height:0 }
+/* the access builder */
+.ab { padding:14px 16px 16px; display:flex; flex-direction:column; gap:12px }
+.ab-top { display:flex; align-items:center; gap:10px; flex-wrap:wrap }
+.ab-top h3 { margin:0; font-size:14px; margin-right:6px }
+.ab-top select { min-width:280px; font-weight:500 }
+.ab-fields { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:flex-end }
+.ab-f { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-3); min-width:160px }
+.ab-f .input { font:12.5px var(--mono) }
+.ab-checks { display:flex; gap:12px; flex-wrap:wrap; padding:6px 0; color:var(--text-2); font-size:12.5px }
+.ab-checks label { display:flex; align-items:center; gap:5px; cursor:pointer }
+.ab-conds { display:flex; flex-direction:column; gap:6px; width:100% }
+.ab-cond { display:flex; gap:6px; align-items:center; flex-wrap:wrap }
+.ab-cond .and { width:34px; text-align:right; font:11px var(--mono); color:var(--text-3) }
+.ab-cond select, .ab-cond input { width:auto; min-width:120px; font:12.5px var(--mono) }
+.ab-out { border:1px solid var(--line); border-radius:var(--r); background:var(--bg); padding:10px 12px; display:flex; flex-direction:column; gap:8px }
+.ab-out code { font:12.5px/1.6 var(--mono); white-space:pre-wrap; word-break:break-word }
+.ab-out .say { color:var(--text-2); font-size:12.5px }
+.ab-out .need { color:var(--warn); font-size:12.5px }
+.ab-out .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
 .acl-card header { display:flex; align-items:center; gap:8px; padding:12px 14px 10px; font-weight:600 }
 .acl-card header .count { font-size:11px; font-weight:500; color:var(--text-3); background:var(--raised); border-radius:999px; padding:0 7px }
 .acl-card .grid { max-height:280px; border-top:1px solid var(--line) }
@@ -338,7 +357,40 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 .fn-out { grid-column:1/-1; margin:0; padding:10px 12px; border-radius:var(--r); background:var(--bg); border:1px solid var(--line); font:12px/1.55 var(--mono); white-space:pre-wrap; word-break:break-word; max-height:320px; overflow:auto; color:var(--text-2) }
 .fn-out.bad { color:#ffd0d0; border-color:rgba(255,112,112,.3); background:var(--bad-bg) }
 
+/* settings */
+.st-head { display:flex; align-items:center; gap:12px; padding:12px 14px; flex-wrap:wrap }
+.st-head > div { flex:1 1 320px; min-width:0 }
+.st-head h3 { margin:0 0 2px; font-size:14px } .st-head p { margin:0; color:var(--text-3); font-size:12.5px }
+.st-head code, .st-sec code { font:12px var(--mono); color:var(--text-2) }
+.st-pending { border-color:rgba(232,181,92,.35); background:var(--warn-bg) }
+.st-pending p { color:var(--text-2) }
+.st-layout { display:grid; grid-template-columns:210px minmax(0,1fr); gap:12px; align-items:start }
+.st-nav { padding:6px; display:flex; flex-direction:column; gap:2px; position:sticky; top:0 }
+.st-nav button { display:flex; align-items:center; gap:8px; width:100%; padding:7px 10px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--text-2); cursor:pointer; text-align:left; font-weight:500 }
+.st-nav button:hover { background:var(--hover); color:var(--text) }
+.st-nav button.on { background:var(--active); color:var(--text) }
+.st-nav .st-state { margin-left:auto; font-size:11px; color:var(--text-3); font-weight:400 }
+.st-nav .st-state.yes { color:var(--ok) }
+.st-nav .mark { width:6px; height:6px; border-radius:50%; background:var(--warn) }
+.st-main { display:flex; flex-direction:column; gap:12px; min-width:0; max-width:760px }
+.st-sec { padding:14px 16px 16px; display:flex; flex-direction:column; gap:12px }
+.st-sec h3 { margin:0; font-size:14px; display:flex; align-items:center; gap:8px }
+.st-sec h3 .sw { margin-left:auto; display:flex; align-items:center; gap:6px; font-weight:500; font-size:12px; color:var(--text-2) }
+.st-sec .lead { margin:-4px 0 0; color:var(--text-3); font-size:12px }
+.st-f { display:flex; flex-direction:column; gap:4px; min-width:0 }
+.st-f > span { font-size:12px; color:var(--text-2); display:flex; gap:6px; align-items:baseline }
+.st-f > span small { color:var(--text-3) }
+.st-f .input { font:12.5px var(--mono) }
+.st-f .fixed { font:11px var(--mono); color:var(--warn) }
+.st-f .clear { margin-left:auto; border:0; background:none; color:var(--text-3); font-size:11px; cursor:pointer; padding:0 }
+.st-f .clear:hover { color:var(--bad) }
+.st-off .st-f { opacity:.45 }
+.st-bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+.st-file .editor { max-height:none; min-height:220px; height:40vh; border-radius:0 0 var(--r) var(--r) }
+
 @media (max-width: 860px) {
+  .st-layout { grid-template-columns:1fr }
+  .st-nav { flex-direction:row; overflow-x:auto; position:static } .st-nav button { width:auto; white-space:nowrap }
   .fn-grid, .fn-try { grid-template-columns:1fr }
   .app { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); height:auto; min-height:100vh }
   .side { border-right:0; border-bottom:1px solid var(--line); max-height:none }
@@ -371,6 +423,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
         <button class="tab" role="tab" aria-selected="false" data-tab="functions" id="t-functions">Functions</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="acl" id="t-acl">Access</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="backup" id="t-backup">Backup <span class="tdot" id="bkdot" aria-hidden="true"></span></button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="settings" id="t-settings">Settings <span class="badge hidden" id="stbadge">restart</span></button>
       </nav>
       <div class="top-right"><button id="disconnect" class="btn btn-ghost btn-sm">Disconnect</button></div>
     </header>
@@ -449,6 +502,22 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 
     <section id="tab-acl" class="view hidden" role="tabpanel" aria-labelledby="t-acl">
       <div class="acl-grid" id="acl"></div>
+    </section>
+
+    <section id="tab-settings" class="view hidden" role="tabpanel" aria-labelledby="t-settings">
+      <div class="card st-head" id="sthead"></div>
+      <div id="sterr" class="alert hidden" role="alert"></div>
+      <div class="st-layout">
+      <nav class="card st-nav" id="stnav" aria-label="Settings"></nav>
+      <div class="st-main">
+      <div id="stgrid"></div>
+      <div class="st-bar" id="stbar"><button id="stsave" class="btn btn-primary" disabled>Save settings</button><button id="streset" class="btn btn-ghost" disabled>Undo changes</button><span class="meta" id="stmeta"></span></div>
+      <div class="card st-file hidden" id="stfile">
+        <div class="fn-bar"><b style="font-size:12.5px">The file</b><span class="meta">everything, comments and all: for settings the form doesn't have</span><span class="spacer"></span><button id="stfilesave" class="btn btn-sm" disabled>Save file</button></div>
+        <div class="editor"><div class="gutter" id="stgutter" aria-hidden="true">1</div><div class="code"><pre id="sthl" aria-hidden="true"></pre><textarea id="sttext" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="Settings file" data-gramm="false"></textarea></div></div>
+      </div>
+      </div>
+      </div>
     </section>
 
     <section id="tab-backup" class="view hidden" role="tabpanel" aria-labelledby="t-backup">
@@ -757,15 +826,164 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   async function acl() {
     try { const a = await api('/api/acl');
       const card = (w, title, ic, head, rows, none) => `<section class="card acl-card ${w}"><header>${icon(ic)}${title}<span class="count">${rows.length}</span></header>${rows.length ? `<div class="grid"><table class="data"><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c, k) => `<td${k ? '' : ' style="color:var(--text)"'}>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : `<div class="none">${none}</div>`}</section>`;
-      const examples = ['CREATE ROLE customer', 'GRANT SELECT, INSERT ON orders TO customer', 'CREATE POLICY own_orders ON orders FOR ALL TO customer USING (tenant_id = SESSION.tenant)', 'CREATE USER alice IN ROLE customer WITH tenant = 7'];
-      $('acl').innerHTML = card('w4', 'Row policies', 'table', ['policy', 'table', 'role', 'commands', 'using'], a.policies.map((p) => [p.name, p.table, p.role, p.commands.join(', '), p.using]), 'No row policies: a role with a grant sees every row of that table.')
+      abAcl = a;
+      $('acl').innerHTML = `<section class="card w4 ab" id="ab"></section>` + card('w4', 'Row policies', 'table', ['policy', 'table', 'role', 'commands', 'using'], a.policies.map((p) => [p.name, p.table, p.role, p.commands.join(', '), p.using]), 'No row policies: a role with a grant sees every row of that table.')
         + card('w2', 'Grants', 'key', ['role', 'table', 'commands'], a.grants.map((g) => [g.role, g.table, g.commands.join(', ')]), 'Nothing granted yet. A role can do nothing until it is granted commands on a table.')
         + card('w1', 'Roles', 'shield', ['role'], a.roles.map((r) => [r]), 'No roles yet.')
         + card('w1', 'Stored users', 'pulse', ['user', 'roles', 'attributes'], a.users.map((u) => [u.name, u.roles.join(', '), Object.entries(u.attrs).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join(', ')]), 'None. Applications usually pass who is asking per request: db.as({ role, ...attributes }).')
-        + `<section class="card examples w4"><h4>Set up access</h4><p>Run these from the Query tab. Applications then act as a role with <span class="mono">db.as({ role: 'customer', tenant: 42 })</span>.</p>${examples.map((q) => `<div class="ex"><code>${highlight(q)}</code><button class="btn btn-sm" data-q="${esc(q)}">Open in editor</button></div>`).join('')}</section>`;
+        + card('w4', 'Sign-in tables', 'shield', ['table', 'login', 'role'], (a.auth || []).map((t) => [t.table, t.login || '', t.role.column ? `from its ${t.role.column} column` : t.role.fixed ? t.role.fixed : 'none']), 'None. A table people sign in to (an email and a password, or a provider) is marked with ALTER TABLE … ENABLE AUTH.');
+      renderBuilder();
+
     } catch (e) { if (!e.auth) $('acl').innerHTML = `<div class="alert"><span class="ecode">${esc(e.code)}</span><span class="msg">${esc(e.message)}</span></div>`; }
   }
   $('acl').addEventListener('click', (e) => { const b = e.target.closest('[data-q]'); if (b) { setSQL(b.dataset.q, true); showTab('console'); } });
+
+  // ---- the access builder: a statement made from choices (roles, tables and columns as they are), shown before it runs
+  const AB_KINDS = [['role', 'Create a role'], ['grant', 'Grant a role commands on a table'], ['policy', 'Limit a role to some rows (a policy)'], ['auth', 'Let users sign in to a table'], ['user', 'Create a stored user'],
+    ['revoke', 'Revoke commands from a role'], ['droppolicy', 'Drop a policy'], ['noauth', 'Stop sign-ins to a table'], ['dropuser', 'Drop a stored user'], ['droprole', 'Drop a role']];
+  const CMDS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
+  const VERB = { SELECT: 'read', INSERT: 'add', UPDATE: 'change', DELETE: 'delete' };
+  const ONLY = { ALL: 'reaches only', SELECT: 'reads only', INSERT: 'adds only', UPDATE: 'changes only', DELETE: 'deletes only' };
+  const OPS = [['=', 'is'], ['<>', 'is not'], ['<', 'is below'], ['<=', 'is at most'], ['>', 'is above'], ['>=', 'is at least']];
+  let abAcl = null;
+  const ab = { kind: store.get('sqzdb.abkind', 'role'), name: '', role: '', table: '', cmds: ['SELECT'], cmd: 'ALL', conds: [{ col: '', op: '=', from: 'session', v: '' }], policy: '', roleFrom: 'column', column: '', roles: [], attrs: [{ k: '', v: '' }], user: '', err: '' };
+  const ident = (x) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(x);
+  const words = (l) => (l.length <= 1 ? l.join('') : l.slice(0, -1).join(', ') + ' and ' + l[l.length - 1]);
+  const lit = (v) => (/^-?\d+(\.\d+)?$/.test(v) ? v : /^(true|false)$/i.test(v) ? v.toLowerCase() : `'${v}'`);
+  const colsOf = (t) => (tablesCache.find((x) => x.name.toLowerCase() === String(t).toLowerCase())?.columns || []);
+  const tableNames = () => tablesCache.map((t) => t.name).filter((n) => !n.startsWith('_'));
+  const abOpt = (v, txt, sel) => `<option value="${esc(v)}"${sel ? ' selected' : ''}>${esc(txt ?? v)}</option>`;
+  const pick = (key, items, ph) => `<select class="input" data-ab="${key}">${abOpt('', ph, !ab[key])}${items.map((x) => (Array.isArray(x) ? abOpt(x[0], x[1], ab[key] === x[0]) : abOpt(x, x, ab[key] === x))).join('')}</select>`;
+  // the statement and what it does, or what is missing
+  function abSql() {
+    const a = ab, A = abAcl, need = (c, m) => { if (!c) throw m; };
+    try {
+      switch (a.kind) {
+        case 'role': need(a.name, 'Name the role.'); need(ident(a.name), 'A role name is letters, digits and _.'); need(!A.roles.includes(a.name), `${a.name} exists already.`);
+          return [`CREATE ROLE ${a.name}`, `Makes the role ${a.name}. It may do nothing until it is granted commands on tables.`];
+        case 'grant': case 'revoke': {
+          need(a.role, 'Choose a role.'); need(a.table, 'Choose a table.'); need(a.cmds.length, 'Choose a command.');
+          const list = a.cmds.length === 4 ? 'ALL' : CMDS.filter((c) => a.cmds.includes(c)).join(', '), verbs = words(CMDS.filter((c) => a.cmds.includes(c)).map((c) => VERB[c]));
+          if (a.kind === 'revoke') { need(A.grants.some((g) => g.role === a.role && g.table === a.table), `${a.role} has no grant on ${a.table}.`); return [`REVOKE ${list} ON ${a.table} FROM ${a.role}`, `${a.role} may no longer ${verbs} rows of ${a.table}.`]; }
+          const limited = A.policies.some((p) => p.table === a.table && p.role === a.role);
+          return [`GRANT ${list} ON ${a.table} TO ${a.role}`, `${a.role} may ${verbs} rows of ${a.table}${limited ? ', within its policies there' : ': every row, until a policy limits it to some'}.`];
+        }
+        case 'policy': {
+          need(a.table, 'Choose a table.'); need(a.role, 'Choose a role.');
+          const name = a.name || `${a.role}_${a.table}`; need(ident(name), 'A policy name is letters, digits and _.');
+          need(!A.policies.some((p) => p.name === name && p.table === a.table), `${a.table} has a policy ${name} already: name this one differently.`);
+          const cs = a.conds.filter((c) => c.col); need(cs.length, 'Add a condition: a column, and what it must be.');
+          for (const c of cs) { need(c.v, `Say what ${c.col} is compared with.`); need(c.from === 'session' ? ident(c.v) : !c.v.includes("'"), c.from === 'session' ? 'A session attribute is letters, digits and _.' : "A value can't hold a quote ('): compare with a session attribute instead."); }
+          const using = cs.map((c) => `${c.col} ${c.op} ${c.from === 'session' ? 'SESSION.' + c.v : lit(c.v)}`).join(' AND ');
+          const say = cs.map((c) => `${c.col} ${OPS.find((o) => o[0] === c.op)[1]} ${c.from === 'session' ? `the session's ${c.v}` : lit(c.v)}`).join(' and ');
+          const attrs = [...new Set(cs.filter((c) => c.from === 'session').map((c) => c.v))];
+          const grant = A.grants.some((g) => g.role === a.role && g.table === a.table);
+          return [`CREATE POLICY ${name} ON ${a.table} FOR ${a.cmd} TO ${a.role} USING (${using})`,
+            `${a.role} ${ONLY[a.cmd]} rows of ${a.table} where ${say}.` + (attrs.length ? ` Its sessions carry ${words(attrs)}: a column of the sign-in table, or db.as({ role: '${a.role}', ${attrs.map((x) => x + ': …').join(', ')} }).` : '')
+            + (grant ? '' : ` ${a.role} has no grant on ${a.table} yet: until it does, it reaches nothing there.`)];
+        }
+        case 'droppolicy': need(a.policy, 'Choose a policy.'); { const [n, t] = a.policy.split(' on '); return [`DROP POLICY ${n} ON ${t}`, `The rows of ${t} it limited are reachable again, by whoever is granted them.`]; }
+        case 'auth': {
+          need(a.table, 'Choose the table people sign in to.');
+          const cols = colsOf(a.table), login = cols.filter((c) => c.unique && /^(TEXT|VARCHAR)/i.test(c.type));
+          need(login.length === 1, login.length ? `${a.table} has more than one UNIQUE text column: the login must be the only one.` : `${a.table} needs a UNIQUE TEXT column for the login, such as email.`);
+          need(!(A.auth || []).some((t) => t.table === a.table.toLowerCase()), `People sign in to ${a.table} already.`);
+          const how = a.roleFrom === 'column' ? (need(a.column, 'Choose the column that holds each user’s role.'), ` (ROLE FROM ${a.column})`) : a.roleFrom === 'fixed' ? (need(a.role, 'Choose the role everyone gets.'), ` (ROLE ${a.role})`) : '';
+          return [`ALTER TABLE ${a.table} ENABLE AUTH${how}`, `People sign in to ${a.table} with their ${login[0].name} and a password (or a provider). Each acts ${a.roleFrom === 'column' ? `as the role in their ${a.column} column` : a.roleFrom === 'fixed' ? `as ${a.role}` : 'with no role (granted nothing)'}, with their row's columns as SESSION attributes.`];
+        }
+        case 'noauth': need(a.table, 'Choose a table.'); return [`ALTER TABLE ${a.table} DISABLE AUTH`, `Nobody can sign in to ${a.table}, and its sessions end. The rows stay.`];
+        case 'user': {
+          need(a.name, 'Name the user.'); need(ident(a.name), 'A user name is letters, digits and _.'); need(!A.users.some((u) => u.name === a.name), `${a.name} exists already.`); need(a.roles.length, 'Choose a role.');
+          const kv = a.attrs.filter((x) => x.k); for (const x of kv) { need(ident(x.k), 'An attribute name is letters, digits and _.'); need(x.v && !x.v.includes("'"), `Give ${x.k} a value (without quotes).`); }
+          return [`CREATE USER ${a.name}${a.roles.map((r) => ` IN ROLE ${r}`).join('')}${kv.length ? ' WITH ' + kv.map((x) => `${x.k} = ${lit(x.v)}`).join(', ') : ''}`, `A user the app acts as with db.as('${a.name}'), and TCP clients by name: ${words(a.roles)}${kv.length ? `, with ${words(kv.map((x) => x.k))} for policies to read` : ''}.`];
+        }
+        case 'dropuser': need(a.user, 'Choose a user.'); return [`DROP USER ${a.user}`, `${a.user} is gone; code that acts as them gets an error.`];
+        case 'droprole': {
+          need(a.role, 'Choose a role.');
+          const uses = [...A.grants.filter((g) => g.role === a.role).map((g) => `its grant on ${g.table}`), ...A.policies.filter((p) => p.role === a.role).map((p) => `policy ${p.name}`), ...A.users.filter((u) => u.roles.includes(a.role)).map((u) => `user ${u.name}`), ...(A.auth || []).filter((t) => t.role.fixed === a.role).map((t) => `sign-in on ${t.table}`)];
+          need(!uses.length, `${a.role} is still used by ${words(uses)}: revoke or drop those first.`);
+          return [`DROP ROLE ${a.role}`, `The role ${a.role} is gone.`];
+        }
+      }
+    } catch (m) { return [null, m]; }
+  }
+  function abFields() {
+    const A = abAcl, k = ab.kind, roles = A.roles, tables = tableNames();
+    const checks = (key, items, labels) => `<div class="ab-checks">${items.map((x) => `<label><input type="checkbox" data-abcheck="${key}" value="${esc(x)}"${ab[key].includes(x) ? ' checked' : ''}>${esc(labels ? labels[x] : x)}</label>`).join('')}</div>`;
+    const name = (ph, label = 'Name') => `<label class="ab-f">${label}<input class="input" data-ab="name" value="${esc(ab.name)}" placeholder="${esc(ph)}" spellcheck="false" autocomplete="off"></label>`;
+    const f = (label, inner) => `<label class="ab-f">${label}${inner}</label>`;
+    if (k === 'role') return name('customer');
+    if (k === 'grant' || k === 'revoke') {
+      const ts = k === 'revoke' ? [...new Set(A.grants.filter((g) => !ab.role || g.role === ab.role).map((g) => g.table))] : tables;
+      const rs = k === 'revoke' ? [...new Set(A.grants.map((g) => g.role))] : roles;
+      return f('Role', pick('role', rs, rs.length ? 'choose…' : 'no roles yet')) + f('Table', pick('table', ts, 'choose…')) + f('Commands', checks('cmds', CMDS, { SELECT: 'read (SELECT)', INSERT: 'add (INSERT)', UPDATE: 'change (UPDATE)', DELETE: 'delete (DELETE)' }));
+    }
+    if (k === 'policy') {
+      const cols = colsOf(ab.table).map((c) => c.name);
+      return f('Table', pick('table', tables, 'choose…')) + f('Role', pick('role', roles, roles.length ? 'choose…' : 'no roles yet')) + f('For', pick('cmd', [['ALL', 'everything it does'], ...CMDS.map((c) => [c, VERB[c] + 'ing'.replace(/^/, '')])].map(([v, t]) => [v, v === 'ALL' ? t : { SELECT: 'reading', INSERT: 'adding', UPDATE: 'changing', DELETE: 'deleting' }[v]]), 'choose…'))
+        + name(ab.role && ab.table ? `${ab.role}_${ab.table}` : 'own_rows', 'Policy name (optional)')
+        + `<div class="ab-conds">${ab.conds.map((c, i) => `<div class="ab-cond"><span class="and">${i ? 'and' : 'where'}</span>
+            <select class="input" data-cond="${i}" data-k="col">${abOpt('', ab.table ? 'a column…' : 'choose a table first', !c.col)}${cols.map((x) => abOpt(x, x, c.col === x)).join('')}</select>
+            <select class="input" data-cond="${i}" data-k="op">${OPS.map(([v, t]) => abOpt(v, t, c.op === v)).join('')}</select>
+            <select class="input" data-cond="${i}" data-k="from">${abOpt('session', "the session's", c.from === 'session')}${abOpt('value', 'the value', c.from === 'value')}</select>
+            <input class="input" data-cond="${i}" data-k="v" value="${esc(c.v)}" placeholder="${c.from === 'session' ? 'tenant' : '42'}" spellcheck="false" autocomplete="off">
+            ${ab.conds.length > 1 ? `<button class="btn btn-sm btn-ghost" data-condx="${i}">remove</button>` : ''}</div>`).join('')}
+            <div><button class="btn btn-sm btn-ghost" id="abaddcond">Add a condition (and)</button></div></div>`;
+    }
+    if (k === 'droppolicy') return f('Policy', pick('policy', A.policies.map((p) => `${p.name} on ${p.table}`), A.policies.length ? 'choose…' : 'no policies'));
+    if (k === 'auth') {
+      const cols = colsOf(ab.table).map((c) => c.name);
+      return f('Table', pick('table', tables.filter((t) => !(A.auth || []).some((x) => x.table === t.toLowerCase())), 'choose…'))
+        + f('Each user’s role', pick('roleFrom', [['column', 'from a column of theirs'], ['fixed', 'one role for everyone'], ['none', 'none (granted nothing)']], 'choose…'))
+        + (ab.roleFrom === 'column' ? f('Column', pick('column', cols, ab.table ? 'choose…' : 'choose a table first')) : ab.roleFrom === 'fixed' ? f('Role', pick('role', roles, 'choose…')) : '');
+    }
+    if (k === 'noauth') return f('Table', pick('table', (A.auth || []).map((t) => t.table), (A.auth || []).length ? 'choose…' : 'none take sign-ins'));
+    if (k === 'user') return name('alice') + f('Roles', checks('roles', roles)) + `<div class="ab-conds">${ab.attrs.map((x, i) => `<div class="ab-cond"><span class="and">${i ? '' : 'with'}</span>
+        <input class="input" data-attr="${i}" data-k="k" value="${esc(x.k)}" placeholder="tenant" spellcheck="false" autocomplete="off"><span>=</span><input class="input" data-attr="${i}" data-k="v" value="${esc(x.v)}" placeholder="7" spellcheck="false" autocomplete="off"></div>`).join('')}
+        <div><button class="btn btn-sm btn-ghost" id="abaddattr">Add an attribute</button></div></div>`;
+    if (k === 'dropuser') return f('User', pick('user', A.users.map((u) => u.name), A.users.length ? 'choose…' : 'no users'));
+    if (k === 'droprole') return f('Role', pick('role', roles, roles.length ? 'choose…' : 'no roles'));
+    return '';
+  }
+  function renderBuilder() {
+    if (!$('ab') || !abAcl) return;
+    $('ab').innerHTML = `<div class="ab-top"><h3>Change access</h3><select class="input" id="abkind">${AB_KINDS.map(([v, t]) => abOpt(v, t, ab.kind === v)).join('')}</select></div>
+      <div class="ab-fields" id="abfields">${abFields()}</div><div class="ab-out" id="about"></div>`;
+    $('abkind').onchange = () => { ab.kind = $('abkind').value; ab.err = ''; ab.name = ''; store.set('sqzdb.abkind', ab.kind); renderBuilder(); };
+    const fields = $('abfields');
+    // a choice that changes other choices draws the fields again; typing only redraws the statement
+    fields.addEventListener('change', (e) => {
+      // (text is taken as it is typed: a change on leaving a text field must not redraw what the next click lands on)
+      const el = e.target; if (el.tagName !== 'SELECT' && el.type !== 'checkbox') return;
+      if (el.dataset.ab) { ab[el.dataset.ab] = el.value; if (el.dataset.ab === 'table') { ab.conds = ab.conds.map((c) => ({ ...c, col: '' })); ab.column = ''; } renderBuilder(); }
+      else if (el.dataset.abcheck) { const key = el.dataset.abcheck; ab[key] = [...fields.querySelectorAll(`[data-abcheck="${key}"]:checked`)].map((x) => x.value); abShow(); }
+      else if (el.dataset.cond) { ab.conds[+el.dataset.cond][el.dataset.k] = el.value; if (el.dataset.k === 'from') renderBuilder(); else abShow(); }
+    });
+    fields.addEventListener('input', (e) => {
+      const el = e.target;
+      if (el.dataset.ab === 'name') { ab.name = el.value; abShow(); }
+      else if (el.dataset.cond && el.dataset.k === 'v') { ab.conds[+el.dataset.cond].v = el.value.trim(); abShow(); }
+      else if (el.dataset.attr) { ab.attrs[+el.dataset.attr][el.dataset.k] = el.value.trim(); abShow(); }
+    });
+    fields.addEventListener('click', (e) => {
+      if (e.target.id === 'abaddcond') { e.preventDefault(); ab.conds.push({ col: '', op: '=', from: 'session', v: '' }); renderBuilder(); }
+      if (e.target.id === 'abaddattr') { e.preventDefault(); ab.attrs.push({ k: '', v: '' }); renderBuilder(); }
+      if (e.target.dataset.condx) { e.preventDefault(); ab.conds.splice(+e.target.dataset.condx, 1); renderBuilder(); }
+    });
+    abShow();
+  }
+  function abShow() {
+    const [sql, say] = abSql();
+    $('about').innerHTML = sql
+      ? `<code>${highlight(sql)}</code><div class="say">${esc(say)}</div>${ab.err ? `<div class="need">${esc(ab.err)}</div>` : ''}<div class="row"><button class="btn btn-primary btn-sm" id="abrun">Run</button><button class="btn btn-sm" id="abopen">Open in the editor</button></div>`
+      : `<div class="need">${esc(say)}</div>`;
+    if (!sql) return;
+    $('abopen').onclick = () => { setSQL(sql, true); showTab('console'); };
+    $('abrun').onclick = async () => {
+      try { await api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) }); toast('Done: ' + sql.split(' ').slice(0, 2).join(' ').toLowerCase()); ab.name = ''; ab.err = ''; await acl(); refresh(); }
+      catch (e) { if (e.auth) return; ab.err = e.message; abShow(); }
+    };
+  }
 
   // ---- backup: health of the uploader when on; a settings file and the restart command when off
   let lastStatus = null, bkMode = '';
@@ -778,6 +996,20 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
       const m = /^(\s*[A-Za-z_]+)(\s*=\s*)(.*)$/.exec(l); if (!m) return esc(l); const v = /^".*"$/.test(m[3]) ? `<span class="tk-str">${esc(m[3])}</span>` : `<span class="tk-num">${esc(m[3])}</span>`; return esc(m[1]) + esc(m[2]) + v; }).join('\n');
   }
   function renderBackupOff(st) {
+    // a server the console can configure: set it up in Settings (saved, then a restart)
+    if (stData === null) { api('/api/settings').then((d) => { stData = d; bkMode = ''; renderBackup(); }, () => {}); }
+    if (stData && stData.editable) {
+      $('bk').innerHTML = `<section class="card bk-head"><div class="big"><span class="state"><span class="dot"></span>Off</span>Backup is not set up</div>
+        <p>Backup copies every commit to an S3-compatible bucket: AWS S3, Cloudflare R2, Backblaze B2, MinIO and others. Objects are compressed with zstd and can be encrypted before they leave this machine. A new machine can start from the bucket.</p>
+        <p>Set it up in Settings: your bucket, its keys (or the environment variables that hold them), and a passphrase. It starts when the server restarts, which Settings does for you.</p>
+        <button class="btn btn-primary" id="bkgo">Set up backup</button></section>`;
+      $('bkgo').onclick = async () => {
+        stSec = 'backup'; showTab('settings'); await loadSettings();
+        const t = $('stgrid').querySelector('[data-toggle="backup"]'); if (t && !t.checked && !t.disabled) { t.checked = true; t.dispatchEvent(new Event('change')); }
+        $('st-backup-endpoint')?.focus();
+      };
+      return;
+    }
     const base = st.dir.replace(/\/+$/, '').split('/').pop() || 'db';
     $('bk').innerHTML = `<section class="card bk-head"><div class="big"><span class="state"><span class="dot"></span>Off</span>Backup is not set up</div>
         <p>Backup copies every commit to an S3-compatible bucket: AWS S3, Cloudflare R2, Backblaze B2, MinIO and others. Objects are compressed with zstd and can be encrypted before they leave this machine. A new machine can start from the bucket, and you can restore to any point in time.</p>
@@ -1113,11 +1345,153 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   for (const id of ['fnargs', 'fnattrs', 'fnrole']) $(id).addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); fnCall(); } });
   addEventListener('beforeunload', (e) => { if (fnDirty()) { e.preventDefault(); e.returnValue = ''; } });
 
+  // ---- settings: the server's settings file, as a form and as text; saved, then applied by a restart
+  const ST = [
+    { id: 'app', title: 'The app API', lead: 'What browsers, apps and agents reach (--app).', fields: [
+      ['app.publicUrl', 'Public address', 'text', 'https://api.example.com', 'where browsers and agents reach it: needed for MCP and provider sign-in'],
+      ['app.signUp', 'Sign-up tables', 'tables', 'users', 'tables people may make accounts in, from the sign-in page and the client'],
+      ['app.origins', 'Other origins', 'list', 'https://app.example.com', 'sites whose pages may call the API ("*": any)'],
+      ['app.anonymousRole', 'Anonymous role', 'text', 'none: sign in first', 'the role of requests without a sign-in'],
+      ['app.maxRows', 'Rows per result', 'int', '10000', ''],
+      ['app.maxRequest', 'Largest request', 'text', '8MB', ''],
+      ['app.trustProxy', 'Proxies in front', 'list', '127.0.0.1, 10.0.0.0/8', 'from these, the client is taken from X-Forwarded-For'] ] },
+    { id: 'https', title: 'HTTPS', lead: 'A certificate from Let’s Encrypt, renewed by itself (--domain). The names must point here, with port 443 open.', fields: [
+      ['app.tls.domains', 'Domains', 'list', 'api.example.com', ''],
+      ['app.tls.email', 'Email for notices', 'text', 'ops@example.com', ''],
+      ['app.tls.redirect', 'Plain HTTP from', 'text', '0.0.0.0:80', 'sent on to https'] ] },
+    { id: 'signin', title: 'Sign-in', lead: 'Sessions, passwords, and providers (each needs the public address).', fields: [
+      ['auth.sessionTtl', 'A session lasts', 'text', '30d', ''],
+      ['auth.passwordMin', 'Shortest password', 'int', '8', ''],
+      ['auth.oauth.google.clientId', 'Google client id', 'text', '…apps.googleusercontent.com', 'callback: <public address>/api/auth/<table>/oauth/google/callback'],
+      ['auth.oauth.google.clientSecret', 'Google client secret', 'secret', '', ''],
+      ['auth.oauth.github.clientId', 'GitHub client id', 'text', '', ''],
+      ['auth.oauth.github.clientSecret', 'GitHub client secret', 'secret', '', ''] ] },
+    { id: 'mcp', title: 'Agents over MCP', nav: 'Agents (MCP)', toggle: 'app.mcp', lead: 'Claude, ChatGPT, Claude Code and others at <public address>/mcp, signed in as their user.', fields: [
+      ['app.mcp.users', 'Sign-in table', 'text', 'the only one there is', 'the table people sign in to when they connect an agent'],
+      ['app.mcp.sql', 'SQL tools', 'bool', '', 'describe, query and execute, besides the functions'],
+      ['app.mcp.tokenTtl', 'Access token lasts', 'text', '1h', ''],
+      ['app.mcp.grantTtl', 'Unused sign-in lapses after', 'text', '30d', ''] ] },
+    { id: 'backup', title: 'Backup', toggle: 'backup', lead: 'Continuous, to any S3-compatible bucket. ${VAR} takes a value from the environment.', fields: [
+      ['backup.endpoint', 'Endpoint', 'text', 'https://s3.us-east-1.amazonaws.com', ''],
+      ['backup.bucket', 'Bucket', 'text', '', ''],
+      ['backup.prefix', 'Prefix', 'text', 'the database’s name', ''],
+      ['backup.region', 'Region', 'text', 'us-east-1', ''],
+      ['backup.accessKey', 'Access key', 'text', '', ''],
+      ['backup.secretKey', 'Secret key', 'secret', '', ''],
+      ['backup.passphrase', 'Encryption passphrase', 'secret', '', 'without one, objects are compressed, not encrypted'],
+      ['backup.interval', 'Upload every', 'text', '1s', ''],
+      ['durable', 'A commit is confirmed', 'choice', '', 'once it is in the bucket: slower, and nothing is lost with this machine', [['', 'when visible (default; the disk follows within a millisecond)'], ['fsync', 'once on this disk'], ['cloud', 'once in the bucket']]] ] },
+    { id: 'functions', title: 'Functions', lead: 'Limits for the app’s code (the Functions tab).', fields: [
+      ['functions.timeout', 'A call may take', 'text', '1s', ''],
+      ['functions.memory', 'Memory per instance', 'text', '64MB', ''],
+      ['functions.instances', 'Calls at once', 'int', 'the CPU count', ''] ] },
+  ];
+  let stData = null, stText = '', stSec = store.get('sqzdb.stsec', 'app');
+  const dig = (o, key) => key.split('.').reduce((v, k) => (v && typeof v === 'object' ? v[k] : undefined), o);
+  const shown = (type, v) => v === undefined || v === null ? '' : type === 'list' ? (Array.isArray(v) ? v.join(', ') : String(v)) : type === 'tables' ? (v && typeof v === 'object' ? Object.keys(v).join(', ') : '') : String(v);
+  const flagOf = (key) => dig(stData.flags, key);
+  function stRender() {
+    const d = stData;
+    if (!d.editable) { $('stnav').classList.add('hidden'); $('stbar').classList.add('hidden'); $('sthead').innerHTML = '<div><h3>Settings</h3><p>This database runs inside its application, which configures it in its code (or the file it names). Change them there.</p></div>'; $('stgrid').innerHTML = ''; for (const id of ['stsave', 'streset', 'stfilesave']) $(id).disabled = true; $('sttext').value = ''; $('sttext').readOnly = true; stSync(); return; }
+    $('stbadge').classList.toggle('hidden', !d.saved);
+    $('sthead').className = 'card st-head' + (d.saved ? ' st-pending' : '');
+    $('sthead').innerHTML = `<div><h3>Settings</h3><p>Kept in <code>${esc(d.path)}</code>${d.exists ? '' : ' (written when you first save)'}, readable by its owner only. Options on the command line win over it, and show here as fixed.</p></div>`
+      + (d.saved ? `<div><h3>Saved: they apply when the server restarts</h3><p>A restart takes a moment: the database reopens from its snapshot, and this page reconnects by itself.</p></div><button class="btn btn-primary" id="strestart">Restart now</button>` : '');
+    if ($('strestart')) $('strestart').onclick = stRestart;
+    $('stgrid').innerHTML = ST.map((sec, si) => {
+      const on = !sec.toggle || dig(d.values, sec.toggle) !== undefined || flagOf(sec.toggle) !== undefined;
+      return `<section class="card st-sec${on ? '' : ' st-off'}${sec.id === stSec ? '' : ' hidden'}" data-sec="${si}" data-id="${sec.id}"><h3>${esc(sec.title)}${sec.toggle ? `<label class="sw"><input type="checkbox" data-toggle="${esc(sec.toggle)}"${on ? ' checked' : ''}${flagOf(sec.toggle) !== undefined ? ' disabled' : ''}>On</label>` : ''}</h3><p class="lead">${esc(sec.lead)}</p>`
+        + sec.fields.map(([key, label, type, ph, hint, opts]) => {
+          const fixed = flagOf(key); const v = dig(d.values, key); const sec2 = d.secrets[key];
+          const id = 'st-' + key.replace(/\./g, '-');
+          let input;
+          const cur = ((x) => (x === true ? 'fsync' : x === false || x == null ? '' : String(x)))(fixed ?? v);
+          if (type === 'choice') input = `<select class="input" id="${id}" data-key="${esc(key)}" data-type="choice"${fixed !== undefined || !on ? ' disabled' : ''}>${opts.map(([val, txt]) => `<option value="${esc(val)}"${cur === val ? ' selected' : ''}>${esc(txt)}</option>`).join('')}</select>`;
+          else if (type === 'bool') input = `<select class="input" id="${id}" data-key="${esc(key)}" data-type="bool"${fixed !== undefined || !on ? ' disabled' : ''}><option value=""${v === undefined ? ' selected' : ''}>default (on)</option><option value="true"${v === true ? ' selected' : ''}>on</option><option value="false"${v === false ? ' selected' : ''}>off</option></select>`;
+          else if (type === 'secret') input = `<input class="input" type="password" id="${id}" data-key="${esc(key)}" data-type="secret" autocomplete="new-password" placeholder="${sec2 === undefined ? 'not set' : sec2 ? esc(sec2) : 'set: type to change'}"${fixed !== undefined || !on ? ' disabled' : ''}>`;
+          else input = `<input class="input" id="${id}" data-key="${esc(key)}" data-type="${type}" value="${esc(shown(type, fixed !== undefined ? fixed : v))}" placeholder="${esc(ph)}" spellcheck="false" autocomplete="off"${fixed !== undefined || !on ? ' disabled' : ''}>`;
+          const clear = type === 'secret' && sec2 !== undefined && fixed === undefined ? `<button class="clear" data-unset="${esc(key)}">remove</button>` : '';
+          return `<label class="st-f"><span>${esc(label)}${hint ? ` <small>${esc(hint)}</small>` : ''}${fixed !== undefined ? '<em class="fixed">from the command line</em>' : ''}${clear}</span>${input}</label>`;
+        }).join('') + '</section>';
+    }).join('');
+    for (const el of $('stgrid').querySelectorAll('[data-key], [data-toggle]')) el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', stDirty);
+    for (const el of $('stgrid').querySelectorAll('[data-toggle]')) el.addEventListener('change', () => { const sec = el.closest('.st-sec'); sec.classList.toggle('st-off', !el.checked); for (const f of sec.querySelectorAll('[data-key]')) f.disabled = !el.checked || flagOf(f.dataset.key) !== undefined; });
+    for (const b of $('stgrid').querySelectorAll('[data-unset]')) b.onclick = (e) => { e.preventDefault(); b.dataset.removed = '1'; const f = $('st-' + b.dataset.unset.replace(/\./g, '-')); f.value = ''; f.placeholder = 'removed on save'; stDirty(); };
+    stText = d.text; $('sttext').value = d.text; $('sttext').readOnly = false; $('stnav').classList.remove('hidden'); stSync();
+    stShow(stSec === 'file' || ST.some((x) => x.id === stSec) ? stSec : 'app'); stDirty();
+  }
+  // the menu: each section, on or off, and whether it has changes not saved; then the file
+  function stNav() {
+    const ch = stChanges(); const d = stData;
+    const changed = (sec) => Object.keys(ch).some((k) => k === sec.toggle || sec.fields.some(([f]) => k === f || k.startsWith(f + '.')) || (sec.toggle && k.startsWith(sec.toggle + '.')));
+    $('stnav').innerHTML = ST.map((sec) => {
+      const t = sec.toggle && $('stgrid').querySelector(`[data-toggle="${sec.toggle}"]`);
+      const state = sec.toggle ? (t && t.checked ? '<span class="st-state yes">On</span>' : '<span class="st-state">Off</span>') : '';
+      return `<button data-go="${sec.id}" class="${sec.id === stSec ? 'on' : ''}">${esc(sec.nav || sec.title)}${changed(sec) ? '<span class="mark" title="Not saved"></span>' : ''}${state}</button>`;
+    }).join('') + `<button data-go="file" class="${stSec === 'file' ? 'on' : ''}">The file${$('sttext').value !== stText ? '<span class="mark" title="Not saved"></span>' : ''}</button>`;
+    for (const b of $('stnav').querySelectorAll('[data-go]')) b.onclick = () => stShow(b.dataset.go);
+  }
+  function stShow(id) {
+    stSec = id; store.set('sqzdb.stsec', id);
+    for (const sec of $('stgrid').querySelectorAll('.st-sec')) sec.classList.toggle('hidden', sec.dataset.id !== id);
+    $('stfile').classList.toggle('hidden', id !== 'file'); $('stbar').classList.toggle('hidden', id === 'file');
+    stNav();
+  }
+  // what the form changed, as keys to set (null: remove)
+  function stChanges() {
+    const set = {}; const d = stData;
+    for (const sec of ST) {
+      if (sec.toggle) {
+        const t = $('stgrid').querySelector(`[data-toggle="${sec.toggle}"]`); const was = dig(d.values, sec.toggle) !== undefined;
+        if (t && !t.disabled && !t.checked) { if (was) set[sec.toggle] = null; continue; }
+        if (t && !t.disabled && t.checked && !was) set[sec.toggle] = {};
+      }
+      for (const [key, , type] of sec.fields) {
+        const f = $('st-' + key.replace(/\./g, '-')); if (!f || f.disabled) continue;
+        const old = dig(d.values, key);
+        if (type === 'secret') { const rm = $('stgrid').querySelector(`[data-unset="${key}"]`); if (rm && rm.dataset.removed) set[key] = null; else if (f.value) set[key] = f.value; continue; }
+        const raw = f.value.trim();
+        let v = raw === '' ? null : type === 'choice' ? raw : type === 'int' ? Number(raw) : type === 'bool' ? raw === 'true' : type === 'list' ? raw.split(/[,\n]/).map((x) => x.trim()).filter(Boolean)
+          : type === 'tables' ? Object.fromEntries(raw.split(/[,\n]/).map((x) => x.trim()).filter(Boolean).map((t) => [t, Array.isArray(old?.[t]) ? old[t] : []])) : raw;
+        if (JSON.stringify(v ?? null) !== JSON.stringify(old ?? null)) set[key] = v;
+      }
+    }
+    // a section turned on goes in as one table with its fields
+    for (const sec of ST) if (sec.toggle && set[sec.toggle] && typeof set[sec.toggle] === 'object') for (const k of Object.keys(set)) if (k.startsWith(sec.toggle + '.')) { set[sec.toggle][k.slice(sec.toggle.length + 1)] = set[k]; delete set[k]; }
+    return set;
+  }
+  function stDirty() { const n = Object.keys(stChanges()).length; $('stsave').disabled = !n; $('streset').disabled = !n; $('stmeta').textContent = n ? `${n} change${n === 1 ? '' : 's'} not saved, in any section` : ''; if ($('stnav').childElementCount) stNav(); }
+  function stSync() { if ($('stnav').childElementCount) stNav(); const v = $('sttext').value; $('sthl').textContent = v + '\n'; let g = ''; for (let k = 1, m = v.split('\n').length; k <= m; k++) g += k + '\n'; $('stgutter').textContent = g; $('stfilesave').disabled = !stData?.editable || v === stText; }
+  $('sttext').addEventListener('input', stSync);
+  $('sttext').addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); if (!$('stfilesave').disabled) stSave({ text: $('sttext').value }); } });
+  async function loadSettings() { try { stData = await api('/api/settings'); stRender(); } catch (e) { if (!e.auth) toast(e.message, true); } }
+  async function stSave(body) {
+    try {
+      const r = await api('/api/settings', { method: 'POST', body: JSON.stringify(body) });
+      $('sterr').classList.add('hidden'); toast(r.saved ? 'Saved: restart to apply' : 'Nothing changed'); await loadSettings();
+    } catch (e) { if (e.auth) return; $('sterr').innerHTML = `<span class="ecode">${esc(e.code || 'ERROR')}</span><span class="msg">${esc(e.message + '\nNothing was saved.')}</span>`; $('sterr').classList.remove('hidden'); }
+  }
+  $('stsave').onclick = () => stSave({ set: stChanges() });
+  $('streset').onclick = () => stRender();
+  $('stfilesave').onclick = () => stSave({ text: $('sttext').value });
+  async function stRestart() {
+    try { await api('/api/restart', { method: 'POST' }); } catch (e) { if (!e.auth) toast(e.message, true); return; }
+    $('sthead').innerHTML = '<div><h3>Restarting…</h3><p>The server takes its final snapshot, and starts again with the settings saved.</p></div>';
+    const t = Date.now();
+    for (;;) {
+      await new Promise((ok) => setTimeout(ok, 500));
+      try { const r = await fetch('/api/status', { headers: { Authorization: 'Bearer ' + token } }); if (r.ok) break; } catch (_) {}
+      if (Date.now() - t > 60000) { toast('The server has not come back: look at its log', true); return; }
+    }
+    toast('Restarted with the settings saved'); await loadSettings(); refresh();
+  }
+
   // ---- tabs, shortcuts, timers
   function showTab(name) {
     for (const b of document.querySelectorAll('.tab')) b.setAttribute('aria-selected', String(b.dataset.tab === name));
-    for (const t of ['console', 'changes', 'functions', 'acl', 'backup']) $('tab-' + t).classList.toggle('hidden', t !== name);
+    for (const t of ['console', 'changes', 'functions', 'acl', 'backup', 'settings']) $('tab-' + t).classList.toggle('hidden', t !== name);
     if (name === 'functions') loadFunctions(true);
+    if (name === 'settings') loadSettings();
     if (name === 'acl') acl(); if (name === 'backup') renderBackup(); if (name === 'changes') { feedEmpty(); if (!$('csql').value.trim() && tablesCache[0]) $('csql').value = `SELECT * FROM ${qid(tablesCache[0].name)}`; }
     store.set('sqzdb.tab', name);
   }
@@ -1134,7 +1508,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   $('tfilter').addEventListener('keydown', (e) => { if (e.key === 'Escape') { $('tfilter').value = ''; filter = ''; tablesKey = ''; renderTables(); $('tfilter').blur(); } if (e.key === 'Enter') { const r = $('tables').querySelector('.trow'); if (r) r.click(); } });
 
   syncEditor(); renderEmpty(); feedEmpty();
-  const tab0 = store.get('sqzdb.tab', 'console'); showTab(['console', 'changes', 'functions', 'acl', 'backup'].includes(tab0) ? tab0 : 'console');
+  const tab0 = store.get('sqzdb.tab', 'console'); showTab(['console', 'changes', 'functions', 'acl', 'backup', 'settings'].includes(tab0) ? tab0 : 'console');
   if (!token) { setConn('warn', 'locked'); showGate(''); } else refresh();
   setInterval(refresh, 2000);
 })();

@@ -28,7 +28,8 @@ fn main() {
     }
 }
 fn usage() -> ! {
-    eprintln!("usage:\n  sqzdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--functions <folder>] [--proxy <http://host:port>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps (with --proxy, in front of your app: what isn't the API's goes on to it); with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.\n  sqzdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqzdb shell <host:port> --token <t>    The same over TCP against a running server.\n  sqzdb deploy <folder> <dir>            Deploy the app's functions in <folder> (.ts, .js) to a database directory (not open elsewhere).\n  sqzdb deploy <folder> <host:port> --token <t>   The same to a running server, over its TCP port.\n      `serve --functions <folder>` deploys a folder when the server starts, and again whenever it changes.");
+    eprintln!("usage:\n  sqzdb serve <dir> [--config <file.toml>] [--ui <addr>] [--tcp <addr>] [--socket <path>] [--app <addr>] [--domain <name>[,<name>...]] [--email <address>] [--token <secret>] [--functions <folder>] [--proxy <http://host:port>] [--durable]\n      Serve a database directory. --ui opens the web console (bind it to 127.0.0.1 unless you mean otherwise).\n      --app serves the app API to browsers and mobile apps (with --proxy, in front of your app: what isn't the API's goes on to it); with --domain, over https with a certificate from Let's Encrypt for\n      those names, renewed automatically (bind --app to port 443 of the address the names point to; --email for expiry notices).\n      --ui and --tcp need a token; without --token one is generated and printed once.
+      Settings come from --config, or else <dir>/sqzdb.toml (yours alone): the console's Settings tab writes it and restarts the server.\n  sqzdb shell <dir>                      Open the directory in this process and run SQL interactively.\n  sqzdb shell <host:port> --token <t>    The same over TCP against a running server.\n  sqzdb deploy <folder> <dir>            Deploy the app's functions in <folder> (.ts, .js) to a database directory (not open elsewhere).\n  sqzdb deploy <folder> <host:port> --token <t>   The same to a running server, over its TCP port.\n      `serve --functions <folder>` deploys a folder when the server starts, and again whenever it changes.");
     std::process::exit(2)
 }
 fn flag(a: &[String], name: &str) -> Option<String> { a.iter().position(|s| s == name).and_then(|i| a.get(i + 1).cloned()) }
@@ -44,7 +45,13 @@ fn serve(a: &[String]) {
     raise_open_files();
     let dir = a.first().filter(|s| !s.starts_with("--")).map(std::path::PathBuf::from).unwrap_or_else(|| usage());
     let mut opts = Map::new(); let mut listen = Map::new();
-    if let Some(f) = flag(a, "--config") { opts.insert("configFile".into(), json!(f)); }
+    // the settings: the file --config names; else the database's own sqzdb.toml (written by the console's Settings
+    // tab), read only if it is this user's alone
+    let settings = match flag(a, "--config") { Some(f) => std::path::PathBuf::from(f), None => dir.join("sqzdb.toml") };
+    if flag(a, "--config").is_some() || settings.exists() {
+        if flag(a, "--config").is_none() { sqzdb::config::private_file(&settings).unwrap_or_else(|e| fail(e)); }
+        opts.insert("configFile".into(), json!(settings.display().to_string()));
+    }
     if has(a, "--durable") { opts.insert("durable".into(), json!(true)); }
     if let Some(v) = flag(a, "--ui") { listen.insert("http".into(), json!(v)); }
     if let Some(v) = flag(a, "--tcp") { listen.insert("tcp".into(), json!(v)); }
@@ -58,10 +65,22 @@ fn serve(a: &[String]) {
     if let Some(e) = flag(a, "--email") { tls.insert("email".into(), json!(e)); }
     if !tls.is_empty() { app.insert("tls".into(), J::Object(tls)); }
     if !app.is_empty() { opts.insert("app".into(), J::Object(app)); }
+    // a console or TCP port without a token of yours gets one: generated and printed (kept across a restart the console
+    // asks for, so its page stays connected)
     let mut printed_token = None;
-    match flag(a, "--token") { Some(t) => { listen.insert("token".into(), json!(t)); } None => if listen.contains_key("http") || listen.contains_key("tcp") { let t = random_token(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t); } }
-    if !listen.is_empty() { opts.insert("listen".into(), J::Object(listen)); }
-    let cfg = Config::load(&dir, Some(&J::Object(opts).to_string())).unwrap_or_else(|e| fail(e));
+    let generated = || std::env::var("SQZDB_RESTART_TOKEN").ok().filter(|t| !t.is_empty()).unwrap_or_else(random_token);
+    match flag(a, "--token") { Some(t) => { listen.insert("token".into(), json!(t)); } None => if listen.contains_key("http") || listen.contains_key("tcp") { let t = generated(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t); } }
+    if !listen.is_empty() { opts.insert("listen".into(), J::Object(listen.clone())); }
+    let flags = { let mut f = opts.clone(); f.remove("configFile"); J::Object(f) };
+    let cfg = match Config::load(&dir, Some(&J::Object(opts.clone()).to_string())) {
+        // the settings file opens a console or a TCP port and names no token: one is generated, as with --ui
+        Err(e) if e.contains("needs listen.token") && printed_token.is_none() => {
+            let t = generated(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t);
+            opts.insert("listen".into(), J::Object(listen)); Config::load(&dir, Some(&J::Object(opts).to_string())).unwrap_or_else(|e| fail(e))
+        }
+        r => r.unwrap_or_else(|e| fail(e)),
+    };
+    sqzdb::ui::serve_settings(settings.clone(), flags);
     let t = Instant::now(); let sql = Sql::open_with(&dir, cfg.clone()).unwrap_or_else(|e| fail(e));
     let rows = sql.snapshot_rows();
     println!("sqzdb serving {} ({} tables, {} rows, opened in {:.0} ms)", dir.display(), sql.db.table_names().len(), rows, t.elapsed().as_secs_f64() * 1e3);
@@ -77,11 +96,22 @@ fn serve(a: &[String]) {
         if let Some(p) = &cfg.app.proxy { println!("  proxy:      everything else to {}", p.to); }
     }
     if let Some(d) = &cfg.functions.dir { let names: Vec<String> = sql.function_defs().into_iter().map(|f| f.name).collect(); println!("  functions:  {} from {}{}: {}", names.len(), d.display(), if cfg.functions.watch { " (watched)" } else { "" }, names.join(", ")); }
-    if let Some(t) = printed_token { println!("  token:      {t}   (generated; pass --token to choose one)"); }
+    if let Some(t) = &printed_token { println!("  token:      {t}   (generated; pass --token to choose one)"); }
+    println!("  settings:   {}{}", settings.display(), if settings.exists() { "" } else { "  (none yet: the console's Settings tab writes it)" });
     unsafe { libc::signal(libc::SIGINT, on_signal as libc::sighandler_t); libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t); }
-    while !STOP.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(100)); }
+    while !STOP.load(Ordering::Relaxed) && !sqzdb::ui::restart_requested() { std::thread::sleep(Duration::from_millis(100)); }
     let t = Instant::now(); let st = sql.snapshot(); sql.close();
     println!("\nstopped: final snapshot of {} rows in {:.0} ms", st.rows, t.elapsed().as_secs_f64() * 1e3);
+    if sqzdb::ui::restart_requested() && !STOP.load(Ordering::Relaxed) {
+        // the console asked: this same command again, in this process (its id, and a service manager's view of it,
+        // stay), now with the settings saved
+        use std::os::unix::process::CommandExt;
+        println!("restarting with the settings in {}", settings.display());
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "sqzdb".into()));
+        c.args(std::env::args_os().skip(1));
+        if let Some(t) = &printed_token { c.env("SQZDB_RESTART_TOKEN", t); }
+        fail(format!("restart: {}", c.exec()));
+    }
 }
 
 /// `deploy <folder> <dir | host:port --token t>`: the folder's functions, as one `DEPLOY FUNCTIONS` statement.

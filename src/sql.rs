@@ -289,6 +289,10 @@ fn tokens(s: &str) -> Vec<String> {
     }
     out
 }
+/// An identity tried to set the role column of a sign-in table.
+fn role_denied(schema: &Schema, c: usize) -> String {
+    format!("permission denied: {}.{} decides a signed-in user's role, so only the application sets it (in a function: ctx.admin)", schema.name, schema.columns[c].name)
+}
 fn literal_tok(t: &str) -> Result<Value, String> {
     if t.starts_with('\'') { return Ok(Value::Text(t.trim_matches('\'').to_string())); }
     if let Ok(i) = t.parse::<i64>() { return Ok(Value::Int(i)); }
@@ -296,7 +300,8 @@ fn literal_tok(t: &str) -> Result<Value, String> {
     match t.to_uppercase().as_str() { "TRUE" => Ok(Value::Bool(true)), "FALSE" => Ok(Value::Bool(false)), _ => Err(format!("bad literal {t}")) }
 }
 fn priv_of(t: &str) -> Result<u8, String> { match t.to_uppercase().as_str() { "SELECT" => Ok(P_SELECT), "INSERT" => Ok(P_INSERT), "UPDATE" => Ok(P_UPDATE), "DELETE" => Ok(P_DELETE), "ALL" => Ok(P_SELECT | P_INSERT | P_UPDATE | P_DELETE), x => Err(format!("unknown privilege {x}")) } }
-pub fn is_admin_stmt(sql: &str) -> bool { let u = sql.trim_start().to_uppercase(); (u.starts_with("ALTER TABLE ") && (u.contains(" ENABLE AUTH") || u.contains(" DISABLE AUTH"))) || u.starts_with("CREATE ROLE ") || u.starts_with("CREATE USER ") || u.starts_with("GRANT ") || u.starts_with("CREATE POLICY ") || u.starts_with("CREATE INDEX ") || u.starts_with(crate::functions::FUNCTIONS_META) }
+pub fn is_admin_stmt(sql: &str) -> bool { let u = sql.trim_start().to_uppercase(); (u.starts_with("ALTER TABLE ") && (u.contains(" ENABLE AUTH") || u.contains(" DISABLE AUTH"))) || u.starts_with("CREATE ROLE ") || u.starts_with("CREATE USER ") || u.starts_with("GRANT ") || u.starts_with("CREATE POLICY ") || u.starts_with("CREATE INDEX ")
+    || u.starts_with("REVOKE ") || u.starts_with("DROP POLICY ") || u.starts_with("DROP ROLE ") || u.starts_with("DROP USER ") || u.starts_with(crate::functions::FUNCTIONS_META) }
 
 fn obj_name(n: &ObjectName) -> String { n.0.iter().map(|p| match p { ObjectNamePart::Identifier(i) => i.value.clone(), other => format!("{other}") }).collect::<Vec<_>>().join(".") }
 /// A column default: a constant, or a generator evaluated per row. A constant is checked against the column type now.
@@ -2065,7 +2070,23 @@ impl Sql {
         if let Some(k) = attrs.iter().find(|(_, v)| **v == Value::Null).map(|(k, _)| k) { return Err(format!("session attribute {k} has no value")); }
         sess.user = Some(roles.join(", ")); sess.roles = roles.to_vec(); sess.attrs = attrs; sess.assumed = true; Ok(())
     }
+    /// A statement on roles, grants, policies, users, sign-in tables or indexes. A change to who may do what ends the
+    /// live queries and subscriptions of signed-in and assumed identities (`acl_epoch`): they were compiled under the
+    /// old rules, and their clients subscribe again under the new ones.
     fn admin(&self, sess: &Session, sql: &str) -> Result<(), String> {
+        self.admin_statement(sess, sql)?;
+        if !sql.trim_start().to_uppercase().starts_with("CREATE INDEX") { self.auth.acl.fetch_add(1, std::sync::atomic::Ordering::Release); }
+        Ok(())
+    }
+    /// The column a sign-in table takes each user's role from (`ENABLE AUTH (ROLE FROM column)`), and its default, when
+    /// an identity rather than the app writes to that table: it decides a user's role, so the app alone sets it.
+    fn role_column(&self, sess: &Session, table: &Table) -> Option<(usize, Value)> {
+        if sess.user.is_none() { return None; }
+        match self.acl.read().unwrap().auth.get(&table.schema.name.to_lowercase())?.role { crate::auth::RoleSrc::Column(c) => Some((c, table.schema.columns[c].default.clone())), _ => None }
+    }
+    /// Which version of the roles, grants and policies is in force: changes with every statement that changes them.
+    pub(crate) fn acl_epoch(&self) -> u64 { self.auth.acl.load(std::sync::atomic::Ordering::Acquire) }
+    fn admin_statement(&self, sess: &Session, sql: &str) -> Result<(), String> {
         if sess.user.is_some() { return Err("permission denied: only the application session can manage roles, users and policies".into()); }
         let t = tokens(sql); let up: Vec<String> = t.iter().map(|x| x.to_uppercase()).collect();
         if up.len() >= 5 && up[0] == "ALTER" && up[1] == "TABLE" && up[4] == "AUTH" && (up[3] == "ENABLE" || up[3] == "DISABLE") {
@@ -2132,6 +2153,43 @@ impl Sql {
                     return Err(format!("unexpected token {:?}", t.get(i)));
                 }
                 acl.policies.push(Policy { name, table, role, cmds, preds }); Ok(())
+            }
+            ("REVOKE", _) => {
+                // REVOKE cmd [, cmd …] ON table FROM role
+                let mut i = 1; let mut mask = 0u8;
+                loop { mask |= priv_of(at(i)?)?; i += 1; if t.get(i).map(|x| x.as_str()) == Some(",") { i += 1; continue; } break; }
+                if up.get(i).map(|x| x.as_str()) != Some("ON") { return Err("expected ON".into()); }
+                let table = at(i + 1)?.to_lowercase();
+                if up.get(i + 2).map(|x| x.as_str()) != Some("FROM") { return Err("expected FROM".into()); }
+                let role = at(i + 3)?.clone(); if t.len() > i + 4 { return Err(format!("unexpected token {}", t[i + 4])); }
+                let Some(m) = acl.grants.get_mut(&(role.clone(), table.clone())) else { return Err(format!("role {role} has no grant on {table}")) };
+                *m &= !mask; if *m == 0 { acl.grants.remove(&(role, table)); }
+                Ok(())
+            }
+            ("DROP", Some("POLICY")) => {
+                // DROP POLICY name ON table
+                let name = at(2)?.clone();
+                if up.get(3).map(|x| x.as_str()) != Some("ON") { return Err("expected ON".into()); }
+                let table = at(4)?.to_lowercase(); if t.len() > 5 { return Err(format!("unexpected token {}", t[5])); }
+                let before = acl.policies.len(); acl.policies.retain(|p| !(p.name == name && p.table == table));
+                if acl.policies.len() == before { return Err(format!("no policy {name} on {table}")); }
+                Ok(())
+            }
+            ("DROP", Some("ROLE")) => {
+                // DROP ROLE name: only once nothing uses it (its grants, policies, users and sign-in tables say where)
+                let role = at(2)?.clone(); if t.len() > 3 { return Err(format!("unexpected token {}", t[3])); }
+                if !acl.roles.contains(&role) { return Err(format!("no such role {role}")); }
+                let mut used: Vec<String> = acl.grants.keys().filter(|(r, _)| *r == role).map(|(_, t)| format!("a grant on {t}")).collect();
+                used.extend(acl.policies.iter().filter(|p| p.role == role).map(|p| format!("policy {} on {}", p.name, p.table)));
+                used.extend(acl.users.iter().filter(|(_, u)| u.roles.contains(&role)).map(|(n, _)| format!("user {n}")));
+                used.extend(acl.auth.iter().filter(|(_, a)| matches!(&a.role, crate::auth::RoleSrc::Fixed(r) if *r == role)).map(|(t, _)| format!("sign-in on {t}")));
+                if !used.is_empty() { used.sort(); return Err(format!("role {role} is still used by {}: revoke or drop those first", used.join(", "))); }
+                acl.roles.remove(&role); Ok(())
+            }
+            ("DROP", Some("USER")) => {
+                let name = at(2)?.clone(); if t.len() > 3 { return Err(format!("unexpected token {}", t[3])); }
+                if acl.users.remove(&name).is_none() { return Err(format!("no such user {name}")); }
+                Ok(())
             }
             _ => Err(format!("unsupported admin statement: {sql}")),
         }
@@ -2264,6 +2322,9 @@ impl Sql {
             Plan::Commit => { let t = sess.txn.take().ok_or("not in a transaction")?; if let Some(e) = &t.doomed { return Err(e.clone()); } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; Ok(vec![]) }
             Plan::Insert { table, rows, returning, from, conflict } => {
                 let policy = self.guard(sess, table, P_INSERT)?;
+                // an identity inserting into a sign-in table leaves its role column as it defaults (or empty)
+                let role_col = self.role_column(sess, table);
+                if let (Some((c, _)), Conflict::Update { sets, .. }) = (&role_col, conflict) { if sets.iter().any(|(s, _)| s == c) { return Err(role_denied(&table.schema, *c)); } }
                 let schema = &table.schema; let mut encoded = Vec::with_capacity(rows.len()); let mut last_id = 0; let mut last_key: Option<Value> = None;
                 // the values of every row to insert: from VALUES, or from the SELECT's rows plus the other columns' fill
                 let plain = from.is_none() && matches!(conflict, Conflict::None);
@@ -2276,6 +2337,7 @@ impl Sql {
                         if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
                         let row = encode_row(schema, &vals)?;
                         for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
+                        if let Some((c, d)) = &role_col { let v = decode_col(schema, &row, *c); if v != Value::Null && v != *d { return Err(role_denied(schema, *c)); } }
                         if let Some(w) = &files { self.check_files(w, schema, None, &row)?; }
                         if embeds { crate::vector::embed_insert_ok(schema, &row)?; }
                         last_key = Some(decode_col(schema, &row, schema.pk));
@@ -2303,6 +2365,7 @@ impl Sql {
                     if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
                     let row = encode_row(schema, vals)?;
                     for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
+                    if let Some((c, d)) = &role_col { let v = decode_col(schema, &row, *c); if v != Value::Null && v != *d { return Err(role_denied(schema, *c)); } }
                     if let (Some(w), Conflict::None) = (&files, conflict) { self.check_files(w, schema, None, &row)?; }
                     if embeds && matches!(conflict, Conflict::None) { crate::vector::embed_insert_ok(schema, &row)?; }   // an upsert checks each row as what it becomes
                     last_key = Some(decode_col(schema, &row, schema.pk));
@@ -2323,6 +2386,7 @@ impl Sql {
                 Ok(match returning { None => vec![], Some(cols) => encoded.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() })
             }
             Plan::Update { table, sets, at, returning } => {
+                if let Some((c, _)) = self.role_column(sess, table) { if sets.iter().any(|(s, _)| *s == c) { return Err(role_denied(&table.schema, c)); } }
                 let policy = self.guard(sess, table, P_UPDATE)?;
                 // reading the rows' values (a WHERE beyond the key, a SET over the row, RETURNING) needs SELECT, as in
                 // PostgreSQL, and reaches only rows the SELECT policy shows; otherwise RETURNING or the count would
@@ -3323,6 +3387,35 @@ mod identity_tests {
     fn rows(s: &Sql, sess: &mut Session, sql: &str) -> Vec<String> { s.exec_s(sess, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")).iter().map(|r| r.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(",")).collect() }
     fn as_app(s: &Sql, sql: &str) { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")); }
     fn attrs(kv: &[(&str, Value)]) -> HashMap<String, Value> { kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() }
+    /// Access can be taken back: REVOKE, DROP POLICY, DROP USER, and DROP ROLE once nothing uses the role (the error
+    /// says what does). Each holds after a restart, and only the application may.
+    #[test] fn access_can_be_taken_back() {
+        let d = std::env::temp_dir().join(format!("sqzdb-revoke-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        for q in ["CREATE TABLE orders (id INT PRIMARY KEY, tenant INT, total INT)", "INSERT INTO orders VALUES (1, 7, 10), (2, 8, 20)", "CREATE ROLE customer",
+                  "GRANT SELECT, INSERT ON orders TO customer", "CREATE POLICY own ON orders FOR ALL TO customer USING (tenant = SESSION.tenant)", "CREATE USER alice IN ROLE customer WITH tenant = 7"] { as_app(&s, q); }
+        let customer = || { let mut c = Session::default(); s.assume(&mut c, &["customer".into()], attrs(&[("tenant", Value::Int(7))])).unwrap(); c };
+        assert_eq!(rows(&s, &mut customer(), "SELECT id FROM orders"), vec!["Int(1)"]);
+        assert!(s.exec_s(&mut customer(), "REVOKE SELECT ON orders FROM customer", &[]).unwrap_err().contains("only the application"));
+        let e = s.exec_s(&mut Session::default(), "DROP ROLE customer", &[]).unwrap_err();
+        assert_eq!(e, "role customer is still used by a grant on orders, policy own on orders, user alice: revoke or drop those first");
+        as_app(&s, "DROP POLICY own ON orders");
+        assert_eq!(rows(&s, &mut customer(), "SELECT id FROM orders ORDER BY id"), vec!["Int(1)", "Int(2)"], "no policy: every row");
+        as_app(&s, "REVOKE INSERT ON orders FROM customer");
+        assert!(s.exec_s(&mut customer(), "INSERT INTO orders VALUES (3, 7, 1)", &[]).unwrap_err().contains("lacks INSERT"));
+        assert_eq!(rows(&s, &mut customer(), "SELECT count(*) FROM orders"), vec!["Int(2)"], "SELECT stays");
+        for (q, e) in [("REVOKE DELETE ON orders FROM nobody", "role nobody has no grant on orders"), ("DROP POLICY own ON orders", "no policy own on orders"),
+                       ("DROP USER bob", "no such user bob"), ("DROP ROLE nobody", "no such role nobody"), ("REVOKE SELECT ON orders TO customer", "expected FROM")] {
+            assert_eq!(s.exec_s(&mut Session::default(), q, &[]).unwrap_err(), e, "{q}");
+        }
+        as_app(&s, "REVOKE ALL ON orders FROM customer");
+        assert!(s.exec_s(&mut customer(), "SELECT id FROM orders", &[]).unwrap_err().contains("lacks SELECT"));
+        as_app(&s, "DROP USER alice"); as_app(&s, "CREATE ROLE staff"); as_app(&s, "DROP ROLE customer");
+        drop(s);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        { let a = s.acl.read().unwrap(); assert!(a.grants.is_empty() && a.policies.is_empty() && a.users.is_empty()); assert_eq!(a.roles.iter().collect::<Vec<_>>(), vec!["staff"]); }
+        drop(s); std::fs::remove_dir_all(&d).unwrap();
+    }
     #[test] fn an_app_supplied_identity_gets_its_roles_and_attributes_and_nothing_more() {
         let d = std::env::temp_dir().join(format!("sqzdb-identity-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
         let s = Sql::open_with(&d, Config::default()).unwrap();

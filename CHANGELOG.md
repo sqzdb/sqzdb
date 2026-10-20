@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.13.0 — 2026-10-19
+
+### Added
+- **The console's Settings tab.** It covers the server's whole configuration, one section at a time from a
+  menu that shows what is on and what isn't saved:
+  - forms for the public address, sign-up tables, origins, HTTPS, sign-in and Google/GitHub, agents over MCP,
+    backup (and when a commit counts as confirmed) and the functions' limits;
+  - the whole file as text, for anything else.
+
+  With backup off, the Backup tab's **Set up backup** opens it there, instead of a file to copy.
+- **Taking access back:** `REVOKE … ON table FROM role`, `DROP POLICY name ON table`, `DROP USER name`, and
+  `DROP ROLE name`. A role can be dropped once nothing uses it; the error lists what still does.
+- **The console's Change access builder,** in the Access tab. Choose an action: create a role, grant, limit a
+  role to some rows, let users sign in to a table, create a stored user, or the removals above. Pick from the
+  roles, tables and columns that exist. It shows the statement and what it does in plain words, and warns when
+  something is missing (a policy on a table its role has no grant on). Run it there or open it in the editor.
+
+  A save is checked as the server would start with it, and keeps the file's comments. Secrets show only as set
+  or not. **Restart now** applies the settings in place (same process, same console token). It is refused while
+  the file would keep the server from starting.
+- **`sqzdb serve` without `--config` uses `<dir>/sqzdb.toml`,** the file the Settings tab writes, with mode 600.
+  It must belong to the user sqzdb runs as and be writable by no one else, or the server won't start. Backups
+  never carry it.
+
+### Fixed
+- **Security: a signed-in user could make themselves admin.** With `ENABLE AUTH (ROLE FROM role)` and a grant
+  letting users edit their own row (`GRANT UPDATE ON users` plus a policy on `SESSION.id`), `UPDATE users SET
+  role = 'admin'` worked, and their next request ran as admin. Sign-up never let a client set the role column;
+  now nothing does but the application. An update or upsert that sets it is refused for a signed-in user or an
+  assumed identity, and so is an insert with any role but the column's default. In a function, `ctx.admin` sets
+  it.
+- **Live queries and subscriptions kept the access rules they started with.** A new policy, or a grant taken
+  back, didn't reach a change subscription already open. Now any change to roles, grants, policies, users or
+  sign-in tables ends those of identities, and their clients subscribe again under the new rules.
+- A settings file that opens the console (`listen.http`) or a TCP port without `listen.token` stopped the
+  server. A token is now generated and printed, as with `--ui`.
+
 ## 0.12.0 — 2026-10-19
 
 **A standalone sqzdb is a whole backend.** Write the app's functions in the web console, and agents connected

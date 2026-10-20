@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "sqzdb"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2591,12 +2591,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "zstd",
 ]
 
 [[package]]
 name = "sqzdb_node"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "napi",
  "napi-build",

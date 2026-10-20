@@ -15,6 +15,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const PAGE: &str = include_str!("ui/index.html");
+
+/// What `sqzdb serve` tells its console about its settings: the file they are kept in (which may not exist yet), and
+/// the options its command line set, which win over the file and so are shown fixed. Unset (an embedded database):
+/// the application's code configures it, and the console only shows that.
+pub struct ServeSettings { pub path: std::path::PathBuf, pub flags: J }
+static SERVE: std::sync::OnceLock<ServeSettings> = std::sync::OnceLock::new();
+/// Saved since this process started (the settings in use are older than the file), and a restart asked for.
+static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `sqzdb serve` hands its console the settings file and its flags; it restarts the process when asked.
+pub fn serve_settings(path: std::path::PathBuf, flags: J) { let _ = SERVE.set(ServeSettings { path, flags }); }
+/// Whether the console asked the server to restart (to start with the settings saved).
+pub fn restart_requested() -> bool { RESTART.load(Relaxed) }
+/// Keys whose values are secrets: shown as set or not (or as the `${VAR}` they come from), never sent back.
+const SECRETS: &[&str] = &["secretKey", "passphrase", "clientSecret", "apiKey", "token"];
 const MAX_BODY: usize = 1 << 20; const MAX_LINE: u64 = 16 << 10; const MAX_HEADERS: usize = 64;
 /// Idle keep-alive connections and stalled writers are dropped after this long.
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -97,6 +112,12 @@ fn serve(weak: std::sync::Weak<Sql>, stream: TcpStream, token: &str) -> std::io:
                         ("GET", "/api/tables") => json_resp(&mut w, 200, &api_tables(&sql))?,
                         ("GET", "/api/status") => json_resp(&mut w, 200, &api_status(&sql))?,
                         ("GET", "/api/acl") => json_resp(&mut w, 200, &api_acl(&sql))?,
+                        ("GET", "/api/settings") => json_resp(&mut w, 200, &api_settings())?,
+                        ("POST", "/api/settings") => { let (st, v) = api_save_settings(&req.body); json_resp(&mut w, st, &v)? }
+                        ("POST", "/api/restart") => match restart_check() {
+                            Err((st, e)) => json_resp(&mut w, st, &json!({"error": e, "code": if st == 409 { "CONFLICT" } else { "CONFIG" }}))?,
+                            Ok(()) => { json_resp(&mut w, 200, &json!({"restarting": true}))?; std::thread::spawn(|| { std::thread::sleep(Duration::from_millis(150)); RESTART.store(true, Relaxed); }); }
+                        },
                         ("GET", "/api/functions") => json_resp(&mut w, 200, &api_functions(&sql))?,
                         ("POST", "/api/functions") => { let (st, v) = api_deploy(&sql, &req.body); json_resp(&mut w, st, &v)? }
                         ("POST", "/api/functions/call") => { let (st, v) = api_call(&sql, &req.body); json_resp(&mut w, st, &v)? }
@@ -171,6 +192,94 @@ fn api_status(sql: &Sql) -> J {
             "backup": backup, "followerApplied": sql.follower_applied(), "tables": sql.db.table_names().len(), "reactor": sql.live.get().map(|r| json!({"events": r.events.load(Relaxed), "reruns": r.reruns.load(Relaxed)})) })
 }
 fn cmp_sym(c: crate::sql::Cmp) -> &'static str { use crate::sql::Cmp::*; match c { Eq => "=", Ne => "<>", Lt => "<", Le => "<=", Gt => ">", Ge => ">=", IsNull => "IS NULL", IsNotNull => "IS NOT NULL", In => "IN", NotIn => "NOT IN" } }
+// ---- settings: the server's configuration file, read and written here; applied by a restart
+
+/// The settings file: its text, its values (secrets masked), which keys the command line fixes, and whether it was
+/// saved since the server started.
+fn api_settings() -> J {
+    let Some(sv) = SERVE.get() else { return json!({"editable": false}) };
+    let text = std::fs::read_to_string(&sv.path).unwrap_or_default();
+    let mut values = toml::from_str::<toml::Value>(&text).ok().and_then(|v| serde_json::to_value(v).ok()).unwrap_or(json!({}));
+    let mut secrets = serde_json::Map::new();
+    fn mask(v: &mut J, at: &str, out: &mut serde_json::Map<String, J>) {
+        let J::Object(m) = v else { return };
+        for (k, x) in m.iter_mut() {
+            let here = if at.is_empty() { k.clone() } else { format!("{at}.{k}") };
+            if SECRETS.contains(&k.as_str()) { if let J::String(s) = x { out.insert(here, json!(if s.trim_start().starts_with("${") { s.clone() } else { String::new() })); *x = json!(""); } }
+            else { mask(x, &here, out); }
+        }
+    }
+    mask(&mut values, "", &mut secrets);
+    json!({"editable": true, "path": sv.path.display().to_string(), "exists": sv.path.exists(), "text": text, "values": values, "secrets": secrets,
+           "flags": sv.flags, "saved": SAVED.load(Relaxed)})
+}
+/// Save the settings: `{"text": …}` (the whole file), or `{"set": {"app.publicUrl": …, "backup": null, …}}` (keys
+/// changed in the file as it is, comments and all; null removes one). Checked as the server would start with it
+/// (its flags over it) before it is written; written whole (a temporary file, renamed), readable by its owner only.
+fn api_save_settings(body: &[u8]) -> (u16, J) {
+    let Some(sv) = SERVE.get() else { return (409, json!({"error": "this database's settings come from its application's code", "code": "CONFLICT"})) };
+    let Ok(v) = serde_json::from_slice::<J>(body) else { return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})) };
+    let current = std::fs::read_to_string(&sv.path).unwrap_or_default();
+    let text = match (v.get("text").and_then(|t| t.as_str()), v.get("set").and_then(|s| s.as_object())) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(set)) => match patch_toml(&current, set) { Ok(t) => t, Err(e) => return (400, json!({"error": e, "code": "CONFIG"})) },
+        _ => return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})),
+    };
+    if let Err(e) = crate::config::Config::check(&text, Some(&sv.flags.to_string())) { return (400, json!({"error": e, "code": "CONFIG"})); }
+    if text == current { return (200, json!({"saved": false, "text": text})); }
+    if sv.path.exists() { if let Err(e) = crate::config::private_file(&sv.path) { return (409, json!({"error": e, "code": "CONFIG"})); } }
+    if let Err(e) = write_private(&sv.path, text.as_bytes()) { return (500, json!({"error": format!("{}: {e}", sv.path.display()), "code": "ERROR"})); }
+    SAVED.store(true, Relaxed);
+    (200, json!({"saved": true, "text": text}))
+}
+/// Whether the server can restart into its settings file as it is now (it may have been edited by hand since): the
+/// checks its start makes, so a restart never leaves it down.
+fn restart_check() -> Result<(), (u16, String)> {
+    let Some(sv) = SERVE.get() else { return Err((409, "this database runs inside its application: restart the application".into())) };
+    if !sv.path.exists() { return Ok(()); }
+    crate::config::private_file(&sv.path).map_err(|e| (409, e))?;
+    let text = std::fs::read_to_string(&sv.path).map_err(|e| (409, format!("{}: {e}", sv.path.display())))?;
+    crate::config::Config::check(&text, Some(&sv.flags.to_string())).map(|_| ()).map_err(|e| (400, format!("{}: {e}", sv.path.display())))
+}
+/// Change keys of a TOML file's text in place (comments, order and the rest untouched): a dotted key to a value,
+/// a table (an object), or nothing (null).
+fn patch_toml(text: &str, set: &serde_json::Map<String, J>) -> Result<String, String> {
+    use toml_edit::{Array, InlineTable, Item, Table, Value as TV};
+    fn value(v: &J) -> Option<TV> { match v {
+        J::String(s) => Some(s.as_str().into()), J::Bool(b) => Some((*b).into()),
+        J::Number(n) => n.as_i64().map(TV::from).or_else(|| n.as_f64().map(TV::from)),
+        J::Array(a) => Some(TV::Array(a.iter().filter_map(value).collect::<Array>())),
+        J::Object(m) => { let mut t = InlineTable::new(); for (k, x) in m { if let Some(v) = value(x) { t.insert(k, v); } } Some(TV::InlineTable(t)) }
+        J::Null => None } }
+    fn item(v: &J) -> Option<Item> { match v {
+        J::Object(m) => { let mut t = Table::new(); for (k, x) in m { if let Some(i) = item(x) { t.insert(k, i); } } Some(Item::Table(t)) }
+        v => value(v).map(Item::Value) } }
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("the file as it is: {e}"))?;
+    for (key, v) in set {
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.iter().any(|p| p.is_empty()) { return Err(format!("{key}: not a key")); }
+        let (last, parents) = parts.split_last().expect("a key");
+        let mut t = doc.as_table_mut();
+        for p in parents {
+            if t.get(p).is_none() { if v.is_null() { break; } t.insert(p, Item::Table(Table::new())); }
+            let it = t.get_mut(p).expect("there");
+            if let Some(inline) = it.as_inline_table().cloned() { *it = Item::Table(inline.into_table()); }
+            t = it.as_table_mut().ok_or_else(|| format!("{key}: {p} is not a table"))?;
+        }
+        if t.get(last).is_some() || !v.is_null() { match item(v) { Some(i) => { t.insert(last, i); } None => { t.remove(last); } } }
+    }
+    Ok(doc.to_string())
+}
+/// Write a file whole and readable by its owner only: a new temporary file next to it, then renamed over it.
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let mut o = std::fs::OpenOptions::new(); o.write(true).create_new(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; o.mode(0o600); }
+    let r = (|| { let mut f = o.open(&tmp)?; f.write_all(data)?; f.sync_all()?; std::fs::rename(&tmp, path) })();
+    if r.is_err() { let _ = std::fs::remove_file(&tmp); }
+    r
+}
+
 // ---- functions: what is deployed, deploying from here, and trying one as an identity
 
 /// The deploy: its files as written, its exports, why it doesn't load (if it doesn't), where it comes from, and the
@@ -212,9 +321,15 @@ fn api_acl(sql: &Sql) -> J {
     let mut roles: Vec<String> = a.roles.iter().cloned().collect(); roles.sort();
     let mut users: Vec<J> = a.users.iter().map(|(u, r)| json!({"name": u, "roles": r.roles, "attrs": r.attrs.iter().map(|(k, v)| (k.clone(), value_json(v, None))).collect::<serde_json::Map<_, _>>()})).collect();
     users.sort_by_key(|x| x["name"].as_str().unwrap_or("").to_string());
+    let mut auth: Vec<J> = a.auth.iter().map(|(t, at)| {
+        let cols = sql.db.table(t).map(|tb| tb.schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
+        json!({"table": t, "login": cols.get(at.login), "role": match &at.role { crate::auth::RoleSrc::Column(c) => json!({"column": cols.get(*c)}), crate::auth::RoleSrc::Fixed(r) => json!({"fixed": r}) }})
+    }).collect();
+    auth.sort_by_key(|x| x["table"].as_str().unwrap_or("").to_string());
     json!({
         "roles": roles,
         "users": users,
+        "auth": auth,
         "grants": a.grants.iter().map(|((role, table), m)| json!({"role": role, "table": table, "commands": cmds_str(*m)})).collect::<Vec<_>>(),
         "policies": a.policies.iter().map(|p| json!({"name": p.name, "table": p.table, "role": p.role, "commands": cmds_str(p.cmds), "using": p.preds.iter().map(|(c, cmp, rhs)| format!("{c} {} {}", cmp_sym(*cmp), match rhs { PolicyRhs::Lit(v) => value_json(v, None).to_string(), PolicyRhs::Attr(n) => format!("SESSION.{n}") })).collect::<Vec<_>>().join(" AND ")})).collect::<Vec<_>>(),
     })
@@ -253,5 +368,33 @@ fn stream_events(weak: &std::sync::Weak<Sql>, sess: &Session, req: &Req, mut w: 
 mod tests {
     use super::*;
     #[test] fn base64_matches_rfc4648() { assert_eq!(base64(b""), ""); assert_eq!(base64(b"f"), "Zg=="); assert_eq!(base64(b"fo"), "Zm8="); assert_eq!(base64(b"foo"), "Zm9v"); assert_eq!(base64(b"foobar"), "Zm9vYmFy"); }
+    /// The console changes keys of the settings file in place: comments, order and other keys stay; a section can be
+    /// added whole or removed; and what it writes is checked as the server would load it.
+    #[test] fn settings_are_changed_in_place() {
+        let text = "# mine: keep this\n[app]\npublicUrl = \"http://127.0.0.1:8080\"  # here\n\n[backup]\nendpoint = \"https://s3.example\"\nbucket = \"b\"\naccessKey = \"a\"\nsecretKey = \"${S3_SECRET}\"\n";
+        let set = |j: J| patch_toml(text, j.as_object().unwrap()).unwrap();
+        let t = set(json!({"app.signUp": {"users": []}, "app.mcp": {}, "auth.sessionTtl": "7d"}));
+        assert!(t.starts_with("# mine: keep this\n[app]\npublicUrl = \"http://127.0.0.1:8080\"  # here\n"), "{t}");
+        assert!(t.contains("[app.signUp]\nusers = []") && t.contains("[app.mcp]") && t.contains("[auth]\nsessionTtl = \"7d\""), "{t}");
+        assert!(t.contains("secretKey = \"${S3_SECRET}\""), "a reference to the environment stays as written");
+        let t = set(json!({"backup": null, "app.publicUrl": null, "nothing.here": null}));
+        assert!(!t.contains("[backup]") && !t.contains("publicUrl") && !t.contains("nothing"), "{t}");
+        assert!(patch_toml("app = { publicUrl = \"x\" }\n", json!({"app.origins": ["*"]}).as_object().unwrap()).unwrap().contains("origins = [\"*\"]"), "an inline table becomes a table");
+        assert!(patch_toml(text, json!({"app.publicUrl.x": 1}).as_object().unwrap()).is_err(), "a value is not a table");
+        assert!(crate::config::Config::check("[functions]\ntimeout = \"0s\"\n", None).unwrap_err().contains("functions.timeout"));
+        assert!(crate::config::Config::check("[app]\npublicUrl = \"http://127.0.0.1:8080\"\n[app.mcp]\n", Some(r#"{"listen": {"app": "127.0.0.1:8080"}}"#)).is_ok());
+    }
+    /// A settings file sqzdb reads without being told to must be its user's alone.
+    #[cfg(unix)] #[test] fn an_unnamed_settings_file_is_its_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = std::env::temp_dir().join(format!("sqzdb-settings-{}.toml", std::process::id()));
+        write_private(&p, b"").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(crate::config::private_file(&p).is_ok());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(crate::config::private_file(&p).unwrap_err().contains("others may write it"));
+        std::fs::remove_file(&p).unwrap();
+        assert!(crate::config::private_file(&std::env::temp_dir()).unwrap_err().contains("not a regular file"));
+    }
     #[test] fn csp_allows_only_the_page_script() { let c = csp(); assert!(c.contains("script-src 'sha256-") && !c.contains("script-src 'unsafe-inline'")); assert!(PAGE.matches("<script>").count() == 1, "the hash covers exactly one inline script"); }
 }

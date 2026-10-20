@@ -58,7 +58,9 @@ pub fn is_system(name: &str) -> bool { let n = name.as_bytes(); (n.len() >= 6 &&
 /// the users table and the auth system tables bump on every write (`Table::watch`).
 #[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>, create_lock: Mutex<()>,
     /// device login: the devices waiting for a signed-in browser to let them in, by device code
-    devices: Mutex<HashMap<String, Device>> }
+    devices: Mutex<HashMap<String, Device>>,
+    /// bumped by every change to roles, grants, policies, users or sign-in tables (`Sql::acl_epoch`)
+    pub(crate) acl: std::sync::atomic::AtomicU64 }
 /// A device waiting to be let in (device login, RFC 8628): the code its user enters, the name it gave itself, the
 /// address it asked from, when it asked and last polled; once someone decided, the session made for it (and its
 /// table) or a refusal.
@@ -669,6 +671,28 @@ mod tests {
         assert!(!verify_password("x y z", "not a hash"));
     }
 
+    /// The column a user's role comes from is the application's alone: a user may edit their own row, but setting the
+    /// role (an UPDATE, an INSERT with another role, an upsert) is refused, for a signed-in user and an assumed
+    /// identity alike. Otherwise "edit your profile" would be "make yourself admin".
+    #[test] fn only_the_app_sets_a_users_role() {
+        let d = tmp("rolecol"); let s = Sql::open_with(&d, Config::default()).unwrap(); setup(&s);
+        for st in ["GRANT SELECT, INSERT, UPDATE ON users TO member", "CREATE POLICY me ON users FOR ALL TO member USING (id = SESSION.id)"] { q(&s, st); }
+        let eve = s.sign_up("users", &[("email".into(), text("eve@x.test"))], "the password 1").unwrap();
+        let mut me = as_token(&s, &eve.token).unwrap();
+        assert!(qs(&s, &mut me, "UPDATE users SET name = 'Eve' WHERE id = 1").is_ok(), "her own row, another column");
+        for bad in ["UPDATE users SET role = 'admin' WHERE id = 1", "UPDATE users SET role = 'admin', name = 'x' WHERE id = 1", "UPDATE users SET role = 'member' WHERE id = 1",
+                    "INSERT INTO users (id, email, role) VALUES (1, 'eve@x.test', 'admin') ON CONFLICT (id) DO UPDATE SET role = excluded.role"] {
+            assert!(qs(&s, &mut me, bad).unwrap_err().contains("users.role decides a signed-in user's role"), "{bad}");
+        }
+        let mut id = Session::default(); s.assume(&mut id, &["member".into()], [("id".to_string(), Value::Int(9))].into_iter().collect()).unwrap();
+        assert!(qs(&s, &mut id, "INSERT INTO users (id, email, role) VALUES (9, 'nine@x.test', 'admin')").unwrap_err().contains("only the application sets it"));
+        assert!(qs(&s, &mut id, "INSERT INTO users (id, email) VALUES (9, 'nine@x.test')").is_ok(), "the role as it defaults");
+        assert_eq!(s.session_from_token(&mut Session::default(), &eve.token).map(|_| ()), Ok(()));
+        let mut again = as_token(&s, &eve.token).unwrap(); assert_eq!(again.roles, vec!["member".to_string()]);
+        q(&s, "UPDATE users SET role = 'admin' WHERE id = 1");
+        again = as_token(&s, &eve.token).unwrap(); assert_eq!(again.roles, vec!["admin".to_string()], "the app may");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
     #[test] fn sign_up_sign_in_and_policies_per_user() {
         let d = tmp("flow"); let s = Sql::open_with(&d, Config::default()).unwrap(); setup(&s);
         let ann = s.sign_up("users", &[("email".into(), text("Ann@Example.com ")), ("name".into(), text("Ann")), ("tenant".into(), Value::Int(7))], "correct horse").unwrap();

@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.12.0` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.13.0` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -474,6 +474,15 @@ Nothing about the user is stored in the database.
 - A missing attribute is an error, not an empty result. So is an unknown role, or an attribute that is
   `undefined`.
 - An identity can never change the schema, roles, grants or policies. Only the application's own handle can.
+- Access can be taken back: `REVOKE SELECT, INSERT ON orders FROM customer` (or `REVOKE ALL …`),
+  `DROP POLICY own_orders ON orders`, `DROP USER alice`, and `DROP ROLE customer`. A role can be dropped only
+  once nothing uses it, and the error lists what still does.
+- A change to roles, grants, policies, users or sign-in tables ends the live queries and subscriptions of
+  identities, which were made under the old rules. Their clients subscribe again under the new ones (the
+  browser client does it by itself). The application's own handle is unaffected.
+- The web console's **Access** tab builds these statements from choices: pick what to do, then a role, a table,
+  its columns and the session attributes to compare with. It shows the SQL and what it means in plain words
+  before you run it, or opens it in the SQL editor.
 - Creating an identity costs about 1.4 µs in Node, and a policy adds about 0.1 µs to a point read, so
   one identity per request is fine.
 
@@ -487,6 +496,13 @@ in with a password, use the next section instead.
 Mark a table you define as the one users sign in to. Its `UNIQUE` text column is the login, and each
 user's role comes from a column or is fixed. A signed-in user acts with their row's columns as
 `SESSION` attributes, so policies such as `USING (owner = SESSION.id)` apply per user.
+
+The table is yours: your columns, visible in the console, queried and joined like any other. Passwords and
+sessions are never in it. They live in sqzdb's own tables (`_auth_secrets`, `_auth_sessions`, and with
+providers `_auth_identities`), which no query can read or write. The role column is the application's
+alone. Users may edit their own row if you grant it, but setting the role column is refused for anyone but the
+application, whether by an update, an insert with another role, or an upsert. In a function, `ctx.admin` sets
+it.
 
 ```sql
 CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, name TEXT, role TEXT DEFAULT 'member', tenant_id INT);
@@ -1137,7 +1153,7 @@ Everything is built on the change log, so backups never pause the database.
 ### Web console and command line
 
 ```sh
-sqzdb serve ./data/shop --ui 127.0.0.1:7780 --tcp 0.0.0.0:7781   # own a database, serve it
+sqzdb serve ./data/shop --ui 127.0.0.1:7780 --tcp 0.0.0.0:7781   # own a database, serve it (settings: ./data/shop/sqzdb.toml)
 sqzdb serve ./data/shop --app 0.0.0.0:8080 --config app.toml     # … to browsers and mobile apps
 sqzdb serve ./data/shop --app 0.0.0.0:443 --domain api.shop.com   # … over https, certificate from Let's Encrypt
 sqzdb shell ./data/shop                                          # SQL in the terminal
@@ -1157,7 +1173,14 @@ that keeps results current, a feed of changes, and the roles, grants and policie
 holds the app's [functions](#functions-your-apps-rules-in-the-database): write, paste or upload `.ts` and `.js`
 files and deploy them (a failed deploy names the line and changes nothing), see each export and whether
 agents get it as a tool, and call one with arguments as the app or as a role with attributes. When the
-server deploys a folder (`--functions`), the tab shows that folder's files read-only. Its **Backup** tab
+server deploys a folder (`--functions`), the tab shows that folder's files read-only.
+
+Its **Settings** tab edits the server's [settings file](#configuration). The form covers the public address,
+sign-up tables, origins, HTTPS, sign-in and providers, agents over MCP, backup and the functions' limits, and
+the whole file can be edited as text for anything else. Secrets show as set or not, never their values. A save
+is checked as the server would start with it, then written with comments and the rest of the file kept.
+Settings apply when the server restarts: **Restart now** does that in place (same process, same console token),
+and is refused while the file would keep the server from starting. Its **Backup** tab
 shows whether uploads are healthy, how far the bucket is behind, the last error and a connection test;
 when backup is off, it writes the settings file and the restart command for your bucket. It is one HTML page compiled into the binary, with no build step. Bind it
 to loopback unless you intend otherwise: it acts as the application and sees everything.
@@ -1174,9 +1197,14 @@ It runs on the database's own threads, not on the event loop, and costs about 0.
 ## Configuration
 
 Every binding accepts the same options. Values passed in code override a TOML file named by
-`configFile`, which overrides the defaults. The data directory itself is never read for configuration,
-so a directory others can write to cannot redirect your backups or open a listener. Unknown keys are
-errors, so a typo never silently disables anything.
+`configFile`, which overrides the defaults. An embedded database never reads configuration from its data
+directory, so a directory others can write to cannot redirect your backups or open a listener. Unknown keys
+are errors, so a typo never silently disables anything.
+
+`sqzdb serve` reads the file `--config` names; without it, `<dir>/sqzdb.toml`, the file the web console's
+**Settings** tab writes. That file must belong to the user sqzdb runs as and be writable by no one else, or the
+server refuses to start. The console writes it with mode 600, and backups never carry it. Flags on the command
+line win over the file. `${VAR}` in a value is taken from the environment, which keeps secrets out of the file.
 
 ```js
 const db = open('./data/orders', {
@@ -1455,7 +1483,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.12.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.13.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

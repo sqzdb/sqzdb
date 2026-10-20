@@ -59,14 +59,38 @@ impl Config {
         if let Some(p) = &code.config_file {
             let path = Path::new(p);
             let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let text = interpolate(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            file = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            if file.config_file.is_some() { return Err(format!("{}: configFile cannot be set from a file", path.display())); }
+            file = file_from_text(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         file.overlay(code).resolve()
     }
+    /// The configuration a file's text would give, with these options over it (as `sqzdb serve`'s flags are): checked
+    /// before the console saves a file, so a server never restarts into one it can't start with.
+    pub fn check(text: &str, options: Option<&str>) -> Result<Config, String> {
+        let code: ConfigFile = match options { Some(j) if !j.trim().is_empty() && j.trim() != "null" => serde_json::from_str(j).map_err(|e| format!("options: {e}"))?, _ => ConfigFile::default() };
+        file_from_text(text)?.overlay(code).resolve()
+    }
     /// Options alone (no file), as the bindings send them.
     pub fn from_json(json: &str) -> Result<Config, String> { let code: ConfigFile = serde_json::from_str(json).map_err(|e| format!("options: {e}"))?; code.resolve() }
+}
+
+/// A configuration file's text, its `${VAR}`s filled in from the environment.
+fn file_from_text(text: &str) -> Result<ConfigFile, String> {
+    let file: ConfigFile = toml::from_str(&interpolate(text)?).map_err(|e| e.to_string())?;
+    if file.config_file.is_some() { return Err("configFile cannot be set from a file".into()); }
+    Ok(file)
+}
+/// Whether a configuration file is safe to read without being named: a regular file owned by the user this process
+/// runs as, that no one else may write (else whoever can write the database directory could redirect its backups or
+/// open a listener). Unix only; elsewhere, any file.
+pub fn private_file(path: &Path) -> Result<(), String> {
+    let m = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !m.file_type().is_file() { return Err(format!("{}: not a regular file", path.display())); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        if m.uid() != unsafe { libc::geteuid() } { return Err(format!("{}: owned by another user; it must be yours (chown it, or name it with --config)", path.display())); }
+        if m.mode() & 0o022 != 0 { return Err(format!("{}: others may write it; make it yours alone (chmod 600)", path.display())); }
+    }
+    Ok(())
 }
 
 /// Continuous backup to an S3-compatible bucket (see `cloud.rs`).

@@ -45,7 +45,9 @@ impl Drop for Subscription { fn drop(&mut self) { self.q.closed.store(true, Orde
 /// `since`: the log position when the subscription was made; it receives exactly the changes committed after it.
 struct Sub { table: u16, preds: Vec<CPred>, policies: Vec<CPred>, q: Arc<Queue>, key: Option<(usize, i64)>, since: u64,
     /// For a session from a sign-in token: its identity, checked again whenever sign-in state changes.
-    ident: Option<Session> }
+    ident: Option<Session>,
+    /// made by a signed-in or assumed identity, not the app: it ends when roles, grants or policies change
+    bound: bool }
 struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<(usize, ColType)>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, last_run: Option<Instant>,
     /// its last re-run started while writes were still publishing, so it runs again (at least SETTLE_RETRY later)
     retry: bool, q: Arc<Queue> }
@@ -109,7 +111,7 @@ impl Reactor {
     }
     fn run(&self, start: u64) {
         let (mut feed, durable_only) = { let Some(sql) = self.sql.upgrade() else { return }; (sql.subscribe(start), sql.db.durable) };
-        let mut auth_seen = { let Some(sql) = self.sql.upgrade() else { return }; sql.auth_epoch() };
+        let (mut auth_seen, mut acl_seen) = { let Some(sql) = self.sql.upgrade() else { return }; (sql.auth_epoch(), sql.acl_epoch()) };
         loop {
             if self.stop.load(Ordering::Relaxed) { return; }
             // sleep until something is appended, or until a dirty query is due
@@ -119,6 +121,16 @@ impl Reactor {
             let recs = feed.poll_raw(); let now = Instant::now();
             // sign-in state changed: a subscription or live query whose token no longer holds, or whose identity changed
             // (another role, other attributes), ends; the client sees it dropped and subscribes again
+            // roles, grants or policies changed: what signed-in and assumed identities subscribed to was compiled under
+            // the old rules. Each ends (its client sees it dropped and subscribes again); the app's own go on
+            let acl = sql.acl_epoch();
+            if acl != acl_seen {
+                acl_seen = acl; let last = self.last_seq.load(Ordering::Relaxed);
+                let mut st = self.state.lock().unwrap();
+                for sub in st.subs.iter_mut() { if sub.bound { let _ = sub.q.push(Event::Overflow { last_seq: last }); sub.q.closed.store(true, Ordering::Relaxed); } }
+                for live in st.lives.iter_mut() { if live.sess.user.is_some() { let _ = live.q.push(Event::Overflow { last_seq: last }); live.q.closed.store(true, Ordering::Relaxed); } }
+                let before = st.subs.len(); st.subs.retain(|s| !s.q.closed.load(Ordering::Relaxed)); if st.subs.len() != before { st.reindex(); } st.lives.retain(|l| !l.q.closed.load(Ordering::Relaxed));
+            }
             let ep = sql.auth_epoch();
             if ep != auth_seen {
                 auth_seen = ep; let last = self.last_seq.load(Ordering::Relaxed);
@@ -200,7 +212,7 @@ impl Reactor {
         let key = { let mut all: Vec<Pred> = sp.preds.clone(); match &sp.access { Access::Pk(e) => all.push(Pred { col: sp.table.schema.pk, cmp: Cmp::Eq, rhs: e.clone() }), Access::Index(ix, e) => all.push(Pred { col: ix.col, cmp: Cmp::Eq, rhs: e.clone() }), _ => {} }
             all.iter().find_map(|p| if p.cmp == Cmp::Eq && sp.table.schema.columns[p.col].ty == crate::table::ColType::Int { match &p.rhs { Expr::Lit(Value::Int(v)) => Some((p.col, *v)), Expr::Param(i) => match params.get(*i) { Some(Value::Int(v)) => Some((p.col, *v)), _ => None }, _ => None } } else { None }) };
         let q = Arc::new(Queue::new(sql.cfg.live.queue));
-        { let mut st = self.state.lock().unwrap(); st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)) }); st.reindex(); }
+        { let mut st = self.state.lock().unwrap(); st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)), bound: sess.user.is_some() }); st.reindex(); }
         Ok(Subscription { q })
     }
     /// Watch a query: returns its current result and a handle that receives `Event::Live` whenever the result changes.
@@ -256,6 +268,25 @@ mod tests {
         drop(sub); drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A change to roles, grants or policies ends what an identity subscribed to (it was compiled under the old rules,
+    /// and its client subscribes again); the app's own live queries go on.
+    #[test] fn new_rules_end_an_identitys_live_queries() {
+        let d = std::env::temp_dir().join(format!("sqzdb-live-{}-acl", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let mut cfg = Config::default(); cfg.live.debounce = Duration::ZERO;
+        let s = Sql::open_with(&d, cfg).unwrap(); let mut app = Session::default();
+        for q in ["CREATE TABLE notes (id INT PRIMARY KEY, owner INT)", "INSERT INTO notes VALUES (1, 7), (2, 8)", "CREATE ROLE member", "GRANT SELECT ON notes TO member"] { s.exec_s(&mut app, q, &[]).unwrap(); }
+        let mut ann = Session::default(); s.assume(&mut ann, &["member".into()], [("id".to_string(), Value::Int(7))].into_iter().collect()).unwrap();
+        let (hers, rows) = s.reactor().watch(&ann, "SELECT id FROM notes ORDER BY id", &[]).unwrap(); assert_eq!(rows.len(), 2);
+        let (mine, _) = s.reactor().watch(&app, "SELECT id FROM notes ORDER BY id", &[]).unwrap();
+        s.exec_s(&mut app, "CREATE POLICY own ON notes FOR ALL TO member USING (owner = SESSION.id)", &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop { match hers.recv_timeout(deadline.saturating_duration_since(Instant::now())) { Some(Event::Overflow { .. }) => break, Some(_) => {}, None => panic!("her live query went on under the old rules") } }
+        s.exec_s(&mut app, "INSERT INTO notes VALUES (3, 7)", &[]).unwrap();
+        until(&mine, &[vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]);
+        let (again, rows) = s.reactor().watch(&ann, "SELECT id FROM notes ORDER BY id", &[]).unwrap();
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(3)]], "subscribed again: the new policy applies");
+        drop(hers); drop(mine); drop(again); drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
     /// The rows a live query returns, once they are `want` (or it fails after 2 s).
     fn until(sub: &Subscription, want: &[Vec<Value>]) {
         let deadline = Instant::now() + Duration::from_secs(2); let mut last = None;
