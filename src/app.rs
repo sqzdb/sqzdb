@@ -634,10 +634,11 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
         // (/_sqz/device), and it polls for its session
         ("POST", ["api", "auth", "device"]) => if !st.allow(ip) { json_resp(429, &limited(), &h) } else {
             let v = if req.body.iter().all(|b| b.is_ascii_whitespace()) { Ok(json!({})) } else { body_json(req) };
-            match v.and_then(|v| sql.device_start(v.get("name").and_then(|n| n.as_str()).unwrap_or("")).map_err(|e| json!({"error": e, "code": "LIMIT"}))) {
+            match v.and_then(|v| sql.device_start(v.get("name").and_then(|n| n.as_str()).unwrap_or(""), &ip.to_string()).map_err(|e| json!({"error": e, "code": "LIMIT"}))) {
+                // (no verification_uri_complete: a link that carries the code is a phishing link waiting to happen;
+                // the user types the code their device shows)
                 Ok((device, user)) => {
-                    let page = format!("{}/_sqz/device", crate::signin::site(sql, req));
-                    json_resp(200, &json!({"device_code": device, "user_code": user, "verification_uri": page, "verification_uri_complete": format!("{page}?code={user}"),
+                    json_resp(200, &json!({"device_code": device, "user_code": user, "verification_uri": format!("{}/_sqz/device", crate::signin::site(sql, req)),
                         "expires_in": crate::auth::DEVICE_TTL.as_secs(), "interval": crate::auth::DEVICE_INTERVAL.as_secs()}), &h)
                 }
                 Err(e) => json_resp(status_of(&e), &e, &h),

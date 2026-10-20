@@ -59,9 +59,10 @@ pub fn is_system(name: &str) -> bool { let n = name.as_bytes(); (n.len() >= 6 &&
 #[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>, create_lock: Mutex<()>,
     /// device login: the devices waiting for a signed-in browser to let them in, by device code
     devices: Mutex<HashMap<String, Device>> }
-/// A device waiting to be let in (device login, RFC 8628): the code its user enters, the name it gave, when it asked
-/// and last polled; once someone decided, the session made for it (and its table) or a refusal.
-struct Device { user_code: String, name: String, at: Instant, polled: Option<Instant>, outcome: Option<Option<(String, SignedIn)>> }
+/// A device waiting to be let in (device login, RFC 8628): the code its user enters, the name it gave itself, the
+/// address it asked from, when it asked and last polled; once someone decided, the session made for it (and its
+/// table) or a refusal.
+struct Device { user_code: String, name: String, ip: String, at: Instant, polled: Option<Instant>, outcome: Option<Option<(String, SignedIn)>> }
 /// How long a device code holds, and how often its device may poll.
 pub const DEVICE_TTL: Duration = Duration::from_secs(600);
 pub const DEVICE_INTERVAL: Duration = Duration::from_secs(5);
@@ -247,7 +248,7 @@ impl Sql {
     }
     /// Device login, step 1: a device (a CLI, a server, a TV) asks to be let in. Its device code (secret: it polls with
     /// it) and the user code its user enters in a browser where they are signed in.
-    pub fn device_start(&self, name: &str) -> Result<(String, String), String> {
+    pub fn device_start(&self, name: &str, ip: &str) -> Result<(String, String), String> {
         let mut d = self.auth.devices.lock().unwrap();
         d.retain(|_, v| v.at.elapsed() < DEVICE_TTL);
         if d.len() >= 10_000 { return Err("too many devices are waiting to sign in; try again in a few minutes".into()); }
@@ -257,13 +258,14 @@ impl Sql {
         };
         let device_code = hex(&random::<32>());
         let name: String = name.chars().filter(|c| !c.is_control()).take(80).collect::<String>().trim().to_string();
-        d.insert(device_code.clone(), Device { user_code: user_code.clone(), name: if name.is_empty() { "A device".into() } else { name }, at: Instant::now(), polled: None, outcome: None });
+        d.insert(device_code.clone(), Device { user_code: user_code.clone(), name: if name.is_empty() { "a device".into() } else { name }, ip: ip.to_string(), at: Instant::now(), polled: None, outcome: None });
         Ok((device_code, user_code))
     }
-    /// The name of the device a user code belongs to, while it waits.
-    pub fn device_named(&self, code: &str) -> Option<String> {
+    /// The device a user code belongs to, while it waits: the name it gave itself, the address it asked from, and how
+    /// long ago it asked.
+    pub fn device_waiting(&self, code: &str) -> Option<(String, String, Duration)> {
         let code = user_code(code);
-        self.auth.devices.lock().unwrap().values().find(|v| v.user_code == code && v.outcome.is_none() && v.at.elapsed() < DEVICE_TTL).map(|v| v.name.clone())
+        self.auth.devices.lock().unwrap().values().find(|v| v.user_code == code && v.outcome.is_none() && v.at.elapsed() < DEVICE_TTL).map(|v| (v.name.clone(), v.ip.clone(), v.at.elapsed()))
     }
     /// Device login, step 2: the user decides, in a browser signed in with `approver` (a session token): a session of
     /// their own for the device, or (None) a refusal.

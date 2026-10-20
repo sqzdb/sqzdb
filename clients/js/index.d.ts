@@ -25,9 +25,9 @@ export interface Auth {
    *  same tab (the tab keeps the verifier the returned code needs). Resolves to the URL it went to. */
   signInWith(provider: string, opts?: { returnTo?: string }): Promise<string>;
   /** Sign in a device without a browser of its own (a CLI, a script on a server): `onCode` gets a code and the page
-   *  to enter it on, which the user opens in a browser where they are signed in; resolves once they allow it, with a
+   *  to type it on, which the user opens in a browser where they are signed in; resolves once they allow it, with a
    *  session of this device's own. Rejects with DENIED, or EXPIRED after 10 minutes. */
-  signInWithDevice(opts?: { name?: string; onCode?: (c: { code: string; url: string; urlWithCode: string; expiresIn: number }) => void | Promise<void>; signal?: AbortSignal }): Promise<SignedIn>;
+  signInWithDevice(opts?: { name?: string; onCode?: (c: { code: string; url: string; expiresIn: number }) => void | Promise<void>; signal?: AbortSignal }): Promise<SignedIn>;
   signOut(): Promise<void>;
   onChange(fn: (user: Row | null) => void): () => void;
 }

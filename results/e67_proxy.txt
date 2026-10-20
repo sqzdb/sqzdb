@@ -1,19 +1,19 @@
-banner                                                           everything else to http://127.0.0.1:45019
-a streamed page: its first part, the whole                       0 ms, 401 ms (the app waits 400 ms)
-a 64 MB upload through the API                                   92 ms
+banner                                                           everything else to http://127.0.0.1:39439
+a streamed page: its first part, the whole                       1 ms, 401 ms (the app waits 400 ms)
+a 64 MB upload through the API                                   93 ms
 checks: routing, headers, streaming, upload, HTTP/2, WebSockets  ok
 a page from the app directly (2000 requests, keep-alive)         41.3 us
-the same page through the API                                    53.0 us
+the same page through the API                                    55.9 us
 new connections to the app: 2000 requests one at a time; 50 at once; 50 again 1; 49; 0
 app.trustProxy: the sign-in limit per client behind the proxy    ok
-device login: allowed from a signed-in browser, refused, a code once ok
+device login: a code typed in a signed-in browser, allowed, refused, once ok
 part 2: cookie sessions, the sign-in page, a provider, the client in cookie mode ok
 part 3: middleware guards (by pattern and by req.path), headers, routes, HTTP/2 cookies, upgrades ok
-a connection that never sends a byte: closed after               10005 ms
-a page from the app directly                                     43.4 us
-the same page through the API, no middleware                     55.9 us
-the same page through the API and one middleware                 97.5 us
-a route the API answers (JSON)                                   47.5 us
+a connection that never sends a byte: closed after               10004 ms
+a page from the app directly                                     44.6 us
+the same page through the API, no middleware                     58.5 us
+the same page through the API and one middleware                 92.7 us
+a route the API answers (JSON)                                   54.1 us
 app.proxy.connections = 1: the second request at once waits its turn, then a 503 ok
 functions: the deployed functions don't load: http.ts: done: /oauth/done is the API's own path
 functions that don't load: the site a 503, the API answering; back once they do ok

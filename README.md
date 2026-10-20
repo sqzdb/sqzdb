@@ -752,24 +752,27 @@ a browser where its user is already signed in, as with a TV app (RFC 8628):
 const db = connect('https://api.example.com', { storage: null })
 await db.auth.signInWithDevice({
   name: 'deploy script on ci-7',                                  // the approval page shows it
-  onCode: ({ code, urlWithCode }) => console.log(`Open ${urlWithCode} (code ${code})`),
+  onCode: ({ code, url }) => console.log(`Open ${url} and type ${code}`),
 })
 // signed in: db.token is this device's own session
 ```
 
 1. The program asks for a code: `POST /api/auth/device` (with an optional `{ "name" }`). It gets a
-   `user_code` such as `JJHK-QKMT`, the page to enter it on (`/_sqz/device`, and a link with the code), and
-   a secret `device_code`.
-2. The user opens the page, signs in there if they aren't already, and sees which device is asking and as
-   whom. **Allow** gives the device a session of its own; **Deny** refuses it.
+   `user_code` such as `JJHK-QKMT`, the page to type it on (`/_sqz/device`), and a secret `device_code`.
+2. The user opens the page, signs in there if they aren't already, and types the code. The page shows the
+   name the device gave itself, the address it asked from, how long ago, and as whom it will act. **Allow**
+   gives the device a session of its own; **Deny** refuses it.
 3. The program polls `POST /api/auth/device/token` with its `device_code` every 5 s. The answer is
    `PENDING` until the user decides, `SLOW_DOWN` if it polls faster, then the session (as a sign-in
    returns it), `DENIED`, or `EXPIRED` after 10 minutes.
 
 - A code lets in one device, once. The device's session is like any other: it ends on sign-out, on a
   password change, or when sessions expire.
+- The code is always typed, never carried in a link. A link with it filled in would let anyone who starts a
+  device sign-in send a signed-in user one click away from handing over their account (device-code phishing),
+  so the page tells the user to deny a code someone sent them.
 - The page's form is bound to the browser that loaded it and to the site's origin, like the sign-in page.
-  Asking for codes is rate-limited per address.
+  Asking for codes and looking them up are rate-limited per address.
 - It works with any sign-in method. A user who signed up with Google approves a device the same way.
 
 #### Agents over MCP: Claude, ChatGPT, Claude Code

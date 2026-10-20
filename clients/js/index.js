@@ -51,11 +51,11 @@ class Auth {
     if (globalThis.location) globalThis.location.assign(to); return to;
   }
   /** Sign in a device without a browser of its own (a CLI, a script on a server): `onCode` gets a code and the page
-   *  to enter it on, which the user opens in a browser where they are signed in; resolves once they allow it, with a
+   *  to type it on, which the user opens in a browser where they are signed in; resolves once they allow it, with a
    *  session of this device's own. Rejects with DENIED, or EXPIRED after 10 minutes. */
   async signInWithDevice({ name, onCode, signal } = {}) {
     const d = await this._c._post('/api/auth/device', { name }, false);
-    await onCode?.({ code: d.user_code, url: d.verification_uri, urlWithCode: d.verification_uri_complete, expiresIn: d.expires_in });
+    await onCode?.({ code: d.user_code, url: d.verification_uri, expiresIn: d.expires_in });
     let wait = d.interval * 1000;
     for (;;) {
       await new Promise((ok, no) => { const t = setTimeout(ok, wait); signal?.addEventListener('abort', () => { clearTimeout(t); no(new SqzError('ABORTED', 'device sign-in stopped')); }, { once: true }); });

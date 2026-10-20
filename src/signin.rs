@@ -8,8 +8,10 @@
 //!   make an account, where `app.signUp` lists the table). It sets the cookie and goes back to `return`, a path on
 //!   this site or a page of `app.origins`.
 //! - `POST /_sqz/sign-out` (and a page at GET): ends the session, clears the cookie.
-//! - `GET /_sqz/device?code=…`: device login. A device (a CLI, a server) got a code from `POST /api/auth/device`; its
-//!   user, signed in here, lets it in (or not), and the device's poll gets a session of its own.
+//! - `/_sqz/device`: device login. A device (a CLI, a server) got a code from `POST /api/auth/device`; its user, signed
+//!   in here, types that code, sees which device asks (and from where, how long ago), and lets it in or not. The
+//!   code is always typed: a link with it filled in would let anyone who starts a device sign-in send a signed-in
+//!   user one click away from handing over their account.
 //!
 //! A form posts back with a value that only the browser that loaded it holds (a cookie of its own, compared with the
 //! form's field), and from the API's own origin: another site can't sign a visitor in or out.
@@ -102,18 +104,20 @@ pub(crate) fn handle(sql: &Sql, ip: IpAddr, allow: &dyn Fn() -> bool, req: &Req)
             match signed { Ok(si) => see_other(&back, &[session_cookie(sql, &si.token)]), Err(e) => sign_in_page(sql, &back, up, Some(&e)) }
         }
         ("GET", "/_sqz/sign-out") => sign_out_page(sql, &back_to(sql, &q("return"))),
-        ("GET", "/_sqz/device") => device_page(sql, req, &q("code"), None),
+        ("GET", "/_sqz/device") => device_page(sql, req, None, None),
         ("POST", "/_sqz/device") => {
             let f = form(req); let code = f.get("code").cloned().unwrap_or_default();
-            if !same_browser(sql, req, &f) { return Some(device_page(sql, req, &code, Some("This form expired, or came from another page. Try again."))); }
-            let Some(t) = signed_in(sql, req) else { return Some(device_page(sql, req, &code, None)) };
-            if !allow() { return Some(device_page(sql, req, &code, Some("Too many attempts from here; wait a little and try again."))); }
+            if !same_browser(sql, req, &f) { return Some(device_page(sql, req, None, Some("This form expired, or came from another page. Try again."))); }
+            let Some(t) = signed_in(sql, req) else { return Some(device_page(sql, req, None, None)) };
+            if !allow() { return Some(device_page(sql, req, None, Some("Too many attempts from here; wait a little and try again."))); }
+            // the code as typed: the device that asks, to allow or deny
+            if f.get("action").map(String::as_str) == Some("look") { return Some(device_page(sql, req, Some(&code), None)); }
             let allowed = f.get("action").map(String::as_str) == Some("allow");
             match sql.device_decide(&code, allowed.then_some(t.as_str())) {
                 Ok(name) => page(200, if allowed { "Device signed in" } else { "Device refused" }, &if allowed {
                     format!("<h1>{} is signed in</h1><p>It acts as you now. You can close this page and go back to it.</p>", esc(&name))
                 } else { format!("<h1>{} was not let in</h1><p>Nothing changed. You can close this page.</p>", esc(&name)) }, None),
-                Err(e) => device_page(sql, req, "", Some(&e)),
+                Err(e) => device_page(sql, req, None, Some(&e)),
             }
         }
         ("POST", "/_sqz/sign-out") => {
@@ -125,24 +129,23 @@ pub(crate) fn handle(sql: &Sql, ip: IpAddr, allow: &dyn Fn() -> bool, req: &Req)
         _ => respond(404, "text/plain", b"not found", &[]),
     })
 }
-/// The device page: to sign in first; to enter the code a device shows; or, for a code that waits, whether to let
-/// that device in as the user signed in here.
-fn device_page(sql: &Sql, req: &Req, code: &str, err: Option<&str>) -> Vec<u8> {
-    let code = crate::auth::user_code(code);
-    let here = if code.is_empty() { "/_sqz/device".to_string() } else { format!("/_sqz/device?code={}", crate::app::enc(&code)) };
-    let Some(t) = signed_in(sql, req) else { return see_other(&format!("/_sqz/sign-in?return={}", crate::app::enc(&here)), &[]) };
+/// The device page: to sign in first; to type the code a device shows; or, for a code typed here that waits, which
+/// device asks, from where and how long ago, and whether to let it in as the user signed in here.
+fn device_page(sql: &Sql, req: &Req, typed: Option<&str>, err: Option<&str>) -> Vec<u8> {
+    let code = crate::auth::user_code(typed.unwrap_or(""));
+    let Some(t) = signed_in(sql, req) else { return see_other("/_sqz/sign-in?return=%2F_sqz%2Fdevice", &[]) };
     // who is signed in here: their login, as the page shows it
     let who = sql.token_owner(&t).ok().and_then(|o| { let table = o.split_once(':')?.0.to_string(); let (tb, at) = sql.auth_table_of(&table).ok()?; let mut s = crate::sql::Session::default(); sql.session_from_token(&mut s, &t).ok()?; s.attrs.get(&tb.schema.columns[at.login].name).map(|v| match v { crate::table::Value::Text(x) => x.clone(), v => format!("{v:?}") }) }).unwrap_or_default();
     let host = host_of(&site(sql, req));
     let err = err.map(|e| format!(r#"<p class="err">{}</p>"#, esc(e))).unwrap_or_default();
-    match (!code.is_empty()).then(|| sql.device_named(&code)).flatten() {
-        Some(name) => with_form(sql, "Sign in a device", |v| format!(r#"<h1>Let {n} sign in?</h1>{err}<p>It will act as <b>{w}</b> on {h}, with everything you may do, until it signs out or you change your password.</p>
-<p class="small">Code <b>{c}</b>. Allow only a device you started yourself, just now.</p>
+    match (!code.is_empty()).then(|| sql.device_waiting(&code)).flatten() {
+        Some((name, ip, ago)) => with_form(sql, "Sign in a device", |v| format!(r#"<h1>Let this device sign in?</h1>{err}<p>A device that calls itself <b>“{n}”</b> asked {a} from <b>{ip}</b>. It will act as <b>{w}</b> on {h}, with everything you may do, until it signs out or you change your password.</p>
+<p class="small">Allow it only if you started it yourself, just now, and it shows <b>{c}</b>. If someone sent you this code, deny it.</p>
 <form method="post" action="/_sqz/device"><input type="hidden" name="form" value="{v}"><input type="hidden" name="code" value="{c}"><button name="action" value="allow">Allow</button><button class="alt" name="action" value="deny">Deny</button></form>"#,
-            n = esc(&name), w = esc(&who), h = esc(&host), c = esc(&code)), if err.is_empty() { 200 } else { 400 }),
-        None => page(if code.is_empty() && err.is_empty() { 200 } else { 400 }, "Sign in a device", &format!(r#"<h1>Sign in a device</h1>{err}{gone}<p>Enter the code your device shows. It will act as <b>{w}</b>.</p>
-<form method="get" action="/_sqz/device"><label>Code<input name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" required autofocus></label><button>Continue</button></form>"#,
-            w = esc(&who), gone = if !code.is_empty() && err.is_empty() { r#"<p class="err">That code is unknown or has expired: start again on the device.</p>"# } else { "" }), None),
+            n = esc(&name), w = esc(&who), h = esc(&host), c = esc(&code), ip = esc(&ip), a = match ago.as_secs() { s if s < 60 => format!("{s} seconds ago"), s => format!("{} minutes ago", s / 60) }), if err.is_empty() { 200 } else { 400 }),
+        None => with_form(sql, "Sign in a device", |v| format!(r#"<h1>Sign in a device</h1>{err}{gone}<p>Type the code your device shows. It will act as <b>{w}</b>.</p>
+<form method="post" action="/_sqz/device"><input type="hidden" name="form" value="{v}"><input type="hidden" name="action" value="look"><label>Code<input name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" required autofocus></label><button>Continue</button></form>"#,
+            w = esc(&who), gone = if !code.is_empty() && err.is_empty() { r#"<p class="err">That code is unknown or has expired: start again on the device.</p>"# } else { "" }), if code.is_empty() && err.is_empty() { 200 } else { 400 }),
     }
 }
 /// A page with a form: its value set as this browser's cookie too.

@@ -17,8 +17,9 @@ over MCP see the new tools at once. CLIs and servers sign in as their user with 
   agent may call, or its user's roles change, the agent gets `notifications/tools/list_changed` and lists them
   again. `initialize` now says `listChanged: true`.
 - **Device login** (RFC 8628) for programs without a browser of their own:
-  - `POST /api/auth/device` gives a code, which the user enters at `/_sqz/device` in a browser where they're
-    signed in;
+  - `POST /api/auth/device` gives a code, which the user types at `/_sqz/device` in a browser where they're
+    signed in. The page shows the device's name, address and age. The code is never carried in a link, against
+    device-code phishing;
   - **Allow** gives the program a session of its own, which it gets by polling `POST /api/auth/device/token`;
   - in the browser client, `auth.signInWithDevice({ name, onCode })` does all of it.
 

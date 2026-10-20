@@ -179,35 +179,43 @@ try {
   // the visitor), and the app is told no one
   assert.equal((await (await get('/api/me', { origin: 'https://evil.example' })).json()).code, 'AUTH');
   assert.equal((await (await get('/headers', { origin: 'https://evil.example' })).json())['x-sqz-user'], undefined);
-  // device login: a device asks for a code, Ann lets it in from this signed-in browser, it gets a session of its own
+  // device login: a device asks for a code, Ann types it in this signed-in browser and lets it in, and it gets a
+  // session of its own. The code is always typed: a link with it filled in shows the empty form
   {
     const { connect } = await import('./index.js');
     const waitFor = async (f) => { for (let i = 0; i < 100 && !f(); i++) await new Promise((ok) => setTimeout(ok, 20)); assert.ok(f()); };
-    const dev = connect(base, { storage: null }); let shown;
+    const formIn = (html) => html.match(/name="form" value="([0-9a-f]+)"/)[1];
+    // (as other addresses, behind the trusted proxy: device sign-ins count against an address's sign-in budget)
+    const browser = { origin: base, 'x-forwarded-for': '198.51.100.7' };
+    const viaDevice = (u, i = {}) => fetch(u, { ...i, headers: { ...(i.headers || {}), 'x-forwarded-for': '198.51.100.8' } });
+    const dev = connect(base, { storage: null, fetch: viaDevice }); let shown;
     const signedIn = dev.auth.signInWithDevice({ name: 'laptop runner', onCode: (c) => { shown = c; } });
     await waitFor(() => shown);
-    assert.match(shown.code, /^[B-Z]{4}-[B-Z]{4}$/); assert.equal(shown.urlWithCode, `${base}/_sqz/device?code=${shown.code}`);
-    r = await fetch(shown.urlWithCode, { redirect: 'manual' });
-    assert.equal(r.status, 303, 'not signed in here: to sign in, and back'); assert.match(r.headers.get('location'), /^\/_sqz\/sign-in\?return=%2F_sqz%2Fdevice%3Fcode%3D/);
-    let html = await (await get(`/_sqz/device?code=${shown.code.replace('-', '').toLowerCase()}`)).text();   // as typed, loosely
-    assert.match(html, /Let laptop runner sign in\?/); assert.match(html, /ann@x\.test/);
-    const dform = html.match(/name="form" value="([0-9a-f]+)"/)[1];
-    r = await post('/_sqz/device', { form: dform, code: shown.code, action: 'allow' }, { origin: base }); assert.match(await r.text(), /laptop runner is signed in/);
+    assert.match(shown.code, /^[B-Z]{4}-[B-Z]{4}$/); assert.equal(shown.url, `${base}/_sqz/device`);
+    r = await fetch(shown.url, { redirect: 'manual' });
+    assert.equal(r.status, 303, 'not signed in here: to sign in, and back'); assert.equal(r.headers.get('location'), '/_sqz/sign-in?return=%2F_sqz%2Fdevice');
+    let html = await (await get(`/_sqz/device?code=${shown.code}`)).text();
+    assert.doesNotMatch(html, /Allow/, 'a link with the code fills nothing in'); assert.match(html, /Type the code your device shows/);
+    r = await post('/_sqz/device', { form: formIn(html), action: 'look', code: shown.code.replace('-', '').toLowerCase() }, browser);   // as typed, loosely
+    html = await r.text();
+    assert.match(html, /calls itself <b>“laptop runner”<\/b>/); assert.match(html, /from <b>198\.51\.100\.8<\/b>/, 'the address the device asked from'); assert.match(html, /seconds ago/); assert.match(html, /ann@x\.test/);
+    const allowForm = formIn(html);
+    r = await post('/_sqz/device', { form: allowForm, code: shown.code, action: 'allow' }, browser); assert.match(await r.text(), /laptop runner is signed in/);
     const si = await signedIn; assert.equal(si.user.email, 'ann@x.test'); assert.ok(si.token);
     assert.equal((await (await fetch(`${base}/api/me`, { headers: { authorization: `Bearer ${si.token}` } })).json()).user.email, 'ann@x.test', "the device's own session");
-    r = await post('/_sqz/device', { form: dform, code: shown.code, action: 'allow' }, { origin: base }); assert.match(await r.text(), /unknown or has expired/, 'a code lets one device in');
-    const dev2 = connect(base, { storage: null }); let shown2;
+    r = await post('/_sqz/device', { form: allowForm, code: shown.code, action: 'allow' }, browser); assert.match(await r.text(), /unknown or has expired/, 'a code lets one device in');
+    const dev2 = connect(base, { storage: null, fetch: viaDevice }); let shown2;
     const refused = dev2.auth.signInWithDevice({ onCode: (c) => { shown2 = c; } }).catch((e) => e.code);
     await waitFor(() => shown2);
-    html = await (await get(`/_sqz/device?code=${shown2.code}`)).text();
-    r = await post('/_sqz/device', { form: html.match(/name="form" value="([0-9a-f]+)"/)[1], code: shown2.code, action: 'deny' }, { origin: base }); assert.match(await r.text(), /was not let in/);
+    html = await (await post('/_sqz/device', { form: formIn(await (await get('/_sqz/device')).text()), action: 'look', code: shown2.code }, browser)).text();
+    r = await post('/_sqz/device', { form: formIn(html), code: shown2.code, action: 'deny' }, browser); assert.match(await r.text(), /was not let in/);
     assert.equal(await refused, 'DENIED');
     const poll = (dc) => fetch(`${base}/api/auth/device/token`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ device_code: dc }) }).then((x) => x.json());
     assert.equal((await poll('nope')).code, 'EXPIRED');
-    const d3 = await (await fetch(`${base}/api/auth/device`, { method: 'POST' })).json();
+    const d3 = await (await viaDevice(`${base}/api/auth/device`, { method: 'POST' })).json(); assert.equal(d3.verification_uri_complete, undefined);
     assert.equal((await poll(d3.device_code)).code, 'PENDING'); assert.equal((await poll(d3.device_code)).code, 'SLOW_DOWN');
     dev.close(); dev2.close();
-    pr('device login: allowed from a signed-in browser, refused, a code once', 'ok');
+    pr('device login: a code typed in a signed-in browser, allowed, refused, once', 'ok');
   }
   // never a way to another site
   for (const back of ['https://evil.example/x', '//evil.example/x', '/\\evil.example']) {
