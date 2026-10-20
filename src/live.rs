@@ -47,10 +47,14 @@ struct Sub { table: u16, preds: Vec<CPred>, policies: Vec<CPred>, q: Arc<Queue>,
     /// For a session from a sign-in token: its identity, checked again whenever sign-in state changes.
     ident: Option<Session>,
     /// made by a signed-in or assumed identity, not the app: it ends when roles, grants or policies change
-    bound: bool }
+    bound: bool,
+    /// the version of the access rules it was compiled under (`Sql::acl_epoch`)
+    acl: u64 }
 struct Live { prepared: Arc<Prepared>, sess: Session, params: Vec<Value>, tables: Vec<u16>, single: Option<(u16, Vec<CPred>, Vec<CPred>)>, key_col: Option<(usize, ColType)>, result: Vec<Vec<Value>>, keys: HashSet<crate::table::Key>, dirty_since: Option<Instant>, last_run: Option<Instant>,
     /// its last re-run started while writes were still publishing, so it runs again (at least SETTLE_RETRY later)
-    retry: bool, q: Arc<Queue> }
+    retry: bool, q: Arc<Queue>,
+    /// the version of the access rules it was compiled under (`Sql::acl_epoch`)
+    acl: u64 }
 impl Live {
     /// When a changed live query runs again: at once if it hasn't run within `debounce`, else `debounce` after its
     /// last run. A lone write is seen without waiting; a burst costs one re-run per `debounce`.
@@ -111,7 +115,9 @@ impl Reactor {
     }
     fn run(&self, start: u64) {
         let (mut feed, durable_only) = { let Some(sql) = self.sql.upgrade() else { return }; (sql.subscribe(start), sql.db.durable) };
-        let (mut auth_seen, mut acl_seen) = { let Some(sql) = self.sql.upgrade() else { return }; (sql.auth_epoch(), sql.acl_epoch()) };
+        // (the access rules' version this loop last swept for: none yet, so its first pass sweeps whatever was compiled
+        // under older rules, however late this thread started)
+        let (mut auth_seen, mut acl_seen) = { let Some(sql) = self.sql.upgrade() else { return }; (sql.auth_epoch(), u64::MAX) };
         loop {
             if self.stop.load(Ordering::Relaxed) { return; }
             // sleep until something is appended, or until a dirty query is due
@@ -127,8 +133,8 @@ impl Reactor {
             if acl != acl_seen {
                 acl_seen = acl; let last = self.last_seq.load(Ordering::Relaxed);
                 let mut st = self.state.lock().unwrap();
-                for sub in st.subs.iter_mut() { if sub.bound { let _ = sub.q.push(Event::Overflow { last_seq: last }); sub.q.closed.store(true, Ordering::Relaxed); } }
-                for live in st.lives.iter_mut() { if live.sess.user.is_some() { let _ = live.q.push(Event::Overflow { last_seq: last }); live.q.closed.store(true, Ordering::Relaxed); } }
+                for sub in st.subs.iter_mut() { if sub.bound && sub.acl != acl { let _ = sub.q.push(Event::Overflow { last_seq: last }); sub.q.closed.store(true, Ordering::Relaxed); } }
+                for live in st.lives.iter_mut() { if live.sess.user.is_some() && live.acl != acl { let _ = live.q.push(Event::Overflow { last_seq: last }); live.q.closed.store(true, Ordering::Relaxed); } }
                 let before = st.subs.len(); st.subs.retain(|s| !s.q.closed.load(Ordering::Relaxed)); if st.subs.len() != before { st.reindex(); } st.lives.retain(|l| !l.q.closed.load(Ordering::Relaxed));
             }
             let ep = sql.auth_epoch();
@@ -218,7 +224,7 @@ impl Reactor {
         let q = Arc::new(Queue::new(sql.cfg.live.queue));
         let mut st = self.state.lock().unwrap();
         if sess.user.is_some() && sql.acl_epoch() != epoch { continue; }
-        st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)), bound: sess.user.is_some() }); st.reindex();
+        st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)), bound: sess.user.is_some(), acl: epoch }); st.reindex();
         return Ok(Subscription { q });
         }
     }
@@ -237,7 +243,7 @@ impl Reactor {
         let keys = result.iter().filter_map(|r| key_of(r, &key_col)).collect();
         let mut st = self.state.lock().unwrap();
         if sess.user.is_some() && sql.acl_epoch() != epoch { continue; }
-        st.lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables: tables.clone(), single, key_col, result: result.clone(), keys, dirty_since: None, last_run: None, retry: false, q: q.clone() });
+        st.lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables: tables.clone(), single, key_col, result: result.clone(), keys, dirty_since: None, last_run: None, retry: false, q: q.clone(), acl: epoch });
         return Ok((Subscription { q }, result));
         }
     }
