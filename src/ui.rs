@@ -487,8 +487,8 @@ fn api_acl(sql: &Sql) -> J {
     let mut users: Vec<J> = a.users.iter().map(|(u, r)| json!({"name": u, "roles": r.roles, "attrs": r.attrs.iter().map(|(k, v)| (k.clone(), value_json(v, None))).collect::<serde_json::Map<_, _>>()})).collect();
     users.sort_by_key(|x| x["name"].as_str().unwrap_or("").to_string());
     let mut auth: Vec<J> = a.auth.iter().map(|(t, at)| {
-        let cols = sql.db.table(t).map(|tb| tb.schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
-        json!({"table": t, "login": cols.get(at.login), "role": match &at.role { crate::auth::RoleSrc::Column(c) => json!({"column": cols.get(*c)}), crate::auth::RoleSrc::Fixed(r) => json!({"fixed": r}) }})
+        let (cols, only) = sql.db.table(t).map(|tb| (tb.schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(), a.app_only(&tb.schema).into_iter().map(|(c, _)| tb.schema.columns[c].name.clone()).collect::<Vec<_>>())).unwrap_or_default();
+        json!({"table": t, "login": cols.get(at.login), "role": match &at.role { crate::auth::RoleSrc::Column(c) => json!({"column": cols.get(*c)}), crate::auth::RoleSrc::Fixed(r) => json!({"fixed": r}) }, "appOnly": only})
     }).collect();
     auth.sort_by_key(|x| x["table"].as_str().unwrap_or("").to_string());
     json!({

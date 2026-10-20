@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.1 — 2026-10-20
+
+### Fixed
+- **Security: a user could move themselves to another tenant.** Only the role column of a sign-in table was the
+  application's alone. A user allowed to edit their own row could set any other column, and a policy that read it
+  as `SESSION.tenant_id` then showed them that tenant's rows. Now every column a policy reads as `SESSION.<column>`
+  is set only by the application too: an update or upsert that sets one is refused, and an insert may leave it as
+  it defaults or give the new row what the user has themselves. The console's Sign-in tables card lists these
+  columns.
+
 ## 0.13.0 — 2026-10-19
 
 ### Added

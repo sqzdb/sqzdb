@@ -275,6 +275,20 @@ pub const P_SELECT: u8 = 1; pub const P_INSERT: u8 = 2; pub const P_UPDATE: u8 =
 #[derive(Default)] pub struct Acl { pub roles: std::collections::HashSet<String>, pub users: HashMap<String, UserRec>, pub grants: HashMap<(String, String), u8>, pub policies: Vec<Policy>,
     /// Tables users sign in to (`ALTER TABLE t ENABLE AUTH`), by lowercase name.
     pub auth: HashMap<String, crate::auth::AuthTable> }
+impl Acl {
+    /// The columns of a sign-in table that only the application sets, each with whether it is the role column: the
+    /// one a user's role comes from, and every column a policy reads as `SESSION.<column>` (a tenant, an owner),
+    /// which decide what the user reaches. Empty for a table nobody signs in to.
+    pub fn app_only(&self, schema: &Schema) -> Vec<(usize, bool)> {
+        let Some(at) = self.auth.get(&schema.name.to_lowercase()) else { return vec![] };
+        let mut out: Vec<(usize, bool)> = vec![];
+        if let crate::auth::RoleSrc::Column(c) = at.role { out.push((c, true)); }
+        for p in &self.policies { for (_, _, rhs) in &p.preds { if let PolicyRhs::Attr(a) = rhs {
+            if let Some(c) = schema.columns.iter().position(|col| col.name.eq_ignore_ascii_case(a)) { if !out.iter().any(|(x, _)| *x == c) { out.push((c, false)); } }
+        } } }
+        out
+    }
+}
 
 fn tokens(s: &str) -> Vec<String> {
     let cs: Vec<char> = s.chars().collect(); let mut out = vec![]; let mut i = 0;
@@ -290,8 +304,21 @@ fn tokens(s: &str) -> Vec<String> {
     out
 }
 /// An identity tried to set the role column of a sign-in table.
-fn role_denied(schema: &Schema, c: usize) -> String {
-    format!("permission denied: {}.{} decides a signed-in user's role, so only the application sets it (in a function: ctx.admin)", schema.name, schema.columns[c].name)
+/// Why an identity may not set a column of a sign-in table: the one its role comes from, or one a policy reads.
+fn app_only_denied(schema: &Schema, c: usize, role: bool) -> String {
+    let (t, col) = (&schema.name, &schema.columns[c].name);
+    if role { format!("permission denied: {t}.{col} decides a signed-in user's role, so only the application sets it (in a function: ctx.admin)") }
+    else { format!("permission denied: {t}.{col} decides what a signed-in user reaches (a policy reads SESSION.{col}), so only the application sets it (in a function: ctx.admin)") }
+}
+/// A row an identity inserts into a sign-in table: each column only the app sets is empty, as it defaults, or what
+/// the identity has itself (a member may add a member to their own tenant, never more than they have). The row's
+/// key is the engine's when generated (`generated_key`); one the identity picks is refused like any other value.
+fn app_only_row(sess: &Session, schema: &Schema, kept: &[(usize, Value, bool)], row: &[u8], generated_key: bool) -> Result<(), String> {
+    for (c, d, r) in kept {
+        if *c == schema.pk && generated_key { continue; }
+        let v = decode_col(schema, row, *c); if v != Value::Null && v != *d && sess.attrs.get(&schema.columns[*c].name) != Some(&v) { return Err(app_only_denied(schema, *c, *r)); }
+    }
+    Ok(())
 }
 fn literal_tok(t: &str) -> Result<Value, String> {
     if t.starts_with('\'') { return Ok(Value::Text(t.trim_matches('\'').to_string())); }
@@ -2078,11 +2105,11 @@ impl Sql {
         if !sql.trim_start().to_uppercase().starts_with("CREATE INDEX") { self.auth.acl.fetch_add(1, std::sync::atomic::Ordering::Release); }
         Ok(())
     }
-    /// The column a sign-in table takes each user's role from (`ENABLE AUTH (ROLE FROM column)`), and its default, when
-    /// an identity rather than the app writes to that table: it decides a user's role, so the app alone sets it.
-    fn role_column(&self, sess: &Session, table: &Table) -> Option<(usize, Value)> {
-        if sess.user.is_none() { return None; }
-        match self.acl.read().unwrap().auth.get(&table.schema.name.to_lowercase())?.role { crate::auth::RoleSrc::Column(c) => Some((c, table.schema.columns[c].default.clone())), _ => None }
+    /// The columns of a sign-in table that an identity rather than the app may not set (`Acl::app_only`), each with its
+    /// default and whether it is the role column. Empty for the app itself.
+    fn app_only(&self, sess: &Session, table: &Table) -> Vec<(usize, Value, bool)> {
+        if sess.user.is_none() { return vec![]; }
+        self.acl.read().unwrap().app_only(&table.schema).into_iter().map(|(c, r)| (c, table.schema.columns[c].default.clone(), r)).collect()
     }
     /// Which version of the roles, grants and policies is in force: changes with every statement that changes them.
     pub(crate) fn acl_epoch(&self) -> u64 { self.auth.acl.load(std::sync::atomic::Ordering::Acquire) }
@@ -2322,9 +2349,10 @@ impl Sql {
             Plan::Commit => { let t = sess.txn.take().ok_or("not in a transaction")?; if let Some(e) = &t.doomed { return Err(e.clone()); } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; Ok(vec![]) }
             Plan::Insert { table, rows, returning, from, conflict } => {
                 let policy = self.guard(sess, table, P_INSERT)?;
-                // an identity inserting into a sign-in table leaves its role column as it defaults (or empty)
-                let role_col = self.role_column(sess, table);
-                if let (Some((c, _)), Conflict::Update { sets, .. }) = (&role_col, conflict) { if sets.iter().any(|(s, _)| s == c) { return Err(role_denied(&table.schema, *c)); } }
+                // an identity inserting into a sign-in table leaves the columns only the app sets as they default (or
+                // gives the row what it has itself), and an upsert never sets them
+                let kept = self.app_only(sess, table);
+                if let Conflict::Update { sets, .. } = conflict { for (c, _, r) in &kept { if sets.iter().any(|(s, _)| s == c) { return Err(app_only_denied(&table.schema, *c, *r)); } } }
                 let schema = &table.schema; let mut encoded = Vec::with_capacity(rows.len()); let mut last_id = 0; let mut last_key: Option<Value> = None;
                 // the values of every row to insert: from VALUES, or from the SELECT's rows plus the other columns' fill
                 let plain = from.is_none() && matches!(conflict, Conflict::None);
@@ -2337,7 +2365,7 @@ impl Sql {
                         if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
                         let row = encode_row(schema, &vals)?;
                         for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
-                        if let Some((c, d)) = &role_col { let v = decode_col(schema, &row, *c); if v != Value::Null && v != *d { return Err(role_denied(schema, *c)); } }
+                        app_only_row(sess, schema, &kept, &row, matches!(exprs[schema.pk], Expr::AutoId | Expr::Gen(_)))?;
                         if let Some(w) = &files { self.check_files(w, schema, None, &row)?; }
                         if embeds { crate::vector::embed_insert_ok(schema, &row)?; }
                         last_key = Some(decode_col(schema, &row, schema.pk));
@@ -2346,7 +2374,8 @@ impl Sql {
                 }
                 let mut all: Vec<Vec<Value>> = Vec::new();
                 let fill_value = |e: &Expr| -> Result<Value, String> { Ok(match e { Expr::AutoId => Value::Int(table.alloc_id()), Expr::Gen(g) => crate::table::gen_value(g), e => self.resolve(sess, e, params)? }) };
-                if !plain { for exprs in rows { all.push(exprs.iter().map(|e| fill_value(e)).collect::<Result<Vec<_>, _>>()?); } }
+                let mut generated: Vec<bool> = vec![];   // per row: its key is the engine's, not the statement's
+                if !plain { for exprs in rows { all.push(exprs.iter().map(|e| fill_value(e)).collect::<Result<Vec<_>, _>>()?); generated.push(matches!(exprs[schema.pk], Expr::AutoId | Expr::Gen(_))); } }
                 if let Some(f) = from {
                     let src = match &*f.plan {
                         Plan::Select(sp) => self.run_select(sess, sp, params)?,
@@ -2357,15 +2386,16 @@ impl Sql {
                         let mut vals = Vec::with_capacity(f.fill.len());
                         for (i, e) in f.fill.iter().enumerate() { vals.push(match e { Some(e) => fill_value(e)?, None => r[f.targets.iter().position(|&t| t == i).unwrap()].clone() }); }
                         // a NULL key from the SELECT takes the automatic id, as in VALUES
+                        generated.push(match &f.fill[schema.pk] { Some(Expr::AutoId | Expr::Gen(_)) => true, Some(_) => false, None => vals[schema.pk] == Value::Null && schema.auto });
                         if vals[schema.pk] == Value::Null && schema.auto { vals[schema.pk] = Value::Int(table.alloc_id()); }
                         all.push(vals);
                     }
                 }
-                for vals in all.iter().filter(|_| !plain) {
+                for (vals, generated) in all.iter().zip(&generated).filter(|_| !plain) {
                     if let Value::Int(id) = vals[schema.pk] { if schema.auto { table.bump_id(id); } last_id = id; }
                     let row = encode_row(schema, vals)?;
                     for p in &policy { if !p.eval(&row) { return Err(format!("permission denied: row violates a policy on {}", schema.name)); } }
-                    if let Some((c, d)) = &role_col { let v = decode_col(schema, &row, *c); if v != Value::Null && v != *d { return Err(role_denied(schema, *c)); } }
+                    app_only_row(sess, schema, &kept, &row, *generated)?;
                     if let (Some(w), Conflict::None) = (&files, conflict) { self.check_files(w, schema, None, &row)?; }
                     if embeds && matches!(conflict, Conflict::None) { crate::vector::embed_insert_ok(schema, &row)?; }   // an upsert checks each row as what it becomes
                     last_key = Some(decode_col(schema, &row, schema.pk));
@@ -2386,7 +2416,7 @@ impl Sql {
                 Ok(match returning { None => vec![], Some(cols) => encoded.iter().map(|row| cols.iter().map(|&c| decode_col(schema, row, c)).collect()).collect() })
             }
             Plan::Update { table, sets, at, returning } => {
-                if let Some((c, _)) = self.role_column(sess, table) { if sets.iter().any(|(s, _)| *s == c) { return Err(role_denied(&table.schema, c)); } }
+                for (c, _, r) in &self.app_only(sess, table) { if sets.iter().any(|(s, _)| s == c) { return Err(app_only_denied(&table.schema, *c, *r)); } }
                 let policy = self.guard(sess, table, P_UPDATE)?;
                 // reading the rows' values (a WHERE beyond the key, a SET over the row, RETURNING) needs SELECT, as in
                 // PostgreSQL, and reaches only rows the SELECT policy shows; otherwise RETURNING or the count would

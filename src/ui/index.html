@@ -831,7 +831,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
         + card('w2', 'Grants', 'key', ['role', 'table', 'commands'], a.grants.map((g) => [g.role, g.table, g.commands.join(', ')]), 'Nothing granted yet. A role can do nothing until it is granted commands on a table.')
         + card('w1', 'Roles', 'shield', ['role'], a.roles.map((r) => [r]), 'No roles yet.')
         + card('w1', 'Stored users', 'pulse', ['user', 'roles', 'attributes'], a.users.map((u) => [u.name, u.roles.join(', '), Object.entries(u.attrs).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join(', ')]), 'None. Applications usually pass who is asking per request: db.as({ role, ...attributes }).')
-        + card('w4', 'Sign-in tables', 'shield', ['table', 'login', 'role'], (a.auth || []).map((t) => [t.table, t.login || '', t.role.column ? `from its ${t.role.column} column` : t.role.fixed ? t.role.fixed : 'none']), 'None. A table people sign in to (an email and a password, or a provider) is marked with ALTER TABLE … ENABLE AUTH.');
+        + card('w4', 'Sign-in tables', 'shield', ['table', 'login', 'role', 'only the app sets'], (a.auth || []).map((t) => [t.table, t.login || '', t.role.column ? `from its ${t.role.column} column` : t.role.fixed ? t.role.fixed : 'none', (t.appOnly || []).join(', ') || '—']), 'None. A table people sign in to (an email and a password, or a provider) is marked with ALTER TABLE … ENABLE AUTH.');
       renderBuilder();
 
     } catch (e) { if (!e.auth) $('acl').innerHTML = `<div class="alert"><span class="ecode">${esc(e.code)}</span><span class="msg">${esc(e.message)}</span></div>`; }

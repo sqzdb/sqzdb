@@ -1,6 +1,6 @@
 {
   "name": "sqzdb",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "An embedded SQL database for Node: concurrent writers, row policies, live queries, files, vectors, sign-in and MCP for agents",
   "keywords": [
     "database",

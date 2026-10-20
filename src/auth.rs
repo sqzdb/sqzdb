@@ -693,6 +693,28 @@ mod tests {
         again = as_token(&s, &eve.token).unwrap(); assert_eq!(again.roles, vec!["admin".to_string()], "the app may");
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
+    #[test] fn only_the_app_sets_what_policies_read() {
+        let d = tmp("tenantcol"); let s = Sql::open_with(&d, Config::default()).unwrap(); setup(&s);
+        for st in ["CREATE TABLE orders (id SERIAL PRIMARY KEY, tenant INT, item TEXT)", "GRANT SELECT ON orders TO member", "GRANT SELECT, INSERT, UPDATE ON users TO member",
+                   "CREATE POLICY mine ON users FOR SELECT TO member USING (id = SESSION.id)", "CREATE POLICY mine_too ON users FOR UPDATE TO member USING (id = SESSION.id)",
+                   "CREATE POLICY tenants ON orders FOR SELECT TO member USING (tenant = SESSION.tenant)", "INSERT INTO orders (tenant, item) VALUES (1, 'ours'), (2, 'theirs')"] { q(&s, st); }
+        let ann = s.sign_up("users", &[("email".into(), text("ann@x.test")), ("tenant".into(), Value::Int(1))], "the password 1").unwrap();
+        let mut me = as_token(&s, &ann.token).unwrap();
+        assert_eq!(qs(&s, &mut me, "SELECT item FROM orders").unwrap(), vec![vec![text("ours")]]);
+        let e = qs(&s, &mut me, "UPDATE users SET tenant = 2 WHERE id = 1").unwrap_err();
+        assert!(e.contains("users.tenant decides what a signed-in user reaches (a policy reads SESSION.tenant)"), "{e}");
+        assert!(qs(&s, &mut me, "UPDATE users SET id = 2 WHERE id = 1").unwrap_err().contains("users.id decides"), "SESSION.id is read too");
+        assert!(qs(&s, &mut me, "UPDATE users SET name = 'Ann' WHERE id = 1").is_ok(), "her own row, a column no policy reads");
+        assert_eq!(qs(&s, &mut as_token(&s, &ann.token).unwrap(), "SELECT item FROM orders").unwrap(), vec![vec![text("ours")]], "still her tenant");
+        assert!(qs(&s, &mut me, "INSERT INTO users (email, tenant) VALUES ('bob@x.test', 2)").unwrap_err().contains("users.tenant decides"), "a new user in another tenant");
+        assert!(qs(&s, &mut me, "INSERT INTO users (email, tenant) VALUES ('bob@x.test', 1)").is_ok(), "in her own: what she has herself");
+        assert!(qs(&s, &mut me, "INSERT INTO users (email) VALUES ('cy@x.test')").is_ok(), "or as it defaults");
+        assert!(qs(&s, &mut me, "INSERT INTO users (id, email) VALUES (77, 'dee@x.test')").unwrap_err().contains("users.id decides"), "a new user's key is the engine's, not hers");
+        assert!(qs(&s, &mut me, "INSERT INTO users (email, tenant) SELECT 'eli@x.test', 1").is_ok(), "from a SELECT too");
+        q(&s, "UPDATE users SET tenant = 2 WHERE id = 1");
+        assert_eq!(qs(&s, &mut as_token(&s, &ann.token).unwrap(), "SELECT item FROM orders").unwrap(), vec![vec![text("theirs")]], "the app may");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
     #[test] fn sign_up_sign_in_and_policies_per_user() {
         let d = tmp("flow"); let s = Sql::open_with(&d, Config::default()).unwrap(); setup(&s);
         let ann = s.sign_up("users", &[("email".into(), text("Ann@Example.com ")), ("name".into(), text("Ann")), ("tenant".into(), Value::Int(7))], "correct horse").unwrap();

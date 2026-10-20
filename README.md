@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.13.0` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.13.1` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -499,10 +499,12 @@ user's role comes from a column or is fixed. A signed-in user acts with their ro
 
 The table is yours: your columns, visible in the console, queried and joined like any other. Passwords and
 sessions are never in it. They live in sqzdb's own tables (`_auth_secrets`, `_auth_sessions`, and with
-providers `_auth_identities`), which no query can read or write. The role column is the application's
-alone. Users may edit their own row if you grant it, but setting the role column is refused for anyone but the
-application, whether by an update, an insert with another role, or an upsert. In a function, `ctx.admin` sets
-it.
+providers `_auth_identities`), which no query can read or write. The columns that decide what a user is and
+reaches are the application's alone: the role column, and every column a policy reads as `SESSION.<column>` (a
+tenant, an organization). Users may edit their own row if you grant it, but an update or upsert that sets one of
+those is refused for anyone but the application, and an insert may only leave it as it defaults or give the new
+row what the user has themselves. In a function, `ctx.admin` sets them. The console's Sign-in tables card lists
+them.
 
 ```sql
 CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, name TEXT, role TEXT DEFAULT 'member', tenant_id INT);
@@ -1487,7 +1489,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.13.0`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.13.1`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

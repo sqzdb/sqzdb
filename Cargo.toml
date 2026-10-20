@@ -1,6 +1,6 @@
 [package]
 name = "sqzdb"
-version = "0.13.0"
+version = "0.13.1"
 homepage = "https://sqzdb.dev"
 repository = "https://github.com/sqzdb/sqzdb"
 edition = "2024"
