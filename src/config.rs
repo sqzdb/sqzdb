@@ -79,6 +79,35 @@ fn file_from_text(text: &str) -> Result<ConfigFile, String> {
     if file.config_file.is_some() { return Err("configFile cannot be set from a file".into()); }
     Ok(file)
 }
+/// An error about a file's text, with the values its `${NAME}`s took from the environment put back as `${NAME}`: so
+/// an error never shows a secret a reference brought in (the console shows such errors).
+pub fn scrub(err: &str, text: &str) -> String {
+    let mut out = err.to_string(); let mut rest = text;
+    while let Some(i) = rest.find("${") {
+        let after = &rest[i + 2..]; let Some(j) = after.find('}') else { break };
+        let name = &after[..j];
+        if let Ok(v) = std::env::var(name) { if v.len() >= 3 { out = out.replace(&v, &format!("${{{name}}}")); } }
+        rest = &after[j + 1..];
+    }
+    out
+}
+/// Read a settings file sqzdb was not told to read, through one handle: opened without following a link, checked
+/// (`private_file`'s rules) on that handle, and read from it, so it can't be swapped between the check and the read.
+pub fn read_private(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut o = std::fs::OpenOptions::new(); o.read(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; o.custom_flags(libc::O_NOFOLLOW); }
+    let mut f = o.open(path).map_err(|e| format!("{}: {e} (a link isn't followed: name it with --config)", path.display()))?;
+    let m = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+    if !m.file_type().is_file() { return Err(format!("{}: not a regular file", path.display())); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        if m.uid() != unsafe { libc::geteuid() } { return Err(format!("{}: owned by another user; it must be yours (chown it, or name it with --config)", path.display())); }
+        if m.mode() & 0o022 != 0 { return Err(format!("{}: others may write it; make it yours alone (chmod 600)", path.display())); }
+    }
+    let mut text = String::new(); f.read_to_string(&mut text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(text)
+}
 /// Whether a configuration file is safe to read without being named: a regular file owned by the user this process
 /// runs as, that no one else may write (else whoever can write the database directory could redirect its backups or
 /// open a listener). Unix only; elsewhere, any file.

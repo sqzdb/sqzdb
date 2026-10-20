@@ -206,28 +206,40 @@ impl Reactor {
         let Plan::Select(sp) = &p.plan else { return Err("subscribe needs a SELECT".into()) };
         if sp.join.is_some() || !sp.subs.is_empty() { return Err("subscribe needs a single-table SELECT (watch handles joins)".into()); }
         if !sp.filters.is_empty() { return Err("subscribe filters by columns compared with values (=, <, IN, IS NULL …); use watch for other conditions".into()); }
+        // compiled under the access rules in force; if they change before it is registered, compiled again (the reactor
+        // ends registered ones on a change; this closes the gap between compiling and registering)
+        loop {
+        let epoch = sql.acl_epoch();
         let mut s0 = session_like(sess); sql.check_identity(&mut s0)?; let sess = &s0;
         let preds = plan_preds(&sql, sess, sp, params)?; let policies = sql.guard(sess, &sp.table, P_SELECT)?;
         // an equality on an INT column with a constant makes the subscription indexable
         let key = { let mut all: Vec<Pred> = sp.preds.clone(); match &sp.access { Access::Pk(e) => all.push(Pred { col: sp.table.schema.pk, cmp: Cmp::Eq, rhs: e.clone() }), Access::Index(ix, e) => all.push(Pred { col: ix.col, cmp: Cmp::Eq, rhs: e.clone() }), _ => {} }
             all.iter().find_map(|p| if p.cmp == Cmp::Eq && sp.table.schema.columns[p.col].ty == crate::table::ColType::Int { match &p.rhs { Expr::Lit(Value::Int(v)) => Some((p.col, *v)), Expr::Param(i) => match params.get(*i) { Some(Value::Int(v)) => Some((p.col, *v)), _ => None }, _ => None } } else { None }) };
         let q = Arc::new(Queue::new(sql.cfg.live.queue));
-        { let mut st = self.state.lock().unwrap(); st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)), bound: sess.user.is_some() }); st.reindex(); }
-        Ok(Subscription { q })
+        let mut st = self.state.lock().unwrap();
+        if sess.user.is_some() && sql.acl_epoch() != epoch { continue; }
+        st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)), bound: sess.user.is_some() }); st.reindex();
+        return Ok(Subscription { q });
+        }
     }
     /// Watch a query: returns its current result and a handle that receives `Event::Live` whenever the result changes.
     pub fn watch(&self, sess: &Session, text: &str, params: &[Value]) -> Result<(Subscription, Vec<Vec<Value>>), String> {
         let sql = self.sql.upgrade().ok_or("database is closed")?; let p = sql.prepare(text)?;
         let Plan::Select(sp) = &p.plan else { return Err("watch needs a SELECT".into()) };
         let mut tables = vec![]; tables_of(sp, &mut tables);
+        loop {   // as in subscribe: compiled again if the access rules change before it is registered
+        let epoch = sql.acl_epoch();
         let mut s0 = session_like(sess); sql.check_identity(&mut s0)?; let sess = &s0;
         let single = if sp.join.is_none() && sp.subs.is_empty() { Some((sp.table.id, plan_preds(&sql, sess, sp, params)?, sql.guard(sess, &sp.table, P_SELECT)?)) } else { None };
         let key_col = if sp.join.is_none() && sp.post.is_none() { sp.proj.iter().position(|pr| matches!(pr, Proj::Col(c) if *c == sp.table.schema.pk)).map(|i| (i, sp.table.schema.columns[sp.table.schema.pk].ty.clone())) } else { None };
         let mut s = session_like(sess); let result = sql.execute_s(&mut s, &p, params)?;
         let q = Arc::new(Queue::new(4096));
         let keys = result.iter().filter_map(|r| key_of(r, &key_col)).collect();
-        self.state.lock().unwrap().lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables, single, key_col, result: result.clone(), keys, dirty_since: None, last_run: None, retry: false, q: q.clone() });
-        Ok((Subscription { q }, result))
+        let mut st = self.state.lock().unwrap();
+        if sess.user.is_some() && sql.acl_epoch() != epoch { continue; }
+        st.lives.push(Live { prepared: p.clone(), sess: s, params: params.to_vec(), tables: tables.clone(), single, key_col, result: result.clone(), keys, dirty_since: None, last_run: None, retry: false, q: q.clone() });
+        return Ok((Subscription { q }, result));
+        }
     }
     pub fn counts(&self) -> (usize, usize) { let st = self.state.lock().unwrap(); (st.subs.len(), st.lives.len()) }
 }

@@ -48,10 +48,13 @@ fn serve(a: &[String]) {
     // the settings: the file --config names; else the database's own sqzdb.toml (written by the console's Settings
     // tab), read only if it is this user's alone
     let settings = match flag(a, "--config") { Some(f) => std::path::PathBuf::from(f), None => dir.join("sqzdb.toml") };
-    if flag(a, "--config").is_some() || settings.exists() {
-        if flag(a, "--config").is_none() { sqzdb::config::private_file(&settings).unwrap_or_else(|e| fail(e)); }
-        opts.insert("configFile".into(), json!(settings.display().to_string()));
-    }
+    if flag(a, "--config").is_some() { opts.insert("configFile".into(), json!(settings.display().to_string())); }
+    // (read once, through the handle that was checked)
+    let own = if flag(a, "--config").is_none() && std::fs::symlink_metadata(&settings).is_ok() { Some(sqzdb::config::read_private(&settings).unwrap_or_else(|e| fail(e))) } else { None };
+    let load = |opts: &Map<String, J>| -> Result<Config, String> {
+        let json = J::Object(opts.clone()).to_string();
+        match &own { Some(text) => Config::check(text, Some(&json)).map_err(|e| format!("{}: {}", settings.display(), sqzdb::config::scrub(&e, text))), None => Config::load(&dir, Some(&json)) }
+    };
     if has(a, "--durable") { opts.insert("durable".into(), json!(true)); }
     if let Some(v) = flag(a, "--ui") { listen.insert("http".into(), json!(v)); }
     if let Some(v) = flag(a, "--tcp") { listen.insert("tcp".into(), json!(v)); }
@@ -72,11 +75,11 @@ fn serve(a: &[String]) {
     match flag(a, "--token") { Some(t) => { listen.insert("token".into(), json!(t)); } None => if listen.contains_key("http") || listen.contains_key("tcp") { let t = generated(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t); } }
     if !listen.is_empty() { opts.insert("listen".into(), J::Object(listen.clone())); }
     let flags = { let mut f = opts.clone(); f.remove("configFile"); J::Object(f) };
-    let cfg = match Config::load(&dir, Some(&J::Object(opts.clone()).to_string())) {
+    let cfg = match load(&opts) {
         // the settings file opens a console or a TCP port and names no token: one is generated, as with --ui
         Err(e) if e.contains("needs listen.token") && printed_token.is_none() => {
             let t = generated(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t);
-            opts.insert("listen".into(), J::Object(listen)); Config::load(&dir, Some(&J::Object(opts).to_string())).unwrap_or_else(|e| fail(e))
+            opts.insert("listen".into(), J::Object(listen)); load(&opts).unwrap_or_else(|e| fail(e))
         }
         r => r.unwrap_or_else(|e| fail(e)),
     };

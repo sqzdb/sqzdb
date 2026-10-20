@@ -18,11 +18,12 @@
   something is missing (a policy on a table its role has no grant on). Run it there or open it in the editor.
 
   A save is checked as the server would start with it, and keeps the file's comments. Secrets show only as set
-  or not. **Restart now** applies the settings in place (same process, same console token). It is refused while
+  or not, in the form and in the file's text, where saving keeps them as they were. An error never shows a value
+  a `${VAR}` brought in from the environment. **Restart now** applies the settings in place (same process, same console token). It is refused while
   the file would keep the server from starting.
 - **`sqzdb serve` without `--config` uses `<dir>/sqzdb.toml`,** the file the Settings tab writes, with mode 600.
-  It must belong to the user sqzdb runs as and be writable by no one else, or the server won't start. Backups
-  never carry it.
+  It must belong to the user sqzdb runs as and be writable by no one else, or the server won't start. It is read
+  through the handle that was checked, and a link is not followed. Backups never carry it.
 
 ### Fixed
 - **Security: a signed-in user could make themselves admin.** With `ENABLE AUTH (ROLE FROM role)` and a grant
@@ -33,7 +34,8 @@
   it.
 - **Live queries and subscriptions kept the access rules they started with.** A new policy, or a grant taken
   back, didn't reach a change subscription already open. Now any change to roles, grants, policies, users or
-  sign-in tables ends those of identities, and their clients subscribe again under the new rules.
+  sign-in tables ends those of identities, and their clients subscribe again under the new rules. One being
+  set up while the rules change is compiled again under the new ones.
 - A settings file that opens the console (`listen.http`) or a TCP port without `listen.token` stopped the
   server. A token is now generated and printed, as with `--ui`.
 

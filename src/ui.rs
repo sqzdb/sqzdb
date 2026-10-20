@@ -30,6 +30,43 @@ pub fn serve_settings(path: std::path::PathBuf, flags: J) { let _ = SERVE.set(Se
 pub fn restart_requested() -> bool { RESTART.load(Relaxed) }
 /// Keys whose values are secrets: shown as set or not (or as the `${VAR}` they come from), never sent back.
 const SECRETS: &[&str] = &["secretKey", "passphrase", "clientSecret", "apiKey", "token"];
+/// A secret's value as the console shows the file's text; saved back, it keeps the value the file has.
+const HIDDEN: &str = "(hidden: unchanged)";
+/// Secrets in JSON (the command line's options): masked, a `${VAR}` reference shown as it is.
+fn mask_json(v: &mut J) { if let J::Object(m) = v { for (k, x) in m.iter_mut() { if SECRETS.contains(&k.as_str()) { if let J::String(s) = x { if !s.trim_start().starts_with("${") { *x = json!(HIDDEN); } } } else { mask_json(x); } } } }
+/// Every secret in a file's text (outside `${VAR}` references), each with its dotted key: to mask, and to restore.
+fn secrets_in(doc: &mut toml_edit::DocumentMut, mut each: impl FnMut(&str, &mut toml_edit::Value)) {
+    fn walk(t: &mut dyn toml_edit::TableLike, at: &str, each: &mut dyn FnMut(&str, &mut toml_edit::Value)) {
+        for (k, item) in t.iter_mut() {
+            let here = if at.is_empty() { k.get().to_string() } else { format!("{at}.{}", k.get()) };
+            match item {
+                toml_edit::Item::Table(t) => walk(t, &here, each),
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => walk(t, &here, each),
+                toml_edit::Item::Value(v) if SECRETS.contains(&k.get()) && v.as_str().is_some_and(|s| !s.trim_start().starts_with("${")) => each(&here, v),
+                _ => {}
+            }
+        }
+    }
+    walk(doc.as_table_mut(), "", &mut each);
+}
+/// The file's text as the console shows it: secrets replaced by HIDDEN (comments and the rest as they are). A text
+/// that doesn't parse shows no line that sets a secret.
+fn masked_text(text: &str) -> String {
+    match text.parse::<toml_edit::DocumentMut>() {
+        Ok(mut doc) => { secrets_in(&mut doc, |_, v| { let d = v.decor().clone(); *v = HIDDEN.into(); *v.decor_mut() = d; }); doc.to_string() }
+        Err(_) => text.lines().map(|l| if SECRETS.iter().any(|k| l.trim_start().starts_with(k)) { format!("# {} = (hidden: the file doesn't parse)", l.trim_start().split(['=', ' ']).next().unwrap_or("")) } else { l.to_string() }).collect::<Vec<_>>().join("\n"),
+    }
+}
+/// A text the console sends back: each secret still HIDDEN takes the value the file has for that key.
+fn unmasked_text(text: &str, current: &str) -> Result<String, String> {
+    if !text.contains(HIDDEN) { return Ok(text.to_string()); }
+    let mut have = std::collections::HashMap::new();
+    if let Ok(mut doc) = current.parse::<toml_edit::DocumentMut>() { secrets_in(&mut doc, |k, v| { have.insert(k.to_string(), v.as_str().unwrap_or("").to_string()); }); }
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
+    let mut missing = None;
+    secrets_in(&mut doc, |k, v| if v.as_str() == Some(HIDDEN) { match have.get(k) { Some(real) => { let d = v.decor().clone(); *v = real.as_str().into(); *v.decor_mut() = d; } None => { missing.get_or_insert(k.to_string()); } } });
+    match missing { Some(k) => Err(format!("{k}: hidden, and the file has no value for it: type the value")), None => Ok(doc.to_string()) }
+}
 const MAX_BODY: usize = 1 << 20; const MAX_LINE: u64 = 16 << 10; const MAX_HEADERS: usize = 64;
 /// Idle keep-alive connections and stalled writers are dropped after this long.
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -210,8 +247,9 @@ fn api_settings() -> J {
         }
     }
     mask(&mut values, "", &mut secrets);
-    json!({"editable": true, "path": sv.path.display().to_string(), "exists": sv.path.exists(), "text": text, "values": values, "secrets": secrets,
-           "flags": sv.flags, "saved": SAVED.load(Relaxed)})
+    let mut flags = sv.flags.clone(); mask_json(&mut flags);
+    json!({"editable": true, "path": sv.path.display().to_string(), "exists": sv.path.exists(), "text": masked_text(&text), "values": values, "secrets": secrets,
+           "flags": flags, "saved": SAVED.load(Relaxed)})
 }
 /// Save the settings: `{"text": …}` (the whole file), or `{"set": {"app.publicUrl": …, "backup": null, …}}` (keys
 /// changed in the file as it is, comments and all; null removes one). Checked as the server would start with it
@@ -221,16 +259,16 @@ fn api_save_settings(body: &[u8]) -> (u16, J) {
     let Ok(v) = serde_json::from_slice::<J>(body) else { return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})) };
     let current = std::fs::read_to_string(&sv.path).unwrap_or_default();
     let text = match (v.get("text").and_then(|t| t.as_str()), v.get("set").and_then(|s| s.as_object())) {
-        (Some(t), _) => t.to_string(),
+        (Some(t), _) => match unmasked_text(t, &current) { Ok(t) => t, Err(e) => return (400, json!({"error": e, "code": "CONFIG"})) },
         (None, Some(set)) => match patch_toml(&current, set) { Ok(t) => t, Err(e) => return (400, json!({"error": e, "code": "CONFIG"})) },
         _ => return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})),
     };
-    if let Err(e) = crate::config::Config::check(&text, Some(&sv.flags.to_string())) { return (400, json!({"error": e, "code": "CONFIG"})); }
-    if text == current { return (200, json!({"saved": false, "text": text})); }
+    if let Err(e) = crate::config::Config::check(&text, Some(&sv.flags.to_string())) { return (400, json!({"error": crate::config::scrub(&e, &text), "code": "CONFIG"})); }
+    if text == current { return (200, json!({"saved": false, "text": masked_text(&text)})); }
     if sv.path.exists() { if let Err(e) = crate::config::private_file(&sv.path) { return (409, json!({"error": e, "code": "CONFIG"})); } }
     if let Err(e) = write_private(&sv.path, text.as_bytes()) { return (500, json!({"error": format!("{}: {e}", sv.path.display()), "code": "ERROR"})); }
     SAVED.store(true, Relaxed);
-    (200, json!({"saved": true, "text": text}))
+    (200, json!({"saved": true, "text": masked_text(&text)}))
 }
 /// Whether the server can restart into its settings file as it is now (it may have been edited by hand since): the
 /// checks its start makes, so a restart never leaves it down.
@@ -239,7 +277,7 @@ fn restart_check() -> Result<(), (u16, String)> {
     if !sv.path.exists() { return Ok(()); }
     crate::config::private_file(&sv.path).map_err(|e| (409, e))?;
     let text = std::fs::read_to_string(&sv.path).map_err(|e| (409, format!("{}: {e}", sv.path.display())))?;
-    crate::config::Config::check(&text, Some(&sv.flags.to_string())).map(|_| ()).map_err(|e| (400, format!("{}: {e}", sv.path.display())))
+    crate::config::Config::check(&text, Some(&sv.flags.to_string())).map(|_| ()).map_err(|e| (400, format!("{}: {}", sv.path.display(), crate::config::scrub(&e, &text))))
 }
 /// Change keys of a TOML file's text in place (comments, order and the rest untouched): a dotted key to a value,
 /// a table (an object), or nothing (null).
@@ -384,6 +422,26 @@ mod tests {
         assert!(crate::config::Config::check("[functions]\ntimeout = \"0s\"\n", None).unwrap_err().contains("functions.timeout"));
         assert!(crate::config::Config::check("[app]\npublicUrl = \"http://127.0.0.1:8080\"\n[app.mcp]\n", Some(r#"{"listen": {"app": "127.0.0.1:8080"}}"#)).is_ok());
     }
+    /// The file's text reaches the console with its secrets hidden (a `${VAR}` reference shown), and comes back with
+    /// them as they were; an error never shows a value a reference brought in.
+    #[test] fn secrets_stay_on_the_server() {
+        let file = "# keys\n[backup]\nendpoint = \"https://s3.example\"\nsecretKey = \"s3cr3t-value\"  # the real one\npassphrase = \"${DB_PASS}\"\n\n[auth.oauth.google]\nclientId = \"id\"\nclientSecret = \"g-secret\"\n";
+        let shown = masked_text(file);
+        assert!(!shown.contains("s3cr3t-value") && !shown.contains("g-secret"), "{shown}");
+        assert!(shown.contains(&format!("secretKey = \"{HIDDEN}\"  # the real one")) && shown.contains("passphrase = \"${DB_PASS}\""), "{shown}");
+        let edited = shown.replace("endpoint = \"https://s3.example\"", "endpoint = \"https://s3.other\"");
+        let back = unmasked_text(&edited, file).unwrap();
+        assert_eq!(back, file.replace("https://s3.example", "https://s3.other"), "secrets as they were, the edit kept");
+        assert!(unmasked_text(&format!("[app]\ntoken = \"{HIDDEN}\"\n"), file).unwrap_err().contains("app.token: hidden"));
+        assert!(!masked_text("[backup\nsecretKey = \"leak\"\n").contains("leak"), "a file that doesn't parse shows no secret line");
+        let mut flags = json!({"listen": {"token": "t0k3n", "http": "127.0.0.1:1"}}); mask_json(&mut flags);
+        assert_eq!(flags, json!({"listen": {"token": HIDDEN, "http": "127.0.0.1:1"}}));
+        // an error about a value from the environment names the reference, not the value
+        let text = "[functions]\ntimeout = \"${HOME}\"\n";
+        let e = crate::config::Config::check(text, None).unwrap_err();
+        let home = std::env::var("HOME").unwrap(); assert!(home.len() >= 3);
+        assert!(!crate::config::scrub(&e, text).contains(&home) && crate::config::scrub(&e, text).contains("${HOME}"), "{e}");
+    }
     /// A settings file sqzdb reads without being told to must be its user's alone.
     #[cfg(unix)] #[test] fn an_unnamed_settings_file_is_its_users_alone() {
         use std::os::unix::fs::PermissionsExt;
@@ -395,6 +453,13 @@ mod tests {
         assert!(crate::config::private_file(&p).unwrap_err().contains("others may write it"));
         std::fs::remove_file(&p).unwrap();
         assert!(crate::config::private_file(&std::env::temp_dir()).unwrap_err().contains("not a regular file"));
+        // read through one handle: a link to a file of the user's own is refused all the same
+        let real = std::env::temp_dir().join(format!("sqzdb-settings-real-{}.toml", std::process::id())); write_private(&real, b"[app]\n").unwrap();
+        let link = std::env::temp_dir().join(format!("sqzdb-settings-link-{}.toml", std::process::id())); let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(crate::config::read_private(&link).unwrap_err().contains("a link isn't followed"));
+        assert_eq!(crate::config::read_private(&real).unwrap(), "[app]\n");
+        std::fs::remove_file(&link).unwrap(); std::fs::remove_file(&real).unwrap();
     }
     #[test] fn csp_allows_only_the_page_script() { let c = csp(); assert!(c.contains("script-src 'sha256-") && !c.contains("script-src 'unsafe-inline'")); assert!(PAGE.matches("<script>").count() == 1, "the hash covers exactly one inline script"); }
 }
