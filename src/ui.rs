@@ -32,8 +32,16 @@ pub fn restart_requested() -> bool { RESTART.load(Relaxed) }
 const SECRETS: &[&str] = &["secretKey", "passphrase", "clientSecret", "apiKey", "token"];
 /// A secret's value as the console shows the file's text; saved back, it keeps the value the file has.
 const HIDDEN: &str = "(hidden: unchanged)";
-/// A key as the configuration reads it: without case or underscores (`secret_key` is `secretKey`).
-fn norm(k: &str) -> String { k.split('.').map(|seg| seg.chars().filter(|c| *c != '_').flat_map(char::to_lowercase).collect::<String>()).collect::<Vec<_>>().join(".") }
+/// A key as the configuration reads it under its parent: a field's snake_case spelling is its camelCase name
+/// (`secret_key` is `secretKey`), and a name in a map (a provider, a sign-up table) is taken as it is.
+fn field(parent: &[String], k: &str) -> String {
+    if matches!(parent, [a, b] if (a == "auth" && b == "oauth") || (a == "app" && b == "signUp")) { return k.to_string(); }
+    let mut out = String::new(); let mut up = false;
+    for c in k.chars() { if c == '_' { up = true } else if up { out.extend(c.to_uppercase()); up = false } else { out.push(c) } }
+    out
+}
+/// A path of keys as the configuration reads it.
+fn canon(path: &[String]) -> Vec<String> { let mut out = vec![]; for k in path { let f = field(&out, k); out.push(f); } out }
 /// Whether a key names a secret, compared without case or underscores (the `secret_key` spellings too).
 fn is_secret(k: &str) -> bool { let n: String = k.chars().filter(|c| *c != '_').flat_map(char::to_lowercase).collect(); SECRETS.iter().any(|s| s.to_ascii_lowercase() == n) }
 /// Whether a key names where its table's secrets are sent: an endpoint, an issuer, a kind of provider, a …Url.
@@ -44,30 +52,40 @@ fn unparsable(text: &str) -> Option<String> {
     let line = e.split("line ").nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).filter(|l| !l.is_empty()).unwrap_or("?").to_string();
     Some(format!("the settings file doesn't parse (line {line}): fix it on the server, or replace it whole with the file's text here"))
 }
-/// Where a text refers to the environment, and how often: (key, as the configuration reads it; the variable). The
-/// server reads every `${NAME}` in the text, so those outside a value (a table's name, a comment) count at "".
-fn references_at(text: &str) -> std::collections::BTreeMap<(String, String), usize> {
-    let mut out = std::collections::BTreeMap::new();
-    let count = |text: &str| { let mut c = std::collections::BTreeMap::new(); for n in references_all(text) { *c.entry(n).or_insert(0) += 1; } c };
-    if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
-        fn walk(t: &dyn toml_edit::TableLike, at: &str, out: &mut std::collections::BTreeMap<(String, String), usize>) {
-            for (k, item) in t.iter() {
-                let here = norm(&if at.is_empty() { k.to_string() } else { format!("{at}.{k}") });
-                match item {
-                    toml_edit::Item::Table(t) => walk(t, &here, out),
-                    toml_edit::Item::ArrayOfTables(a) => for (i, t) in a.iter().enumerate() { walk(t, &format!("{here}[{i}]"), out) },
-                    toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => walk(t, &here, out),
-                    toml_edit::Item::Value(v) => for n in references_all(&v.to_string()) { *out.entry((here.clone(), n)).or_insert(0) += 1; },
-                    _ => {}
+/// Where a text refers to the environment, and how often: (place, variable) → (count, the key it's at). The server
+/// reads every `${NAME}` in the text: one in a value is placed at its key as the configuration reads it, any other
+/// (in a table's name, a key, a comment) at its line under its table's header. None: a text whose references can't
+/// all be placed so (one that doesn't parse, or a `${` that runs across a value's end).
+fn references_at(text: &str) -> Option<std::collections::BTreeMap<(String, String), (usize, String)>> {
+    type Places = std::collections::BTreeMap<(String, String), (usize, String)>;
+    let mut doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    // the values' references, each value then emptied: what's left is the text outside the values
+    fn walk(t: &mut dyn toml_edit::TableLike, at: &[String], out: &mut Places) {
+        for (k, item) in t.iter_mut() {
+            let mut here = at.to_vec(); here.push(field(at, k.get()));
+            match item {
+                toml_edit::Item::Table(t) => walk(t, &here, out),
+                toml_edit::Item::ArrayOfTables(a) => for (i, t) in a.iter_mut().enumerate() { let mut h = here.clone(); h.push(format!("[{i}]")); walk(t, &h, out) },
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => walk(t, &here, out),
+                toml_edit::Item::Value(v) => {
+                    let d = v.decor().clone(); v.decor_mut().clear();
+                    for n in references_all(&v.to_string()) { out.entry((format!("{here:?}"), n)).or_insert((0, here.join("."))).0 += 1; }
+                    *v = "".into(); *v.decor_mut() = d;
                 }
+                toml_edit::Item::None => {}
             }
         }
-        walk(doc.as_table(), "", &mut out);
     }
-    let mut in_values = std::collections::BTreeMap::new();
-    for ((_, n), c) in &out { *in_values.entry(n.clone()).or_insert(0) += c; }
-    for (n, c) in count(text) { let rest = c - in_values.get(&n).copied().unwrap_or(0).min(c); if rest > 0 { out.insert((String::new(), n), rest); } }
-    out
+    let mut out = Places::new();
+    walk(doc.as_table_mut(), &[], &mut out);
+    let mut header = String::new();
+    for line in doc.to_string().lines().map(str::trim) {
+        if line.starts_with('[') { header = line.to_string(); }
+        for n in references_all(line) { out.entry((format!("{header}\n{line}"), n)).or_insert((0, String::new())).0 += 1; }
+    }
+    let mut placed = std::collections::BTreeMap::new(); for ((_, n), (c, _)) in &out { *placed.entry(n.as_str()).or_insert(0) += c; }
+    let mut all = std::collections::BTreeMap::new(); let names = references_all(text); for n in &names { *all.entry(n.as_str()).or_insert(0) += 1; }
+    (placed == all).then_some(out)
 }
 /// Every `${NAME}` in a text, as the server reads them (one per occurrence).
 fn references_all(text: &str) -> Vec<String> {
@@ -75,12 +93,16 @@ fn references_all(text: &str) -> Vec<String> {
     while let Some(i) = rest.find("${") { let after = &rest[i + 2..]; let Some(j) = after.find('}') else { break }; out.push(after[..j].to_string()); rest = &after[j + 1..]; }
     out
 }
-/// A save that puts a `${NAME}` reference anywhere it wasn't (a new name, one moved to another key, or one more of it
-/// in the same place): refused. A reference reads the server's environment, and the console's token mustn't reach
-/// what only the server's shell can (add it in the file on the server).
+/// A save that puts a `${NAME}` reference anywhere it wasn't (a new name, one moved to another key, line or table, or
+/// one more of it in the same place): refused. A reference reads the server's environment, and the console's token
+/// mustn't reach what only the server's shell can (add it in the file on the server).
 fn new_reference(current: &str, new: &str) -> Option<String> {
-    let had = references_at(current);
-    references_at(new).into_iter().find(|(r, c)| had.get(r).copied().unwrap_or(0) < *c).map(|((k, n), _)| format!("${{{n}}}{}: a reference to the server's environment is added in the file on the server, not here", if k.is_empty() { String::new() } else { format!(" at {k}") }))
+    let says = |n: &str, at: &str| format!("${{{n}}}{}: a reference to the server's environment is added in the file on the server, not here", if at.is_empty() { String::new() } else { format!(" at {at}") });
+    let had = references_at(current).unwrap_or_default();
+    match references_at(new) {
+        Some(now) => now.into_iter().find(|(r, (c, _))| had.get(r).map_or(0, |x| x.0) < *c).map(|((_, n), (_, at))| says(&n, &at)),
+        None => references_all(new).first().map(|n| says(n, "")),
+    }
 }
 /// A configuration error as the console shows it: where and what, without the values the parser or the checks quote
 /// (one could be a secret, in whatever escaped form they print it) and without the parser's view of the source.
@@ -109,44 +131,48 @@ fn redirected(current: &str, new: &str) -> Option<String> {
     let (Ok(mut cur), Ok(mut next)) = (current.parse::<toml_edit::DocumentMut>(), new.parse::<toml_edit::DocumentMut>()) else { return None };
     // (keys as the configuration reads them; the secrets that go to the address: a passphrase or a token never
     // leaves this machine)
-    let sent = |k: &str| matches!(norm(k).rsplit('.').next().unwrap_or(""), "secretkey" | "clientsecret" | "apikey");
-    let mut had = std::collections::HashMap::new(); secrets_with(&mut cur, true, |k, v| { had.insert(norm(k), v.as_str().unwrap_or("").to_string()); });
+    let sent = |k: &[String]| matches!(k.last().map(String::as_str), Some("secretKey" | "clientSecret" | "apiKey"));
+    let mut had = std::collections::HashMap::new(); secrets_with(&mut cur, true, |k, v| { had.insert(canon(k), v.as_str().unwrap_or("").to_string()); });
     // kept: the value the file has there, or any reference (a value from the environment is never typed in here)
-    let mut kept = vec![]; secrets_with(&mut next, true, |k, v| { let x = v.as_str().unwrap_or(""); if sent(k) && (x.contains("${") || had.get(&norm(k)).map(String::as_str) == Some(x)) { kept.push(k.to_string()); } });
-    let addresses = |doc: &toml_edit::DocumentMut, at: &str| -> Vec<(String, String)> {
-        // the table at `at`, its keys compared as the configuration reads them
-        fn find<'a>(t: &'a dyn toml_edit::TableLike, path: &[String]) -> Option<&'a dyn toml_edit::TableLike> {
-            let Some((first, rest)) = path.split_first() else { return Some(t) };
-            let (_, item) = t.iter().find(|(k, _)| norm(k) == *first)?;
-            find(item.as_table_like()?, rest)
+    let mut kept = vec![]; secrets_with(&mut next, true, |k, v| { let (c, x) = (canon(k), v.as_str().unwrap_or("")); if sent(&c) && (x.contains("${") || had.get(&c).map(String::as_str) == Some(x)) { kept.push(c); } });
+    // the addresses of the table at a path, keys as the configuration reads them; None: two spellings of one key
+    fn addresses(doc: &toml_edit::DocumentMut, at: &[String]) -> Option<Vec<(String, String)>> {
+        let mut t: &dyn toml_edit::TableLike = doc.as_table();
+        for (i, seg) in at.iter().enumerate() {
+            let mut found = t.iter().filter(|(k, _)| field(&at[..i], k) == *seg);
+            let first = found.next(); if found.next().is_some() { return None; }
+            match first.and_then(|(_, item)| item.as_table_like()) { Some(x) => t = x, None => return Some(vec![]) }
         }
-        let path: Vec<String> = norm(at).split('.').filter(|s| !s.is_empty()).map(String::from).collect();
-        let mut v: Vec<(String, String)> = find(doc.as_table(), &path).map(|x| x.iter().filter(|(k, _)| is_address(k)).map(|(k, i)| (norm(k), i.as_value().map(|v| v.to_string().trim().to_string()).unwrap_or_default())).collect()).unwrap_or_default();
-        v.sort(); v
-    };
+        let value = |v: &toml_edit::Value| v.as_str().map(String::from).unwrap_or_else(|| { let mut v = v.clone(); v.decor_mut().clear(); v.to_string() });
+        let mut v: Vec<(String, String)> = t.iter().filter(|(k, _)| is_address(k)).map(|(k, i)| (field(at, k), i.as_value().map(value).unwrap_or_default())).collect();
+        v.sort(); if v.windows(2).any(|w| w[0].0 == w[1].0) { return None; }
+        Some(v)
+    }
     kept.into_iter().find_map(|k| {
-        let at = k.rsplit_once('.').map(|x| x.0).unwrap_or("");
-        (addresses(&cur, at) != addresses(&next, at)).then(|| format!("{k}: where {at} sends it changed, so give {k} again as a value in the same save (a hidden value, or one from the environment, doesn't go to a new address from here; or change the address in the file on the server)"))
+        let at = &k[..k.len() - 1]; let (a, b) = (addresses(&cur, at), addresses(&next, at));
+        let (k, at) = (k.join("."), at.join("."));
+        (a.is_none() || a != b).then(|| format!("{k}: where {at} sends it changed, so give {k} again as a value in the same save (a hidden value, or one from the environment, doesn't go to a new address from here; or change the address in the file on the server)"))
     })
 }
 /// Secrets in JSON (the command line's options): masked, a `${VAR}` reference shown as it is.
 fn mask_json(v: &mut J) { if let J::Object(m) = v { for (k, x) in m.iter_mut() { if is_secret(k) { if let J::String(s) = x { if !s.trim_start().starts_with("${") { *x = json!(HIDDEN); } } } else { mask_json(x); } } } }
-/// Every secret in a file's text (outside `${VAR}` references), each with its dotted key: to mask, and to restore.
-fn secrets_in(doc: &mut toml_edit::DocumentMut, each: impl FnMut(&str, &mut toml_edit::Value)) { secrets_with(doc, false, each) }
+/// Every secret in a file's text (outside `${VAR}` references), each with its path of keys: to mask, and to restore.
+fn secrets_in(doc: &mut toml_edit::DocumentMut, each: impl FnMut(&[String], &mut toml_edit::Value)) { secrets_with(doc, false, each) }
 /// The same, `refs`: with the secrets that are `${VAR}` references too.
-fn secrets_with(doc: &mut toml_edit::DocumentMut, refs: bool, mut each: impl FnMut(&str, &mut toml_edit::Value)) {
-    fn walk(t: &mut dyn toml_edit::TableLike, at: &str, refs: bool, each: &mut dyn FnMut(&str, &mut toml_edit::Value)) {
+fn secrets_with(doc: &mut toml_edit::DocumentMut, refs: bool, mut each: impl FnMut(&[String], &mut toml_edit::Value)) {
+    fn walk(t: &mut dyn toml_edit::TableLike, at: &[String], refs: bool, each: &mut dyn FnMut(&[String], &mut toml_edit::Value)) {
         for (k, item) in t.iter_mut() {
-            let here = if at.is_empty() { k.get().to_string() } else { format!("{at}.{}", k.get()) };
+            let mut here = at.to_vec(); here.push(k.get().to_string());
             match item {
                 toml_edit::Item::Table(t) => walk(t, &here, refs, each),
+                toml_edit::Item::ArrayOfTables(a) => for (i, t) in a.iter_mut().enumerate() { let mut h = here.clone(); h.push(format!("[{i}]")); walk(t, &h, refs, each) },
                 toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => walk(t, &here, refs, each),
                 toml_edit::Item::Value(v) if is_secret(k.get()) && v.as_str().is_some_and(|s| refs || !s.trim_start().starts_with("${")) => each(&here, v),
                 _ => {}
             }
         }
     }
-    walk(doc.as_table_mut(), "", refs, &mut each);
+    walk(doc.as_table_mut(), &[], refs, &mut each);
 }
 /// The file's text as the console shows it: secrets replaced by HIDDEN (comments and the rest as they are). A text
 /// that doesn't parse isn't shown at all: no masking of a text that isn't understood is sure to catch every secret.
@@ -160,10 +186,10 @@ fn masked_text(text: &str) -> String {
 fn unmasked_text(text: &str, current: &str) -> Result<String, String> {
     if !text.contains(HIDDEN) { return Ok(text.to_string()); }
     let mut have = std::collections::HashMap::new();
-    if let Ok(mut doc) = current.parse::<toml_edit::DocumentMut>() { secrets_in(&mut doc, |k, v| { have.insert(k.to_string(), v.as_str().unwrap_or("").to_string()); }); }
+    if let Ok(mut doc) = current.parse::<toml_edit::DocumentMut>() { secrets_in(&mut doc, |k, v| { have.insert(k.to_vec(), v.as_str().unwrap_or("").to_string()); }); }
     let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
     let mut missing = None;
-    secrets_in(&mut doc, |k, v| if v.as_str() == Some(HIDDEN) { match have.get(k) { Some(real) => { let d = v.decor().clone(); *v = real.as_str().into(); *v.decor_mut() = d; } None => { missing.get_or_insert(k.to_string()); } } });
+    secrets_in(&mut doc, |k, v| if v.as_str() == Some(HIDDEN) { match have.get(k) { Some(real) => { let d = v.decor().clone(); *v = real.as_str().into(); *v.decor_mut() = d; } None => { missing.get_or_insert(k.join(".")); } } });
     match missing { Some(k) => Err(format!("{k}: hidden, and the file has no value for it: type the value")), None => Ok(doc.to_string()) }
 }
 const MAX_BODY: usize = 1 << 20; const MAX_LINE: u64 = 16 << 10; const MAX_HEADERS: usize = 64;
@@ -547,20 +573,33 @@ mod tests {
         assert_eq!(redirected(file, &unmasked_text(&commented, file).unwrap()), None, "no address changed");
         assert_eq!(redact("bad value s3cr3t-value near g-secret", &[file]), "bad value (hidden) near (hidden)");
         // the environment: no new references from here, and one already there doesn't follow a new address either
-        assert!(new_reference(file, &format!("{file}[app]\npublicUrl = \"https://x/${{HOME}}\"\n")).unwrap().starts_with("${HOME} at app.publicurl: a reference to the server's environment"));
+        assert!(new_reference(file, &format!("{file}[app]\npublicUrl = \"https://x/${{HOME}}\"\n")).unwrap().starts_with("${HOME} at app.publicUrl: a reference to the server's environment"));
         assert_eq!(new_reference(file, &file.replace("# keys", "# the keys")), None, "the reference to DB_PASS was there");
         let moved_ref = format!("{file}\n[auth.oauth.evil]\nclientId = \"x\"\ntokenUrl = \"https://evil.example/token\"\nclientSecret = \"${{DB_PASS}}\"\n");
-        assert!(new_reference(file, &moved_ref).unwrap().contains("${DB_PASS} at auth.oauth.evil.clientsecret"), "a reference moved to another key is new there");
+        assert!(new_reference(file, &moved_ref).unwrap().contains("${DB_PASS} at auth.oauth.evil.clientSecret"), "a reference moved to another key is new there");
         assert!(redirected(file, &moved_ref).unwrap().contains("auth.oauth.evil.clientSecret"), "and the address check holds it too");
-        assert!(new_reference(file, &file.replace("passphrase", "pass_phrase")).is_none(), "the same key in another spelling is the same place");
+        let s3 = "[backup]\nendpoint = \"https://s3.example\"\nsecretKey = \"${S3}\"\n";
+        assert!(new_reference(s3, &s3.replace("secretKey", "secret_key")).is_none(), "the same key in its other spelling is the same place");
+        assert!(new_reference(s3, &s3.replace("secretKey", "secretkey")).is_some(), "a spelling the configuration doesn't read isn't");
         assert_eq!(new_reference(file, &format!("{file}\n[auth.oauth.\"${{DB_PASS}}\"]\nclientId = \"x\"\n")).unwrap(), "${DB_PASS}: a reference to the server's environment is added in the file on the server, not here", "nor in a table's name");
         assert!(new_reference(file, &file.replace("# keys", "# keys ${DB_PASS}")).is_some(), "nor in a comment");
         let twice = file.replace("# keys", "# keys ${DB_PASS}");
         assert!(new_reference(&twice, &twice.replace("[backup]", "[backup] # backups")).is_none(), "the ones already there stay");
+        let from_comment = format!("{file}\n[auth.oauth.\"${{DB_PASS}}\"]\nclientId = \"x\"\n");
+        assert!(new_reference(&twice, &from_comment).is_some(), "one outside a value doesn't move to another line (a comment's to a table's name)");
+        assert!(new_reference(file, "a = \"${\"\n# DB_PASS}\n").is_some(), "nor run across a value's end");
+        // a provider is its name as written: another spelling of it is another provider
+        let g = "[auth.oauth.google]\nclientId = \"id\"\nclientSecret = \"${G_SECRET}\"\ntokenUrl = \"https://g.example/t\"\n";
+        let respelled = format!("{}[auth.oauth.Goo_gle]\nclientId = \"id\"\nclientSecret = \"${{G_SECRET}}\"\ntokenUrl = \"https://evil.example/t\"\n", g.replace("\"${G_SECRET}\"", "\"typed\""));
+        assert!(new_reference(g, &respelled).unwrap().contains("at auth.oauth.Goo_gle.clientSecret"), "{respelled}");
+        assert!(redirected(g, &respelled).unwrap().starts_with("auth.oauth.Goo_gle.clientSecret: where"));
+        // a name with a dot in it is one name
+        let dotted = g.replace("[auth.oauth.google]", "[auth.oauth.\"a.b\"]");
+        assert!(redirected(&dotted, &dotted.replace("g.example", "evil.example")).unwrap().starts_with("auth.oauth.a.b.clientSecret: where"));
         assert!(unmasked_text(&shown.replace("secretKey", "secret_key"), file).unwrap_err().contains("backup.secret_key: hidden"), "a hidden value comes back under its own key only");
         let aliased = file.replace("secretKey", "secret_key").replace("https://s3.example", "https://evil.example");
-        assert!(redirected(file, &aliased).unwrap().starts_with("backup.secret_key: where backup sends it changed"), "renaming the key doesn't make a kept secret new");
-        assert!(redirected(file, &file.replace("[backup]", "[Backup]").replace("https://s3.example", "https://evil.example")).is_some(), "nor does renaming its table");
+        assert!(redirected(file, &aliased).unwrap().starts_with("backup.secretKey: where backup sends it changed"), "renaming the key doesn't make a kept secret new");
+        assert!(crate::config::Config::check("[Backup]\nendpoint = \"https://evil.example\"\n", None).is_err(), "a table's name in another spelling isn't read at all");
         let env_key = "[embed]\nurl = \"https://api.example/v1\"\nmodel = \"m\"\napiKey = \"${OPENAI_KEY}\"\n";
         assert!(redirected(env_key, &env_key.replace("api.example", "evil.example")).unwrap().contains("embed.apiKey"));
         assert_eq!(redirected(env_key, &env_key.replace("api.example", "evil.example").replace("${OPENAI_KEY}", "sk-typed-again")), None);
