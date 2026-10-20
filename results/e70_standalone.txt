@@ -1,0 +1,6 @@
+schema from the console SQL, functions from its Functions tab    ok
+an agent over MCP: OAuth, its tools, a call, its event stream    ok
+a console deploy, heard by the agent after                       503 ms
+a broken deploy                                                  jobs.ts:12:14: Unexpected token
+called from the console, as the app and as a member              ok
+functions from a folder: shown, and not deployed over            ok

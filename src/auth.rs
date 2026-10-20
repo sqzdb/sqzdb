@@ -56,7 +56,22 @@ pub fn is_system(name: &str) -> bool { let n = name.as_bytes(); (n.len() >= 6 &&
 /// Per database: failed sign-ins by login, and when expired sessions were last swept.
 /// Per database: failed sign-ins by login, when expired sessions were last swept, and the sign-in state counter that
 /// the users table and the auth system tables bump on every write (`Table::watch`).
-#[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>, create_lock: Mutex<()> }
+#[derive(Default)] pub struct AuthState { failures: Mutex<HashMap<String, (u32, Instant)>>, last_sweep: std::sync::atomic::AtomicI64, pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>, create_lock: Mutex<()>,
+    /// device login: the devices waiting for a signed-in browser to let them in, by device code
+    devices: Mutex<HashMap<String, Device>> }
+/// A device waiting to be let in (device login, RFC 8628): the code its user enters, the name it gave, when it asked
+/// and last polled; once someone decided, the session made for it (and its table) or a refusal.
+struct Device { user_code: String, name: String, at: Instant, polled: Option<Instant>, outcome: Option<Option<(String, SignedIn)>> }
+/// How long a device code holds, and how often its device may poll.
+pub const DEVICE_TTL: Duration = Duration::from_secs(600);
+pub const DEVICE_INTERVAL: Duration = Duration::from_secs(5);
+/// Letters a user code is made of: no vowels (no words), no look-alikes (0/O, 1/I).
+const USER_CODE: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
+/// A user code as people type it: upper case, the hyphen anywhere or nowhere.
+pub fn user_code(typed: &str) -> String {
+    let c: String = typed.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect();
+    if c.len() == 8 { format!("{}-{}", &c[..4], &c[4..]) } else { c }
+}
 
 fn params() -> Params { Params::new(19_456, 2, 1, None).expect("argon2 parameters") }
 /// Argon2 into working memory of its own: an anonymous mapping, returned to the system when the hash is done. From
@@ -217,6 +232,63 @@ impl Sql {
         let id = token_id(token).ok_or("session: not a session token")?; let sessions = self.system(SESSIONS)?;
         let k = sessions.schema.key_from_value(&Value::Bytes(id.to_vec()))?;
         match sessions.with_pk(k, |r| decode_col(&sessions.schema, r, 1)) { Some(Value::Text(s)) => Ok(s), _ => Err("session: unknown or signed out; sign in again".into()) }
+    }
+    /// A new session for the user another session belongs to (`token_owner`'s `<table>:<key>`): a device a signed-in
+    /// browser lets in. The table, and the user's row as sign-in returns it.
+    pub(crate) fn session_for_owner(&self, owner: &str) -> Result<(String, SignedIn), String> {
+        let (table, key) = owner.split_once(':').ok_or("session: damaged session row")?;
+        let (t, _) = self.auth_table(table)?;
+        let pk = t.schema.key_from_value(&key_value(&t.schema.columns[t.schema.pk].ty, key)?)?;
+        let user = t.with_pk(pk, |r| r.to_vec()).ok_or("sign-in: the user no longer exists")?;
+        let secrets = self.system(SECRETS)?;
+        let sr = secrets.with_pk(Self::text_pk(&secrets, owner)?, |r| r.to_vec()).ok_or("sign-in: the user no longer exists")?;
+        let token = self.new_session(&secrets, owner, &sr)?;
+        Ok((t.schema.name.to_lowercase(), SignedIn { token, user: user_pairs(&t, &user), created: false }))
+    }
+    /// Device login, step 1: a device (a CLI, a server, a TV) asks to be let in. Its device code (secret: it polls with
+    /// it) and the user code its user enters in a browser where they are signed in.
+    pub fn device_start(&self, name: &str) -> Result<(String, String), String> {
+        let mut d = self.auth.devices.lock().unwrap();
+        d.retain(|_, v| v.at.elapsed() < DEVICE_TTL);
+        if d.len() >= 10_000 { return Err("too many devices are waiting to sign in; try again in a few minutes".into()); }
+        let user_code = loop {
+            let r = random::<8>(); let c: String = r.iter().map(|b| USER_CODE[*b as usize % USER_CODE.len()] as char).collect();
+            let c = user_code(&c); if !d.values().any(|v| v.user_code == c) { break c; }
+        };
+        let device_code = hex(&random::<32>());
+        let name: String = name.chars().filter(|c| !c.is_control()).take(80).collect::<String>().trim().to_string();
+        d.insert(device_code.clone(), Device { user_code: user_code.clone(), name: if name.is_empty() { "A device".into() } else { name }, at: Instant::now(), polled: None, outcome: None });
+        Ok((device_code, user_code))
+    }
+    /// The name of the device a user code belongs to, while it waits.
+    pub fn device_named(&self, code: &str) -> Option<String> {
+        let code = user_code(code);
+        self.auth.devices.lock().unwrap().values().find(|v| v.user_code == code && v.outcome.is_none() && v.at.elapsed() < DEVICE_TTL).map(|v| v.name.clone())
+    }
+    /// Device login, step 2: the user decides, in a browser signed in with `approver` (a session token): a session of
+    /// their own for the device, or (None) a refusal.
+    pub fn device_decide(&self, code: &str, approver: Option<&str>) -> Result<String, String> {
+        let code = user_code(code);
+        let made = match approver { Some(t) => { let mut s = Session::default(); self.session_from_token(&mut s, t)?; Some(self.session_for_owner(&self.token_owner(t)?)?) } None => None };
+        let mut d = self.auth.devices.lock().unwrap();
+        let Some(v) = d.values_mut().find(|v| v.user_code == code && v.outcome.is_none() && v.at.elapsed() < DEVICE_TTL) else {
+            if let Some((_, si)) = &made { let _ = self.sign_out(&si.token); }
+            return Err("that code is unknown or has expired: start again on the device".into());
+        };
+        v.outcome = Some(made); Ok(v.name.clone())
+    }
+    /// Device login, step 3: the device polls with its device code. Its session once let in; else why not yet
+    /// (`PENDING`, `SLOW_DOWN` when it polls more often than every DEVICE_INTERVAL), or not at all (`DENIED`,
+    /// `EXPIRED`).
+    pub fn device_poll(&self, device_code: &str) -> Result<(String, SignedIn), &'static str> {
+        let mut d = self.auth.devices.lock().unwrap();
+        let Some(v) = d.get_mut(device_code).filter(|v| v.at.elapsed() < DEVICE_TTL) else { return Err("EXPIRED") };
+        if v.outcome.is_none() {
+            let early = v.polled.is_some_and(|p| p.elapsed() < DEVICE_INTERVAL - Duration::from_millis(500));
+            v.polled = Some(Instant::now());
+            return Err(if early { "SLOW_DOWN" } else { "PENDING" });
+        }
+        match d.remove(device_code).and_then(|v| v.outcome.flatten()) { Some(x) => Ok(x), None => Err("DENIED") }
     }
     /// The password generation of a user (`<table>:<key>`): a password change or a sign-out everywhere changes it.
     fn generation_of(&self, secret_id: &str) -> Result<Value, String> {

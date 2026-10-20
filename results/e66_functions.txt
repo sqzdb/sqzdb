@@ -6,9 +6,10 @@ MCP instructions                                                 A database you 
 a rule, as the agent sees it                                     a completed run needs an outcome
 part 2: MCP                                                      ok
 functions: deployed 5 from /home/iluxa/dblab/data/nocow/e66-functions: myJobs, park, ping, reportRun, startRun
-a new file in the folder, callable after                         1010 ms
-HTTP round trip, an empty function (ping)                        57.5 us
-HTTP round trip, SELECT 1 as /api/sql                            47.2 us
-HTTP round trip, read-only function myJobs (1 row)               57.8 us
-HTTP round trip, its SELECT as /api/sql                          52.5 us
-HTTP, park + startRun + reportRun (three calls, six writes)      233.2 us
+a new file in the folder, callable after                         1009 ms
+the agent told its tools changed, after the file was written     1009 ms
+HTTP round trip, an empty function (ping)                        55.1 us
+HTTP round trip, SELECT 1 as /api/sql                            48.4 us
+HTTP round trip, read-only function myJobs (1 row)               63.8 us
+HTTP round trip, its SELECT as /api/sql                          51.0 us
+HTTP, park + startRun + reportRun (three calls, six writes)      250.5 us

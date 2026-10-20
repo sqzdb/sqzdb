@@ -1,6 +1,6 @@
 {
   "name": "sqzdb",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "description": "An embedded SQL database for Node: concurrent writers, row policies, live queries, files, vectors, sign-in and MCP for agents",
   "keywords": [
     "database",
@@ -49,11 +49,11 @@
     "darwin"
   ],
   "optionalDependencies": {
-    "@sqzdb/linux-x64-gnu": "0.11.1",
-    "@sqzdb/linux-x64-musl": "0.11.1",
-    "@sqzdb/linux-arm64-gnu": "0.11.1",
-    "@sqzdb/linux-arm64-musl": "0.11.1",
-    "@sqzdb/darwin-x64": "0.11.1",
-    "@sqzdb/darwin-arm64": "0.11.1"
+    "@sqzdb/linux-x64-gnu": "0.12.0",
+    "@sqzdb/linux-x64-musl": "0.12.0",
+    "@sqzdb/linux-arm64-gnu": "0.12.0",
+    "@sqzdb/linux-arm64-musl": "0.12.0",
+    "@sqzdb/darwin-x64": "0.12.0",
+    "@sqzdb/darwin-arm64": "0.12.0"
   }
 }

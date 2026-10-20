@@ -24,7 +24,7 @@ pub(crate) fn ours(sql: &crate::sql::Sql, path: &str) -> bool {
     if path.starts_with("/_sqz/") { return true; }
     let p: Vec<&str> = path.trim_matches('/').split('/').collect();
     matches!(p.as_slice(),
-        ["api", "sql" | "batch" | "me" | "socket" | "client.js" | "files"] | ["api", "fn", _] | ["api", "files", _] | ["api", "auth", "sign-out" | "exchange"]
+        ["api", "sql" | "batch" | "me" | "socket" | "client.js" | "files"] | ["api", "fn", _] | ["api", "files", _] | ["api", "auth", "sign-out" | "exchange" | "device"] | ["api", "auth", "device", "token"]
         | ["api", "auth", _, "sign-up" | "sign-in" | "methods"] | ["api", "auth", _, "oauth", _] | ["api", "auth", _, "oauth", _, "callback"])
 }
 

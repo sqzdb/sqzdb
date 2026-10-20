@@ -97,6 +97,9 @@ fn serve(weak: std::sync::Weak<Sql>, stream: TcpStream, token: &str) -> std::io:
                         ("GET", "/api/tables") => json_resp(&mut w, 200, &api_tables(&sql))?,
                         ("GET", "/api/status") => json_resp(&mut w, 200, &api_status(&sql))?,
                         ("GET", "/api/acl") => json_resp(&mut w, 200, &api_acl(&sql))?,
+                        ("GET", "/api/functions") => json_resp(&mut w, 200, &api_functions(&sql))?,
+                        ("POST", "/api/functions") => { let (st, v) = api_deploy(&sql, &req.body); json_resp(&mut w, st, &v)? }
+                        ("POST", "/api/functions/call") => { let (st, v) = api_call(&sql, &req.body); json_resp(&mut w, st, &v)? }
                         ("POST", "/api/backup/test") => json_resp(&mut w, 200, &api_backup_test(&sql))?,
                         ("POST", "/api/snapshot") => { let st = sql.snapshot(); json_resp(&mut w, 200, &json!({"rows": st.rows, "bytes": st.bytes, "secs": st.secs, "deletedSegments": st.deleted_segments}))? }
                         ("GET", "/api/live") => { drop(sql); return stream_events(&weak, &sess, &req, w, false) }
@@ -168,6 +171,41 @@ fn api_status(sql: &Sql) -> J {
             "backup": backup, "followerApplied": sql.follower_applied(), "tables": sql.db.table_names().len(), "reactor": sql.live.get().map(|r| json!({"events": r.events.load(Relaxed), "reruns": r.reruns.load(Relaxed)})) })
 }
 fn cmp_sym(c: crate::sql::Cmp) -> &'static str { use crate::sql::Cmp::*; match c { Eq => "=", Ne => "<>", Lt => "<", Le => "<=", Gt => ">", Ge => ">=", IsNull => "IS NULL", IsNotNull => "IS NOT NULL", In => "IN", NotIn => "NOT IN" } }
+// ---- functions: what is deployed, deploying from here, and trying one as an identity
+
+/// The deploy: its files as written, its exports, why it doesn't load (if it doesn't), where it comes from, and the
+/// MCP endpoint agents reach its functions at.
+fn api_functions(sql: &Sql) -> J {
+    let dir = sql.cfg.functions.dir.as_ref().map(|d| d.display().to_string());
+    let files: serde_json::Map<String, J> = sql.deployed_files().into_iter().map(|(k, v)| (k, J::String(v))).collect();
+    json!({"files": files, "exports": sql.exports_json(), "broken": sql.functions_broken_reason(), "folder": dir, "watch": sql.cfg.functions.watch,
+           "mcp": sql.cfg.app.mcp.as_ref().map(|m| json!({"url": sql.cfg.app.public_url.as_ref().map(|u| format!("{}/mcp", u.trim_end_matches('/'))), "sql": m.sql}))})
+}
+/// Deploy these files (`{"files": {path: source}}`), replacing the deploy in use; refused while a folder is the source.
+fn api_deploy(sql: &Sql, body: &[u8]) -> (u16, J) {
+    if let Some(d) = &sql.cfg.functions.dir { return (409, json!({"error": format!("the functions are deployed from {} (at start, and as it changes): edit the files there", d.display()), "code": "CONFLICT"})); }
+    let files = serde_json::from_slice::<J>(body).ok().and_then(|v| v.get("files").and_then(|f| f.as_object()).map(|m| m.iter().map(|(k, s)| s.as_str().map(|s| (k.clone(), s.to_string()))).collect::<Option<Vec<_>>>())).flatten();
+    let Some(files) = files else { return (400, json!({"error": "send {\"files\": {path: source}}", "code": "ARGUMENTS"})) };
+    match sql.deploy_functions(&Session::default(), files) {
+        Ok(d) => (200, json!({"functions": d.functions, "changed": d.changed})),
+        Err(e) => (400, json!({"error": e, "code": "FUNCTION"})),
+    }
+}
+/// Call a function as the app (`as` absent), or as an identity: `{"name", "args", "as": {"roles": […], "attrs": {…}}}`.
+fn api_call(sql: &Sql, body: &[u8]) -> (u16, J) {
+    let Ok(v) = serde_json::from_slice::<J>(body) else { return (400, json!({"error": "send {\"name\", \"args\", \"as\"}", "code": "ARGUMENTS"})) };
+    let mut sess = Session::default();
+    if let Some(who) = v.get("as").filter(|w| !w.is_null()) {
+        if let Err(e) = sql.assume_json(&mut sess, &who.to_string()) { return (400, json!({"error": e, "code": "ARGUMENTS"})); }
+    }
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let t = Instant::now();
+    match sql.call_function(&mut sess, name, v.get("args").unwrap_or(&json!({})), false) {
+        Ok(r) => (200, json!({"result": r, "ms": t.elapsed().as_secs_f64() * 1000.0})),
+        Err(e) => (400, json!({"error": e.message, "code": e.code})),
+    }
+}
+
 fn cmds_str(m: u8) -> Vec<&'static str> { let mut v = vec![]; if m & P_SELECT != 0 { v.push("SELECT"); } if m & P_INSERT != 0 { v.push("INSERT"); } if m & P_UPDATE != 0 { v.push("UPDATE"); } if m & P_DELETE != 0 { v.push("DELETE"); } v }
 fn api_acl(sql: &Sql) -> J {
     let a = sql.acl.read().unwrap();

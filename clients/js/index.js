@@ -50,6 +50,19 @@ class Auth {
     const to = `${this._c.url}/api/auth/${this.table}/oauth/${encodeURIComponent(provider)}?return=${encodeURIComponent(back)}&challenge=${challenge}`;
     if (globalThis.location) globalThis.location.assign(to); return to;
   }
+  /** Sign in a device without a browser of its own (a CLI, a script on a server): `onCode` gets a code and the page
+   *  to enter it on, which the user opens in a browser where they are signed in; resolves once they allow it, with a
+   *  session of this device's own. Rejects with DENIED, or EXPIRED after 10 minutes. */
+  async signInWithDevice({ name, onCode, signal } = {}) {
+    const d = await this._c._post('/api/auth/device', { name }, false);
+    await onCode?.({ code: d.user_code, url: d.verification_uri, urlWithCode: d.verification_uri_complete, expiresIn: d.expires_in });
+    let wait = d.interval * 1000;
+    for (;;) {
+      await new Promise((ok, no) => { const t = setTimeout(ok, wait); signal?.addEventListener('abort', () => { clearTimeout(t); no(new SqzError('ABORTED', 'device sign-in stopped')); }, { once: true }); });
+      try { return this._took(await this._c._post('/api/auth/device/token', { device_code: d.device_code }, false)); }
+      catch (e) { if (e.code === 'PENDING') continue; if (e.code === 'SLOW_DOWN') { wait += 5000; continue; } throw e; }
+    }
+  }
   async signOut() {
     const t = this._c.token; this._set(null, null);
     if (t) await this._c._fetch('/api/auth/sign-out', { method: 'POST', headers: { authorization: `Bearer ${t}` } }).catch(() => {});

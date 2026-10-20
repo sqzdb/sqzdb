@@ -125,6 +125,14 @@ try {
   const tok = await (await fetch(`${base}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', code: back.searchParams.get('code'), redirect_uri: redirect, client_id: client.client_id, code_verifier: verifier, resource: `${base}/mcp` }) })).json();
   let n = 0; const rpc = async (method, params) => (await (await json('/mcp', { jsonrpc: '2.0', id: ++n, method, params }, { authorization: `Bearer ${tok.access_token}`, 'mcp-protocol-version': '2025-06-18' })).json());
   const init = await rpc('initialize', { protocolVersion: '2025-06-18' }); pr('MCP instructions', init.result.instructions);
+  assert.equal(init.result.capabilities.tools.listChanged, true);
+  // the event stream: open for an agent with its token, and only as a stream
+  assert.equal((await fetch(`${base}/mcp`, { headers: { accept: 'text/event-stream' } })).status, 401);
+  assert.equal((await fetch(`${base}/mcp`, { headers: { authorization: `Bearer ${tok.access_token}` } })).status, 405, 'GET without Accept: text/event-stream');
+  const events = await fetch(`${base}/mcp`, { headers: { accept: 'text/event-stream', authorization: `Bearer ${tok.access_token}` } });
+  assert.equal(events.status, 200); assert.match(events.headers.get('content-type'), /^text\/event-stream/);
+  const reader = events.body.getReader(); let said = '';
+  const listChanged = (async () => { while (!said.includes('notifications/tools/list_changed')) { const { value, done } = await reader.read(); if (done) return false; said += new TextDecoder().decode(value); } return true; })();
   const tools = (await rpc('tools/list', {})).result.tools;
   assert.deepEqual(tools.map((t) => t.name), ['myJobs', 'park', 'reportRun', 'startRun'], 'the functions, and no SQL tools');
   const report = tools.find((t) => t.name === 'reportRun');
@@ -147,6 +155,11 @@ try {
   fs.writeFileSync(`${fns}/ping.ts`, "import { fn } from 'sqzdb/functions'\nexport const ping = fn({ roles: ['member'], run: () => 1 })\n");
   const t0 = Date.now(); while ((await call(ann, 'ping', {}))[0] !== 200) { assert.ok(Date.now() - t0 < 5000); await new Promise((r) => setTimeout(r, 100)); }
   pr('a new file in the folder, callable after', `${Date.now() - t0} ms`);
+  // the agent connected over MCP hears of it, and lists its tools again
+  assert.equal(await Promise.race([listChanged, new Promise((r) => setTimeout(() => r('timed out'), 5000))]), true, 'tools/list_changed on the event stream');
+  pr('the agent told its tools changed, after the file was written', `${Date.now() - t0} ms`);
+  assert.ok((await rpc('tools/list', {})).result.tools.some((t) => t.name === 'ping'));
+  reader.cancel();
   const N = 2000; const auth = { authorization: `Bearer ${ann}` };
   const loop = async (f) => { const t = process.hrtime.bigint(); for (let i = 0; i < N; i++) await f(); return Number(process.hrtime.bigint() - t) / N / 1000; };
   const best = async (f) => { await loop(f); return Math.min(await loop(f), await loop(f)); };

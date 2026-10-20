@@ -45,7 +45,7 @@ fn with_header(mut resp: Vec<u8>, header: &str) -> Vec<u8> {
     if let Some(i) = resp.windows(2).position(|w| w == b"\r\n") { resp.splice(i..i, format!("\r\n{header}").into_bytes()); }
     resp
 }
-fn open() -> Vec<(String, String)> { vec![("Access-Control-Allow-Origin".into(), "*".into()), ("Access-Control-Expose-Headers".into(), "WWW-Authenticate, Mcp-Session-Id".into())] }
+pub(crate) fn open() -> Vec<(String, String)> { vec![("Access-Control-Allow-Origin".into(), "*".into()), ("Access-Control-Expose-Headers".into(), "WWW-Authenticate, Mcp-Session-Id".into())] }
 fn json_out(status: u16, v: &J) -> Vec<u8> { let mut h = open(); h.push(("Cache-Control".into(), "no-store".into())); respond(status, "application/json", v.to_string().as_bytes(), &h) }
 fn oauth_err(status: u16, error: &str, desc: &str) -> Vec<u8> { json_out(status, &json!({"error": error, "error_description": desc})) }
 /// A form body (application/x-www-form-urlencoded), or a JSON object's string fields.
@@ -128,7 +128,8 @@ pub(crate) fn handle(sql: &Sql, st: &McpState, links: &Links, ip: IpAddr, allow:
         ("POST", "/oauth/token") => token(sql, st, mcp, req),
         ("POST", "/oauth/revoke") => { if let Some(t) = form(req).get("token") { sql.mcp_revoke(t); } json_out(200, &json!({})) }
         ("POST", "/mcp") => rpc(sql, links, mcp, req),
-        (_, "/mcp") => { let mut h = open(); h.push(("Allow".into(), "POST, OPTIONS".into())); respond(405, "text/plain", b"this server answers POST only (no event stream)", &h) }
+        // (GET with Accept: text/event-stream is the event stream, served by the app API itself: `events`)
+        (_, "/mcp") => { let mut h = open(); h.push(("Allow".into(), "GET, POST, OPTIONS".into())); respond(405, "text/plain", b"POST a JSON-RPC message, or GET with Accept: text/event-stream for the event stream (no sessions to DELETE)", &h) }
         _ => respond(404, "text/plain", b"not found", &open()),
     })
 }
@@ -333,16 +334,39 @@ pub(crate) fn title_case(s: &str) -> String { let mut c = s.chars(); match c.nex
 
 // ---- MCP: JSON-RPC over POST, one message per request
 
-fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> Vec<u8> {
+/// The agent a request to /mcp is from: its token's session, and the token. Refused (the answer to send): a page of
+/// another origin (DNS rebinding: the transport spec), or no token, or one that no longer holds.
+fn agent(sql: &Sql, req: &Req) -> Result<(Session, String), Vec<u8>> {
     let b = base(sql);
     let unauthorized = |e: Option<&str>| { let mut h = open(); h.push(("WWW-Authenticate".into(), format!("Bearer resource_metadata=\"{b}/.well-known/oauth-protected-resource/mcp\", scope=\"sql\"{}", e.map(|e| format!(", error=\"invalid_token\", error_description=\"{}\"", e.replace('"', "'"))).unwrap_or_default()))); respond(401, "application/json", br#"{"error":"sign in through this server's OAuth"}"#, &h) };
     // a page in a browser may call only from the API's own origin or app.origins (DNS rebinding: the transport spec)
-    if let Some(o) = req.headers.get("origin") { let o = o.trim_end_matches('/'); if o != b && !sql.cfg.app.origins.iter().any(|x| x == "*" || x.eq_ignore_ascii_case(o)) { return json_out(403, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "this origin may not call /mcp (app.origins)"}})); } }
+    if let Some(o) = req.headers.get("origin") { let o = o.trim_end_matches('/'); if o != b && !sql.cfg.app.origins.iter().any(|x| x == "*" || x.eq_ignore_ascii_case(o)) { return Err(json_out(403, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "this origin may not call /mcp (app.origins)"}}))); } }
     let token = req.headers.get("authorization").and_then(|h| h.get(..7).filter(|p| p.eq_ignore_ascii_case("bearer ")).map(|_| h[7..].trim().to_string()));
-    let Some(token) = token else { return unauthorized(None) };
+    let Some(token) = token else { return Err(unauthorized(None)) };
     let mut sess = Session::default();
-    if let Err(e) = sql.mcp_session(&mut sess, &token) { return unauthorized(Some(&e)); }
-    if let Some(v) = req.headers.get("mcp-protocol-version") { if !PROTOCOLS.contains(&v.as_str()) { return json_out(400, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": format!("unsupported MCP-Protocol-Version {v}")}})); } }
+    if let Err(e) = sql.mcp_session(&mut sess, &token) { return Err(unauthorized(Some(&e))); }
+    if let Some(v) = req.headers.get("mcp-protocol-version") { if !PROTOCOLS.contains(&v.as_str()) { return Err(json_out(400, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": format!("unsupported MCP-Protocol-Version {v}")}}))); } }
+    Ok((sess, token))
+}
+
+/// The event stream (`GET /mcp`, Accept: text/event-stream) for this request: the agent's session and token, and the
+/// headers to answer with; or the refusal to send.
+pub(crate) fn events(sql: &Sql, req: &Req) -> Result<(Session, String, Vec<(String, String)>), Vec<u8>> {
+    if !req.headers.get("accept").is_some_and(|a| a.contains("text/event-stream")) { let mut h = open(); h.push(("Allow".into(), "GET, POST, OPTIONS".into())); return Err(respond(405, "text/plain", b"GET /mcp is the event stream: send Accept: text/event-stream", &h)); }
+    let (sess, token) = agent(sql, req)?;
+    Ok((sess, token, open()))
+}
+/// A fingerprint of the tools an agent's session sees: when it changes (a deploy, or other roles for its user), the
+/// event stream tells the agent to list them again.
+pub(crate) fn tools_digest(sql: &Sql, sess: &Session) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Some(mcp) = sql.cfg.app.mcp.as_ref() else { return 0 };
+    let mut h = std::collections::hash_map::DefaultHasher::new(); tools(sql, sess, mcp).to_string().hash(&mut h); h.finish()
+}
+
+fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> Vec<u8> {
+    let (mut sess, _) = match agent(sql, req) { Ok(x) => x, Err(refused) => return refused };
+    let b = base(sql);
     let msg: J = match serde_json::from_slice(&req.body) { Ok(m) => m, Err(_) => return json_out(400, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "not JSON"}})) };
     if !msg.is_object() { return json_out(400, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "one JSON-RPC message per request"}})); }
     // a notification, or a response to us: accepted, nothing to answer
@@ -358,7 +382,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
                 (true, false) => "A database you act on as the user who connected you, through its own tools: each carries out one operation, with its rules.",
                 _ => "A SQL database you act on as the user who connected you. Start with describe: it lists the tables you may use, their columns, and who you are (SESSION values that row policies compare with). Then query (SELECT) and execute (INSERT, UPDATE, DELETE). Use ? placeholders and pass values in params.",
             };
-            Ok(json!({ "protocolVersion": if PROTOCOLS.contains(&asked) { asked } else { PROTOCOLS[0] }, "capabilities": {"tools": {"listChanged": false}},
+            Ok(json!({ "protocolVersion": if PROTOCOLS.contains(&asked) { asked } else { PROTOCOLS[0] }, "capabilities": {"tools": {"listChanged": true}},
                 "serverInfo": {"name": "sqzdb", "title": host_of(&b), "version": env!("CARGO_PKG_VERSION")}, "instructions": instructions }))
         }
         "ping" => Ok(json!({})),

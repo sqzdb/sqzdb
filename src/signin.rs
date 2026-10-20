@@ -8,6 +8,8 @@
 //!   make an account, where `app.signUp` lists the table). It sets the cookie and goes back to `return`, a path on
 //!   this site or a page of `app.origins`.
 //! - `POST /_sqz/sign-out` (and a page at GET): ends the session, clears the cookie.
+//! - `GET /_sqz/device?code=…`: device login. A device (a CLI, a server) got a code from `POST /api/auth/device`; its
+//!   user, signed in here, lets it in (or not), and the device's poll gets a session of its own.
 //!
 //! A form posts back with a value that only the browser that loaded it holds (a cookie of its own, compared with the
 //! form's field), and from the API's own origin: another site can't sign a visitor in or out.
@@ -46,6 +48,16 @@ pub(crate) fn token_of(sql: &Sql, req: &Req) -> Option<String> {
     let h = |k: &str| req.headers.get(k).map(String::as_str);
     let from_cookie = || cookie(req, session_name(sql)).filter(|_| cookie_origin_ok(sql, h("origin"), h("host"), h("sec-fetch-site")));
     crate::app::bearer(req).or_else(from_cookie).filter(|t| !t.is_empty())
+}
+/// The address this API is reached at: `app.publicUrl`, or the scheme and host this request came to.
+pub(crate) fn site(sql: &Sql, req: &Req) -> String {
+    if let Some(u) = &sql.cfg.app.public_url { return u.trim_end_matches('/').to_string(); }
+    format!("{}://{}", if https(sql) { "https" } else { "http" }, req.headers.get("host").map(String::as_str).unwrap_or("localhost"))
+}
+/// The session token of a browser signed in here (a session that still holds).
+fn signed_in(sql: &Sql, req: &Req) -> Option<String> {
+    let t = token_of(sql, req)?; let mut s = crate::sql::Session::default();
+    sql.session_from_token(&mut s, &t).ok().map(|_| t)
 }
 /// Where to go back to after signing in or out: a path on this site, or a page on one of `app.origins` (never another
 /// site's: no open redirect). Anything else goes home.
@@ -90,6 +102,20 @@ pub(crate) fn handle(sql: &Sql, ip: IpAddr, allow: &dyn Fn() -> bool, req: &Req)
             match signed { Ok(si) => see_other(&back, &[session_cookie(sql, &si.token)]), Err(e) => sign_in_page(sql, &back, up, Some(&e)) }
         }
         ("GET", "/_sqz/sign-out") => sign_out_page(sql, &back_to(sql, &q("return"))),
+        ("GET", "/_sqz/device") => device_page(sql, req, &q("code"), None),
+        ("POST", "/_sqz/device") => {
+            let f = form(req); let code = f.get("code").cloned().unwrap_or_default();
+            if !same_browser(sql, req, &f) { return Some(device_page(sql, req, &code, Some("This form expired, or came from another page. Try again."))); }
+            let Some(t) = signed_in(sql, req) else { return Some(device_page(sql, req, &code, None)) };
+            if !allow() { return Some(device_page(sql, req, &code, Some("Too many attempts from here; wait a little and try again."))); }
+            let allowed = f.get("action").map(String::as_str) == Some("allow");
+            match sql.device_decide(&code, allowed.then_some(t.as_str())) {
+                Ok(name) => page(200, if allowed { "Device signed in" } else { "Device refused" }, &if allowed {
+                    format!("<h1>{} is signed in</h1><p>It acts as you now. You can close this page and go back to it.</p>", esc(&name))
+                } else { format!("<h1>{} was not let in</h1><p>Nothing changed. You can close this page.</p>", esc(&name)) }, None),
+                Err(e) => device_page(sql, req, "", Some(&e)),
+            }
+        }
         ("POST", "/_sqz/sign-out") => {
             let f = form(req); let back = back_to(sql, f.get("return").map(String::as_str).unwrap_or("/"));
             if !same_browser(sql, req, &f) { return Some(sign_out_page(sql, &back)); }
@@ -98,6 +124,26 @@ pub(crate) fn handle(sql: &Sql, ip: IpAddr, allow: &dyn Fn() -> bool, req: &Req)
         }
         _ => respond(404, "text/plain", b"not found", &[]),
     })
+}
+/// The device page: to sign in first; to enter the code a device shows; or, for a code that waits, whether to let
+/// that device in as the user signed in here.
+fn device_page(sql: &Sql, req: &Req, code: &str, err: Option<&str>) -> Vec<u8> {
+    let code = crate::auth::user_code(code);
+    let here = if code.is_empty() { "/_sqz/device".to_string() } else { format!("/_sqz/device?code={}", crate::app::enc(&code)) };
+    let Some(t) = signed_in(sql, req) else { return see_other(&format!("/_sqz/sign-in?return={}", crate::app::enc(&here)), &[]) };
+    // who is signed in here: their login, as the page shows it
+    let who = sql.token_owner(&t).ok().and_then(|o| { let table = o.split_once(':')?.0.to_string(); let (tb, at) = sql.auth_table_of(&table).ok()?; let mut s = crate::sql::Session::default(); sql.session_from_token(&mut s, &t).ok()?; s.attrs.get(&tb.schema.columns[at.login].name).map(|v| match v { crate::table::Value::Text(x) => x.clone(), v => format!("{v:?}") }) }).unwrap_or_default();
+    let host = host_of(&site(sql, req));
+    let err = err.map(|e| format!(r#"<p class="err">{}</p>"#, esc(e))).unwrap_or_default();
+    match (!code.is_empty()).then(|| sql.device_named(&code)).flatten() {
+        Some(name) => with_form(sql, "Sign in a device", |v| format!(r#"<h1>Let {n} sign in?</h1>{err}<p>It will act as <b>{w}</b> on {h}, with everything you may do, until it signs out or you change your password.</p>
+<p class="small">Code <b>{c}</b>. Allow only a device you started yourself, just now.</p>
+<form method="post" action="/_sqz/device"><input type="hidden" name="form" value="{v}"><input type="hidden" name="code" value="{c}"><button name="action" value="allow">Allow</button><button class="alt" name="action" value="deny">Deny</button></form>"#,
+            n = esc(&name), w = esc(&who), h = esc(&host), c = esc(&code)), if err.is_empty() { 200 } else { 400 }),
+        None => page(if code.is_empty() && err.is_empty() { 200 } else { 400 }, "Sign in a device", &format!(r#"<h1>Sign in a device</h1>{err}{gone}<p>Enter the code your device shows. It will act as <b>{w}</b>.</p>
+<form method="get" action="/_sqz/device"><label>Code<input name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" required autofocus></label><button>Continue</button></form>"#,
+            w = esc(&who), gone = if !code.is_empty() && err.is_empty() { r#"<p class="err">That code is unknown or has expired: start again on the device.</p>"# } else { "" }), None),
+    }
 }
 /// A page with a form: its value set as this browser's cookie too.
 fn with_form(sql: &Sql, title: &str, body: impl Fn(&str) -> String, status: u16) -> Vec<u8> {

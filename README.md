@@ -44,10 +44,10 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 | **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT` and `BYTES` of any length (up to 16 MB) or `TEXT(n)`, `TIMESTAMP`, `UUID`, `FILE`, `VECTOR(n)`. A value of the wrong type is rejected, never stored. |
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
-| **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions. A signed-in user's row becomes the identity the row policies read. |
+| **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions; CLIs and servers sign in with a code their user approves in a browser (device login). A signed-in user's row becomes the identity the row policies read. |
 | **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 20 KB. |
-| **Agents over MCP** | Claude, ChatGPT, Claude Code and other MCP clients connect to `/mcp`, sign their user in on the database's own OAuth page, and query and change data as that user, under the same grants and row policies. |
-| **Functions** | Your app's rules as TypeScript or JavaScript that runs inside the database, one transaction per call, as the caller. Each is an API endpoint and an MCP tool. Deploy a folder: on a server, a change to it deploys itself. |
+| **Agents over MCP** | Claude, ChatGPT, Claude Code and other MCP clients connect to `/mcp`, sign their user in on the database's own OAuth page, and query and change data as that user, under the same grants and row policies. Tools added by a deploy reach connected agents at once. |
+| **Functions** | Your app's rules as TypeScript or JavaScript that runs inside the database, one transaction per call, as the caller. Each is an API endpoint and an MCP tool. Deploy a folder (on a server, a change to it deploys itself), or write them in the web console. |
 | **In front of your app** | Point sqzdb at a Next.js (or any) server and it serves the site: HTTPS and HTTP/2 to browsers, a streaming, pooled proxy to the app, sign-in pages with the session in a cookie, and middleware and routes in TypeScript that guard pages and answer webhooks, with the database at hand. |
 | **Files as a column** | A `FILE` column holds an uploaded file. A browser uploads it with the row, and whoever may read the row gets a signed link that an `<img>` can load, with caching and byte ranges. Files no row refers to are cleaned up. |
 | **Vectors and search by meaning** | A `VECTOR(n)` column, searched with `cosine_distance` under the same policies as everything else. A column can be the embedding of other columns, filled in the background by OpenAI, Ollama or any OpenAI-compatible model, and `embed(?)` embeds the search text. |
@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.11.1` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.12.0` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -743,6 +743,35 @@ redirect = "0.0.0.0:80"             # optional: send http:// visitors to https:/
 
 **Not built yet:** email verification and password reset.
 
+#### Device login: CLIs and servers
+
+A program without a browser of its own (a CLI, a script on a server, a runner on a laptop) signs in through
+a browser where its user is already signed in, as with a TV app (RFC 8628):
+
+```js
+const db = connect('https://api.example.com', { storage: null })
+await db.auth.signInWithDevice({
+  name: 'deploy script on ci-7',                                  // the approval page shows it
+  onCode: ({ code, urlWithCode }) => console.log(`Open ${urlWithCode} (code ${code})`),
+})
+// signed in: db.token is this device's own session
+```
+
+1. The program asks for a code: `POST /api/auth/device` (with an optional `{ "name" }`). It gets a
+   `user_code` such as `JJHK-QKMT`, the page to enter it on (`/_sqz/device`, and a link with the code), and
+   a secret `device_code`.
+2. The user opens the page, signs in there if they aren't already, and sees which device is asking and as
+   whom. **Allow** gives the device a session of its own; **Deny** refuses it.
+3. The program polls `POST /api/auth/device/token` with its `device_code` every 5 s. The answer is
+   `PENDING` until the user decides, `SLOW_DOWN` if it polls faster, then the session (as a sign-in
+   returns it), `DENIED`, or `EXPIRED` after 10 minutes.
+
+- A code lets in one device, once. The device's session is like any other: it ends on sign-out, on a
+  password change, or when sessions expire.
+- The page's form is bound to the browser that loaded it and to the site's origin, like the sign-in page.
+  Asking for codes is rate-limited per address.
+- It works with any sign-in method. A user who signed up with Google approves a device the same way.
+
 #### Agents over MCP: Claude, ChatGPT, Claude Code
 
 With `[app.mcp]` set, the app API also serves the [Model Context Protocol](https://modelcontextprotocol.io)
@@ -787,8 +816,13 @@ In Claude and ChatGPT, add a custom connector with the same URL.
 - The official TypeScript SDK's client (1.30) connects, signs in, lists the tools and calls them; a tool
   call takes about 0.3 ms over HTTP (E65). Claude, ChatGPT and Claude Code use the same flow but weren't
   tested here: they need the server on a public https address.
-- **Not built yet:** Client ID Metadata Documents (clients register dynamically instead), server-to-agent
-  notifications, resources and prompts.
+- **New tools reach connected agents.** `GET /mcp` with `Accept: text/event-stream` is the event stream.
+  When a deploy changes the tools an agent may call (or its user's roles change), the agent gets
+  `notifications/tools/list_changed` within a second and lists them again. A comment every 25 s keeps the
+  stream open through proxies, and it ends when the agent's token does. Claude Code reloads its tools on
+  it; a client that ignores it sees new tools when it reconnects (E66).
+- **Not built yet:** Client ID Metadata Documents (clients register dynamically instead), resources and
+  prompts.
 
 ### Functions: your app's rules in the database
 
@@ -831,6 +865,10 @@ sqzdb serve ./data --app 0.0.0.0:443 --domain api.example.com --functions ./func
 sqzdb deploy ./functions ./data                                 # to a database that isn't open
 sqzdb deploy ./functions db.internal:7781 --token "$DB_TOKEN"   # to a running server, over its TCP port
 ```
+
+Or with no folder at all: write, paste or upload files in the [web console](#web-console-and-command-line)'s
+**Functions** tab and deploy them from there. On a standalone server that's the whole backend: tables and
+policies from its SQL editor, the app's rules from its Functions tab.
 
 - A deploy replaces every function before it. The same files again change nothing.
 - A deploy is stored in the catalog, so it is logged, snapshotted, backed up and copied to followers with
@@ -1112,7 +1150,11 @@ generated and printed once. `Ctrl-C` stops cleanly, writing a final snapshot so 
 instant.
 
 The console has a table browser, a form to create and alter tables, a SQL editor with a **Live** toggle
-that keeps results current, a feed of changes, and the roles, grants and policies. Its **Backup** tab
+that keeps results current, a feed of changes, and the roles, grants and policies. Its **Functions** tab
+holds the app's [functions](#functions-your-apps-rules-in-the-database): write, paste or upload `.ts` and `.js`
+files and deploy them (a failed deploy names the line and changes nothing), see each export and whether
+agents get it as a tool, and call one with arguments as the app or as a role with attributes. When the
+server deploys a folder (`--functions`), the tab shows that folder's files read-only. Its **Backup** tab
 shows whether uploads are healthy, how far the bucket is behind, the last error and a connection test;
 when backup is off, it writes the settings file and the restart command for your bucket. It is one HTML page compiled into the binary, with no build step. Bind it
 to loopback unless you intend otherwise: it acts as the application and sees everything.
@@ -1410,7 +1452,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.11.1`. The release workflow builds
+Releases are tags that match the version in `Cargo.toml`, such as `v0.12.0`. The release workflow builds
 Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
 `SHA256SUMS` and `install.sh`.
 

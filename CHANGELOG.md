@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.12.0 — 2026-10-19
+
+**A standalone sqzdb is a whole backend.** Write the app's functions in the web console, and agents connected
+over MCP see the new tools at once. CLIs and servers sign in as their user with a code.
+
+### Added
+- **The console's Functions tab:**
+  - write, paste or upload `.ts` and `.js` files, and deploy them (Ctrl+S). A failed deploy names the file,
+    line and column, and changes nothing;
+  - see each export: functions (as MCP tools), middleware and routes, their arguments and roles;
+  - call a function with JSON arguments, as the app or as a role with attributes.
+
+  When the server deploys a folder (`--functions`), the tab shows its files read-only.
+- **MCP's event stream:** `GET /mcp` with `Accept: text/event-stream`. When a deploy changes the tools an
+  agent may call, or its user's roles change, the agent gets `notifications/tools/list_changed` and lists them
+  again. `initialize` now says `listChanged: true`.
+- **Device login** (RFC 8628) for programs without a browser of their own:
+  - `POST /api/auth/device` gives a code, which the user enters at `/_sqz/device` in a browser where they're
+    signed in;
+  - **Allow** gives the program a session of its own, which it gets by polling `POST /api/auth/device/token`;
+  - in the browser client, `auth.signInWithDevice({ name, onCode })` does all of it.
+
 ## 0.11.1 — 2026-10-19
 
 ### Added

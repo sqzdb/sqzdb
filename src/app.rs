@@ -584,6 +584,7 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
         return st.upstream.as_ref().expect("an upstream").forward(req, ip, peer, trusted, st.tls, &who).await;
     }
     if method == "GET" && path.trim_matches('/') == "api/socket" { return websocket(weak, st.links.clone(), req); }
+    if method == "GET" && path == "/mcp" && weak.upgrade().is_some_and(|s| s.cfg.app.mcp.is_some()) { return mcp_events(weak, req); }
     if method == "POST" && path == "/api/files" { return upload(weak, st, req).await; }
     if (method == "GET" || method == "HEAD") && path.starts_with("/api/files/") { return download(weak, st, req).await; }
     let (parts, mut body) = req.into_parts();
@@ -629,6 +630,28 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
             let mut h = h.clone(); if crate::app::cookie(req, crate::signin::session_name(sql)).is_some() { h.push(("Set-Cookie".into(), crate::signin::clear_session(sql))); }
             json_resp(200, &json!({}), &h)
         }
+        // device login: a device (a CLI, a server) asks for a code, its user lets it in from a signed-in browser
+        // (/_sqz/device), and it polls for its session
+        ("POST", ["api", "auth", "device"]) => if !st.allow(ip) { json_resp(429, &limited(), &h) } else {
+            let v = if req.body.iter().all(|b| b.is_ascii_whitespace()) { Ok(json!({})) } else { body_json(req) };
+            match v.and_then(|v| sql.device_start(v.get("name").and_then(|n| n.as_str()).unwrap_or("")).map_err(|e| json!({"error": e, "code": "LIMIT"}))) {
+                Ok((device, user)) => {
+                    let page = format!("{}/_sqz/device", crate::signin::site(sql, req));
+                    json_resp(200, &json!({"device_code": device, "user_code": user, "verification_uri": page, "verification_uri_complete": format!("{page}?code={user}"),
+                        "expires_in": crate::auth::DEVICE_TTL.as_secs(), "interval": crate::auth::DEVICE_INTERVAL.as_secs()}), &h)
+                }
+                Err(e) => json_resp(status_of(&e), &e, &h),
+            }
+        },
+        ("POST", ["api", "auth", "device", "token"]) => match body_json(req) {
+            Ok(v) => match sql.device_poll(v.get("device_code").and_then(|c| c.as_str()).unwrap_or("")) {
+                Ok((table, si)) => signed_reply(sql, signed_json(sql, &table, &si), false, &h),
+                Err(code) => json_resp(400, &json!({"code": code, "error": match code {
+                    "PENDING" => "waiting for the user to let this device in", "SLOW_DOWN" => "polling too often: wait the interval between polls",
+                    "DENIED" => "the user did not let this device in", _ => "an unknown or expired device code: start again" }}), &h),
+            },
+            Err(e) => json_resp(status_of(&e), &e, &h),
+        },
         ("POST", ["api", "auth", "exchange"]) => if !st.allow(ip) { json_resp(429, &limited(), &h) } else { body_json(req).and_then(|v| {
             let code = v.get("code").and_then(|c| c.as_str()).unwrap_or(""); let verifier = v.get("verifier").and_then(|c| c.as_str()).unwrap_or("");
             let held = st.codes.lock().unwrap().remove(code);   // one attempt per code, whatever the verifier
@@ -739,6 +762,41 @@ fn inline_type(t: &str) -> bool {
 }
 /// `GET /api/files/<id>?e=…&s=…`: the file, if the link is one a query handed out and still works. ETags, and
 /// single byte ranges (seeking in a video); the bytes stream from disk.
+/// MCP's event stream (`GET /mcp`): what the server tells an agent unasked. Here, that its tools changed (a deploy, or
+/// other roles for its user), so it lists them again. A comment every 25 s keeps proxies from closing it; it ends
+/// when the agent's token no longer holds, or the server stops.
+fn mcp_events(weak: &Weak<Sql>, req: hyper::Request<Incoming>) -> hyper::Response<Body> {
+    const CHANGED: &[u8] = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+    struct Watch { weak: Weak<Sql>, token: String, sess: Session, version: u64, digest: u64, checked: Instant, beat: Instant }
+    let Some(sql) = weak.upgrade() else { return into_response(respond(503, "text/plain", b"shutting down", &[])) };
+    let (parts, _) = req.into_parts();
+    let (sess, token, h) = match crate::mcp::events(&sql, &req_of(&parts, vec![])) { Ok(x) => x, Err(refused) => return into_response(refused) };
+    let now = Instant::now();
+    let w = Watch { weak: weak.clone(), token, version: sql.functions_version(), digest: crate::mcp::tools_digest(&sql, &sess), sess, checked: now, beat: now };
+    drop(sql);
+    let opened = futures_util::stream::once(async { Ok::<_, io::Error>(Frame::data(Bytes::from_static(b": open\n\n"))) });
+    let events = futures_util::stream::unfold(w, |mut w| async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let sql = w.weak.upgrade()?;
+            let mut look = false;
+            if w.checked.elapsed() > Duration::from_secs(30) {
+                // the token still holds (and carries the roles its user has now)
+                w.checked = Instant::now();
+                let mut fresh = Session::default();
+                if sql.mcp_session(&mut fresh, &w.token).is_err() { return None; }
+                w.sess = fresh; look = true;
+            }
+            let v = sql.functions_version(); if v != w.version { w.version = v; look = true; }
+            if look { let d = crate::mcp::tools_digest(&sql, &w.sess); if d != w.digest { w.digest = d; return Some((Ok(Frame::data(Bytes::from_static(CHANGED))), w)); } }
+            if w.beat.elapsed() > Duration::from_secs(25) { w.beat = Instant::now(); return Some((Ok(Frame::data(Bytes::from_static(b": keep-alive\n\n"))), w)); }
+        }
+    });
+    let mut b = hyper::Response::builder().status(200).header("content-type", "text/event-stream").header("cache-control", "no-store").header("x-accel-buffering", "no");
+    for (k, v) in &h { b = b.header(k.as_str(), v.as_str()); }
+    b.body(http_body_util::StreamBody::new(futures_util::StreamExt::chain(opened, events)).boxed()).unwrap_or_else(|_| into_response(respond(500, "text/plain", b"the stream failed", &[])))
+}
+
 async fn download(weak: &Weak<Sql>, st: &AppState, req: hyper::Request<Incoming>) -> hyper::Response<Body> {
     let Some(sql) = weak.upgrade() else { return into_response(respond(503, "text/plain", b"shutting down", &[])) };
     let (parts, _) = req.into_parts(); let req = req_of(&parts, vec![]);

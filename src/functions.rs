@@ -205,7 +205,9 @@ struct Bundle { version: u64, hash: String, names: Vec<String>, js: Arc<HashMap<
 /// Per database: the deploy in use (or why the one in the catalog failed to load), and the instances not in use.
 /// `pending`: the latest deploy read back from the catalog, compiled when first needed (a restart replays every deploy
 /// still in the log; only the last one is ever loaded).
-#[derive(Default)] pub struct FunctionsState { bundle: RwLock<Option<Arc<Bundle>>>, broken: RwLock<Option<String>>, pending: Mutex<Option<String>>, pool: Mutex<Pool>, freed: Condvar, versions: AtomicU64, deploying: Mutex<()> }
+#[derive(Default)] pub struct FunctionsState { bundle: RwLock<Option<Arc<Bundle>>>, broken: RwLock<Option<String>>, pending: Mutex<Option<String>>, pool: Mutex<Pool>, freed: Condvar, versions: AtomicU64, deploying: Mutex<()>,
+    /// the files of the deploy in the catalog, as written (TypeScript and all), loaded or not: what the console shows
+    source: RwLock<Option<String>> }
 #[derive(Default)] struct Pool { idle: Vec<Instance>, live: usize }
 /// A QuickJS runtime with a deploy loaded, used by one call at a time. Its JavaScript handles drop before the context
 /// and the runtime they live in (fields drop in order).
@@ -772,6 +774,7 @@ impl Sql {
         self.log_meta_replacing(FUNCTIONS_META, &format!("{FUNCTIONS_META}{text}"));
         let names = b.defs.iter().map(|d| d.name.clone()).collect();
         self.install(b, inst);
+        *self.functions.source.write().unwrap() = Some(text);
         Ok(Deployed { functions: names, changed: true })
     }
     /// Deploy the functions in a folder (see `read_folder`), as the application.
@@ -793,6 +796,7 @@ impl Sql {
         if let Some(p) = self.functions.pending.lock().unwrap().take() { self.load_catalog(&p); }
     }
     fn load_catalog(&self, json: &str) {
+        *self.functions.source.write().unwrap() = Some(json.to_string());
         let files: Result<Vec<(String, String)>, String> = serde_json::from_str::<J>(json).map_err(|e| e.to_string()).and_then(|v| v.get("files").and_then(|f| f.as_object()).map(|m| m.iter().map(|(k, s)| (k.clone(), s.as_str().unwrap_or("").to_string())).collect()).ok_or_else(|| "no files".into()));
         match files.and_then(|f| self.compile_functions(&f, false)) {
             Ok((b, inst)) => self.install(b, inst),
@@ -846,6 +850,26 @@ impl Sql {
         self.functions.bundle.read().unwrap().clone().ok_or_else(|| match self.functions.broken.read().unwrap().clone() { Some(e) => FnError::new("FUNCTION", format!("the deployed functions don't load: {e}")), None => FnError::new("NOT_FOUND", format!("no function {name} (none are deployed)")) })
     }
     /// Whether the deploy in the catalog doesn't load (its functions, middleware and routes are unavailable).
+    /// The files deployed, as written (path, source), whether they loaded or not.
+    pub fn deployed_files(&self) -> Vec<(String, String)> {
+        self.settle_functions();
+        let src = self.functions.source.read().unwrap().clone().unwrap_or_default();
+        serde_json::from_str::<J>(&src).ok().and_then(|v| v.get("files").and_then(|f| f.as_object()).map(|m| m.iter().map(|(k, s)| (k.clone(), s.as_str().unwrap_or("").to_string())).collect())).unwrap_or_default()
+    }
+    /// Why the deployed functions don't load, if they don't.
+    pub fn functions_broken_reason(&self) -> Option<String> { self.settle_functions(); self.functions.broken.read().unwrap().clone() }
+    /// Every export of the deploy in use, as the console lists them: kind, file, arguments, roles; and for middleware and
+    /// routes, their paths.
+    pub fn exports_json(&self) -> J {
+        J::Array(self.deployed().iter().map(|d| {
+            let (kind, paths, methods) = match &d.kind { Kind::Function => ("function", vec![], vec![]), Kind::Middleware { matches, .. } => ("middleware", matches.iter().map(|p| p.text.clone()).collect(), vec![]), Kind::Route { methods, pattern } => ("route", vec![pattern.text.clone()], methods.clone()) };
+            json!({"name": d.name, "file": d.file, "kind": kind, "description": d.description, "readOnly": d.read_only, "roles": d.roles, "paths": paths, "methods": methods,
+                   "args": d.args.iter().map(|a| json!({"name": a.name, "type": a.ty.describe(), "optional": a.optional, "description": a.description})).collect::<Vec<_>>(),
+                   "inputSchema": if d.kind == Kind::Function { input_schema(d) } else { J::Null }})
+        }).collect())
+    }
+    /// Which deploy is in effect: changes with every deploy that loads (and is 0 while none is).
+    pub fn functions_version(&self) -> u64 { self.settle_functions(); self.functions.bundle.read().unwrap().as_ref().map_or(0, |b| b.version) }
     pub fn functions_broken(&self) -> bool { self.settle_functions(); self.functions.broken.read().unwrap().is_some() }
     /// Whether middleware or routes are deployed: requests for anything but the API's own paths go through them.
     pub fn has_http(&self) -> bool { self.settle_functions(); self.functions.bundle.read().unwrap().as_ref().is_some_and(|b| !b.middleware.is_empty() || !b.routes.is_empty()) }
