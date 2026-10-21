@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.16.0 — 2026-10-21
+
+### Added
+- **`@sqzdb/client` on npm.** The browser client, with its types, as a package of its own: `npm install @sqzdb/client`,
+  `import { connect } from '@sqzdb/client'`. The same file is still served by every sqzdb at `/api/client.js`.
+- **Settings apply without a restart.** A save in the console's Settings tab, or an edit to the settings file by
+  hand, is put in place under the running server: the public address, origins, the anonymous role, sign-up,
+  providers, session length, MCP, the proxy target, static files and the function limits. The few that can't change
+  while running (the listeners, TLS, durability, backup, following, snapshots, the log, embeddings, the functions
+  folder and instance count) are marked "at the next restart" in the form, and Restart now is offered only for them.
+- **Password sign-in can be turned off**: `auth.password = false`, or the switch under Settings → Sign-in. The sign-in
+  pages then show the providers alone, the password endpoints answer `DENIED`, and the client's `methods()` says so.
+- **`enabled: false` on a function, route or middleware** deploys it switched off: nothing reaches it but the
+  console's Try panel, so it can be tried against real data first. The Functions panel lists it dimmed, with "off".
+- **The users table comes made.** `sqzdb serve` with the app API on makes `users` the first time it runs with nothing
+  to sign in to: `id UUID`, `email` (the login), `name`, `role` (member by default, the application's alone to set)
+  and `created`, sign-in enabled, a `member` role that reads and edits its own row, and sign-up open with `name`.
+  Add columns with `ALTER TABLE`. A table named `users` of yours, or a table that takes sign-ins already, leaves it
+  unmade. The console's Access tab says which table sqzdb made and what sign-up allows as the server runs.
+
+### Changed
+- **The public address is derived for an app address on every interface too**: `--app 0.0.0.0:8088` gives
+  `http://localhost:8088` when nothing is set, as a named address gives itself, so provider sign-in and MCP work on
+  this machine with no setting. The Settings form shows the derived value as the field's placeholder, with every
+  other default, so an empty field never means unknown.
+- **Google and GitHub are sections of their own** under Settings, each with its switch, its id and secret, and the
+  redirect URI to register spelled out.
+- **Delete file in the Functions tab deletes at once**: the remaining files are deployed, instead of the removal
+  waiting for the next Deploy.
+- **The Access tab says what the built-in sign-in page is for**: the sign-in of an app served behind sqzdb, and a way
+  to try sign-in by hand for any other.
+
+### Fixed
+- **`/oauth/…` and `/.well-known/…` were unguarded with MCP off.** 0.15.0 left those paths, and `/mcp`, out of
+  middleware whether or not `app.mcp` was on, so with it off a request there went on to your app with no middleware
+  run, no route of yours answering, and nothing held back while the deployed functions didn't load. The exemption
+  now covers exactly the paths the API answers for agents, `/mcp`, `/oauth/…` and `/.well-known/oauth-…` with
+  `app.mcp` on; everything else is guarded like the rest of the site.
+
 ## 0.15.0 — 2026-10-20
 
 ### Added

@@ -24,6 +24,8 @@ export const guard = middleware({ match: ['/dashboard/*'], run({ user }, req) {
 } })
 export const adminOnly = middleware({ match: '/admin/*', run({ roles }) { if (!roles.includes('admin')) return new Response('Forbidden', { status: 403 }) } })
 export const passing = middleware({ match: '/timed/*', run() {} })
+// the paths agents use with app.mcp on are the app's own with it off: middleware guards them like any other
+export const agentish = middleware({ match: '/.well-known/*', run() { return new Response('mine', { status: 418 }) } })
 // as the README's guard checks it: by req.path, which is the path the patterns matched (decoded)
 export const staff = middleware({ match: ['/staff/*', '/team/*'], run({ roles }, req) {
   if (req.path.startsWith('/staff') && !roles.includes('admin')) return new Response('Forbidden', { status: 403 })
@@ -266,6 +268,10 @@ try {
   const raw = (path) => new Promise((ok, no) => http.get({ host: '127.0.0.1', port, path, headers: { cookie: cookies() } }, (x) => { x.resume(); ok(x.statusCode); }).on('error', no));
   for (const p of ['/public/../admin/x', '/admin%2fx', '/x/%2e%2e/admin', '/x/./admin/../admin/y']) assert.equal(await raw(p), 400, p);
   assert.ok(!seen.some((p) => p.toLowerCase().includes('adm')), 'none reached the app');
+  // with app.mcp off, /oauth/… and /.well-known/… are the app's: a route of the app's answers, a middleware guards
+  r = await get('/oauth/done'); assert.deepEqual([r.status, await r.json()], [200, 'done'], 'a route at /oauth/… runs with app.mcp off');
+  r = await get('/.well-known/anything'); assert.deepEqual([r.status, await r.text()], [418, 'mine'], 'a middleware at /.well-known/… runs with app.mcp off');
+  assert.ok(!seen.some((p) => p.startsWith('/.well-known') || p.startsWith('/oauth')), 'neither reached the app');
   // a guard that checks req.path itself (as the README's does) holds too: req.path is the path the patterns matched
   seen.length = 0;
   for (const p of ['/staff/x', '/st%61ff/x', '//staff//x', '/_next/data/b1d/staff/x.json', '/st%61ff/x?q=1']) { r = await get(p); assert.equal(r.status, 403, p); }

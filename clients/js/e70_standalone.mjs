@@ -13,7 +13,9 @@ const [port, uiPort] = [await freePort(), await freePort()];
 const base = `http://127.0.0.1:${port}`, ui = `http://127.0.0.1:${uiPort}`, token = crypto.randomBytes(18).toString('base64url');
 const pr = (label, v = 'ok') => console.log(label.padEnd(64), typeof v === 'string' ? v : JSON.stringify(v));
 
-fs.writeFileSync(`${dir}.toml`, `[app]\npublicUrl = "${base}"\n\n[app.signUp]\nusers = []\n\n[app.mcp]\nusers = "users"\nsql = false\n`);
+// (no app.signUp: the users table sqzdb makes is open to sign-up by default)
+fs.writeFileSync(`${dir}.toml`, `[app]\npublicUrl = "${base}"\n\n[app.mcp]\nusers = "users"\nsql = false\n`);
+fs.chmodSync(`${dir}.toml`, 0o600);   // the console saves settings only to a file that is its owner's alone
 const start = (extra = []) => {
   const p = spawn(BIN, ['serve', dir, '--app', `127.0.0.1:${port}`, '--ui', `127.0.0.1:${uiPort}`, '--token', token, '--config', `${dir}.toml`, ...extra], { stdio: ['ignore', 'pipe', 'inherit'] });
   return new Promise((r) => { let out = ''; p.stdout.on('data', (d) => { out += d; if (out.includes('app API:')) r(p); }); });
@@ -27,22 +29,28 @@ const con = async (path, body) => {
 const json = (path, body, headers = {}) => fetch(base + path, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
 
 try {
-  // the schema, from the console's SQL editor
-  for (const sql of ["CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member')", 'CREATE ROLE member', 'ALTER TABLE users ENABLE AUTH (ROLE FROM role)',
-    'CREATE TABLE jobs (id SERIAL PRIMARY KEY, owner INT NOT NULL, title TEXT NOT NULL, done BOOL NOT NULL DEFAULT false)']) {
+  // the users table sqzdb made at start (the app API on, nothing to sign in to): id, email, name, role, created;
+  // sign-in enabled with the role from `role`, the member role, members on their own row, sign-up open with name
+  let r = await con('/api/acl'); const made = r.auth.find((t) => t.table === 'users');
+  assert.deepEqual([made.login, made.role, made.signUp, made.made, r.roles.includes('member')], ['email', { column: 'role' }, ['name'], true, true], JSON.stringify(made));
+  assert.ok(r.policies.some((p) => p.name === 'own_account' && p.table === 'users' && p.using === 'id = SESSION.id'), JSON.stringify(r.policies));
+  r = await con('/api/sql', { sql: 'SELECT id, email, name, role, created FROM users' }); assert.ok(!r.error, r.error);
+  // the rest of the schema, from the console's SQL editor
+  for (const sql of ['CREATE TABLE jobs (id SERIAL PRIMARY KEY, owner UUID NOT NULL, title TEXT NOT NULL, done BOOL NOT NULL DEFAULT false)']) {
     const r = await con('/api/sql', { sql }); assert.ok(!r.error, `${sql}: ${r.error}`);
   }
   // the app's rules, from the Functions tab
   const v1 = "import { fn } from 'sqzdb/functions'\n\nexport const add_job = fn({ description: 'Park a job', roles: ['member'], args: { title: 'text' },\n  run: ({ admin, user }, { title }) => admin.get('INSERT INTO jobs (owner, title) VALUES (?, ?) RETURNING id, title', [user!.id, title]) })\n\nexport const open_jobs = fn({ description: 'My open jobs', roles: ['member'], readOnly: true,\n  run: ({ admin, user }) => admin.all('SELECT id, title FROM jobs WHERE owner = ? AND NOT done ORDER BY id', [user!.id]) })\n";
-  let r = await con('/api/functions', { files: { 'jobs.ts': v1 } });
+  r = await con('/api/functions', { files: { 'jobs.ts': v1 } });
   assert.equal(r.status, 200); assert.deepEqual(r.functions.sort(), ['add_job', 'open_jobs']); assert.equal(r.changed, true);
   r = await con('/api/functions');
   assert.deepEqual(r.files, { 'jobs.ts': v1 }, 'the file as written, TypeScript and all'); assert.equal(r.folder, null); assert.equal(r.mcp.url, `${base}/mcp`);
   assert.deepEqual(r.exports.map((e) => [e.name, e.kind, e.roles]), [['add_job', 'function', ['member']], ['open_jobs', 'function', ['member']]]);
-  pr('schema from the console SQL, functions from its Functions tab');
+  pr('the users table made at start; schema from the console SQL, functions from its Functions tab');
 
   // a user, and an agent of theirs over MCP (the OAuth flow agents use)
-  await json('/api/auth/users/sign-up', { fields: { email: 'ann@x.test' }, password: 'the password 1' });
+  const signed = await (await json('/api/auth/users/sign-up', { fields: { email: 'ann@x.test', name: 'Ann' }, password: 'the password 1' })).json(); const ann = signed.user.id;
+  assert.match(String(ann), /^[0-9a-f-]{36}$/, `a UUID id from the made table: ${ann}`);
   const redirect = 'http://localhost:7777/callback';
   const client = await (await json('/oauth/register', { client_name: 'E70 agent', redirect_uris: [redirect] })).json();
   const verifier = crypto.randomBytes(32).toString('base64url'); const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
@@ -83,9 +91,9 @@ try {
   assert.equal(await hears(2, 1500), null); assert.deepEqual(await tools(), ['add_job', 'finish_job', 'open_jobs']);
   // try it from the console: as the app (no user: this rule needs one), and as a member
   r = await con('/api/functions/call', { name: 'open_jobs', args: {} }); assert.equal(r.status, 400, 'as the app, user is null');
-  r = await con('/api/functions/call', { name: 'add_job', args: { title: 'from the console' }, as: { roles: ['member'], attrs: { id: 1 } } }); assert.equal(r.status, 200); assert.equal(r.result.title, 'from the console');
+  r = await con('/api/functions/call', { name: 'add_job', args: { title: 'from the console' }, as: { roles: ['member'], attrs: { id: ann } } }); assert.equal(r.status, 200); assert.equal(r.result.title, 'from the console');
   assert.deepEqual((await call('open_jobs')).structuredContent.result.map((j) => j.title), ['from the console'], "the agent's user sees it");
-  r = await con('/api/functions/call', { name: 'add_job', args: { title: 1 }, as: { roles: ['member'], attrs: { id: 1 } } }); assert.equal(r.code, 'ARGUMENTS');
+  r = await con('/api/functions/call', { name: 'add_job', args: { title: 1 }, as: { roles: ['member'], attrs: { id: ann } } }); assert.equal(r.code, 'ARGUMENTS');
   pr('called from the console, as the app and as a member');
   reader.cancel();
 
@@ -100,14 +108,14 @@ try {
   assert.deepEqual([r.status, r.handlers, r.body, r.headers], [200, ['hello (route)'], '{"hi":"Ann"}', [['content-type', 'application/json']]], 'a value as JSON');
   r = await tried({ method: 'GET', path: '/jobs/1' });
   assert.equal(r.status, 401); assert.equal(r.error.code, 'AUTH'); assert.match(r.error.error, /job is for signed-in users: sign in first/); assert.match(r.body, /"code":"AUTH"/);
-  const made = await con('/api/sql', { sql: "INSERT INTO jobs (owner, title) VALUES (1, 'tried')" });
-  r = await tried({ method: 'GET', path: `/jobs/${made.lastInsertId}`, as: { roles: ['member'], attrs: { id: 1 } } });
+  const job = await con('/api/sql', { sql: `INSERT INTO jobs (owner, title) VALUES ('${ann}', 'tried')` });
+  r = await tried({ method: 'GET', path: `/jobs/${job.lastInsertId}`, as: { roles: ['member'], attrs: { id: ann } } });
   assert.equal(r.status, 200); assert.equal(JSON.parse(r.body).title, 'tried');
-  r = await tried({ method: 'GET', path: '/jobs/999999', as: { roles: ['member'], attrs: { id: 1 } } });
+  r = await tried({ method: 'GET', path: '/jobs/999999', as: { roles: ['member'], attrs: { id: ann } } });
   assert.deepEqual([r.status, r.body, r.headers], [404, 'no such job', [['content-type', 'text/plain; charset=utf-8']]], 'text gets its type');
   r = await tried({ method: 'GET', path: '/admin/x' });
   assert.deepEqual([r.status, r.handlers, r.body], [401, ['guard (middleware)'], 'who?'], 'middleware answered');
-  r = await tried({ method: 'GET', path: '/admin/x', headers: { Accept: 'text/html' }, as: { roles: ['member'], attrs: { id: 1 } } });
+  r = await tried({ method: 'GET', path: '/admin/x', headers: { Accept: 'text/html' }, as: { roles: ['member'], attrs: { id: ann } } });
   assert.equal(r.status, null, 'no route: on to the app'); assert.deepEqual([r.handlers, r.headers], [['guard (middleware)'], [['accept', 'text/html'], ['x-seen', 'guard']]], 'with the headers the middleware left');
   // middleware stands in front of the API's own endpoints too, the agent sign-in paths apart
   r = await tried({ method: 'POST', path: '/api/fn/open_jobs', headers: { 'x-block': '1' } }); assert.deepEqual([r.status, r.handlers], [429, ['apiGuard (middleware)']]);
@@ -120,6 +128,30 @@ try {
   r = await tried({ method: 'GET', path: '/a/../b' }); assert.equal(r.status, 400); assert.equal(r.code, 'ARGUMENTS');
   r = await tried({ method: 'BREW', path: '/hello' }); assert.equal(r.status, 400);
   pr('a request tried from the console; middleware in front of the API too');
+
+  // settings apply in place: password sign-in off, then back on; what takes a restart is named, and only that
+  r = await con('/api/settings', { set: { 'auth.password': false } }); assert.deepEqual([r.status, r.saved, r.pending], [200, true, []], JSON.stringify(r));
+  h = await fetch(`${base}/api/auth/users/methods`); assert.equal((await h.json()).password, false, 'reported at once, no restart');
+  h = await json('/api/auth/users/sign-in', { login: 'ann@x.test', password: 'the password 1' }); assert.equal(h.status, 403, 'the password endpoints answer DENIED');
+  assert.ok(!(await (await fetch(`${base}/_sqz/sign-in`)).text()).includes('name="login"'), 'the sign-in page shows no form');
+  r = await con('/api/settings', { set: { 'auth.password': null, 'functions.instances': 1 } }); assert.deepEqual([r.saved, r.pending], [true, ['functions.instances']], 'what takes a restart is named');
+  h = await fetch(`${base}/api/auth/users/methods`); assert.equal((await h.json()).password, true, 'back on at once');
+  r = await con('/api/settings'); assert.deepEqual(r.pending, ['functions.instances'], 'and still pending as the file stands');
+  r = await con('/api/settings', { set: { 'functions.instances': null } }); assert.deepEqual(r.pending, []);
+  // an edit to the file by hand applies too (within two seconds)
+  const toml = fs.readFileSync(`${dir}.toml`, 'utf8');   // (the console's saves may have left an [auth] table; a second one would be an error)
+  fs.writeFileSync(`${dir}.toml`, toml.includes('[auth]') ? toml.replace('[auth]', '[auth]\npassword = false') : toml + '\n[auth]\npassword = false\n');
+  for (let i = 0; i < 30 && (await (await fetch(`${base}/api/auth/users/methods`)).json()).password; i++) await new Promise((ok) => setTimeout(ok, 200));
+  assert.equal((await (await fetch(`${base}/api/auth/users/methods`)).json()).password, false, 'the file edited by hand applied');
+  r = await con('/api/settings', { set: { 'auth.password': null } }); assert.equal((await (await fetch(`${base}/api/auth/users/methods`)).json()).password, true);
+  // a function deployed switched off: the console's Try panel alone reaches it
+  const cur = (await con('/api/functions')).files;
+  r = await con('/api/functions', { files: { ...cur, 'draft.ts': "import { fn } from 'sqzdb/functions'\nexport const draft = fn({ enabled: false, roles: ['member'], run: () => 'soon' })\n" } }); assert.equal(r.status, 200, r.error);
+  r = await con('/api/functions'); assert.equal(r.exports.find((e) => e.name === 'draft').enabled, false, 'listed, as off');
+  h = await json('/api/fn/draft', {}, { authorization: `Bearer ${signed.token}` }); assert.equal(h.status, 404, 'off for the app'); assert.match((await h.json()).error, /enabled: false/);
+  assert.ok(!(await tools()).includes('draft'), 'and not a tool for agents');
+  r = await con('/api/functions/call', { name: 'draft', args: {}, as: { roles: ['member'], attrs: { id: ann } } }); assert.deepEqual([r.status, r.result], [200, 'soon'], 'the Try panel runs it');
+  pr('settings applied in place, by the console and by hand; a function deployed switched off');
 
   // a server whose functions come from a folder: the console shows them, and refuses to deploy over them
   server.kill(); await new Promise((ok) => server.once('exit', ok));

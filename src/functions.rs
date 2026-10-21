@@ -93,7 +93,7 @@ const HELPERS: &str = r#"(print, host) => {
   const dec = (s) => { try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch { return s; } };
   return {
     kind: (v) => v !== null && typeof v === 'object' && typeof v[MARK] === 'string' ? v[MARK] : null,
-    meta: (v) => toJson({ kind: v[MARK], description: v.description, args: v.args, argOrder: v.args !== null && typeof v.args === 'object' ? Object.keys(v.args) : [], roles: v.roles, readOnly: v.readOnly, match: v.match, order: v.order, path: v.path, method: v.method, mcp: v.mcp }),
+    meta: (v) => toJson({ kind: v[MARK], description: v.description, args: v.args, argOrder: v.args !== null && typeof v.args === 'object' ? Object.keys(v.args) : [], roles: v.roles, readOnly: v.readOnly, match: v.match, order: v.order, path: v.path, method: v.method, mcp: v.mcp, enabled: v.enabled }),
     // a request for middleware or a route: `text` and `bytes` its body (null for middleware, which gets the headers)
     request: (d, text, bytes) => {
       const headers = new Headers(d.headers); const cookies = {}, query = {};
@@ -133,7 +133,9 @@ impl ArgType {
 /// `get`: a function with `method: 'GET'`, which answers `GET /api/fn/<name>?arg=value` too (read-only; the arguments
 /// come as text and are read as `args` says). `mcp`: agents get it as a tool (the default; `mcp: false` keeps it off
 /// their list).
-#[derive(Clone, Debug)] pub struct Def { pub name: String, pub file: String, pub description: Option<String>, pub args: Vec<Arg>, pub roles: Option<Vec<String>>, pub read_only: bool, pub kind: Kind, pub get: bool, pub mcp: bool }
+#[derive(Clone, Debug)] pub struct Def { pub name: String, pub file: String, pub description: Option<String>, pub args: Vec<Arg>, pub roles: Option<Vec<String>>, pub read_only: bool, pub kind: Kind, pub get: bool, pub mcp: bool,
+    /// `enabled: false`: deployed but reachable from the console's Try panel only, not from the app, agents or the socket
+    pub enabled: bool }
 /// What an export is: a function clients call by name (`fn`), middleware that runs before requests to the paths it
 /// matches go on (in `order`, then by file and name), or a route that answers requests itself (`route`).
 #[derive(Clone, Debug, PartialEq)] pub enum Kind { Function, Middleware { matches: Vec<Pattern>, order: i64 }, Route { methods: Vec<String>, pattern: Pattern } }
@@ -648,6 +650,7 @@ fn def_of(file: &str, name: &str, m: &J) -> Result<Def, String> {
     if RESERVED.contains(&name) { return Err(format!("{at}: describe, query and execute are the names of MCP's SQL tools")); }
     let description = match m.get("description") { None | Some(J::Null) => None, Some(J::String(s)) if s.len() <= 4000 => Some(s.clone()), _ => return Err(format!("{at}: description is text (at most 4000 characters)")) };
     let read_only = match m.get("readOnly") { None | Some(J::Null) => false, Some(J::Bool(b)) => *b, _ => return Err(format!("{at}: readOnly is true or false")) };
+    let enabled = match m.get("enabled") { None | Some(J::Null) => true, Some(J::Bool(b)) => *b, _ => return Err(format!("{at}: enabled is true or false (false: deployed, but reachable from the console's Try panel only)")) };
     let roles = match m.get("roles") {
         None | Some(J::Null) => None,
         Some(J::Array(a)) if !a.is_empty() => Some(a.iter().map(|r| r.as_str().filter(|s| !s.is_empty()).map(String::from).ok_or_else(|| format!("{at}: roles is a list of role names"))).collect::<Result<Vec<_>, _>>()?),
@@ -709,7 +712,7 @@ fn def_of(file: &str, name: &str, m: &J) -> Result<Def, String> {
     }
     // in the order the source lists them
     if let Some(order) = m.get("argOrder").and_then(|o| o.as_array()) { args.sort_by_key(|a| order.iter().position(|o| o.as_str() == Some(a.name.as_str())).unwrap_or(usize::MAX)); }
-    Ok(Def { name: name.into(), file: file.into(), description, args, roles, read_only, kind, get, mcp })
+    Ok(Def { name: name.into(), file: file.into(), description, args, roles, read_only, kind, get, mcp, enabled })
 }
 fn is_uuid(s: &str) -> bool { s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() }) }
 /// The arguments of a call, checked against the function's `args`.
@@ -756,7 +759,7 @@ fn bundle_text(files: &[(String, String)]) -> Result<String, String> {
 fn hash_of(text: &str) -> String { use sha2::Digest; sha2::Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect() }
 
 impl Sql {
-    fn limits(&self) -> Limits { Limits { timeout: self.cfg.functions.timeout, memory: self.cfg.functions.memory } }
+    fn limits(&self) -> Limits { Limits { timeout: self.cfg().functions.timeout, memory: self.cfg().functions.memory } }
     /// Compile files into a deploy, with its first instance. `strict` (a deploy, not the catalog replayed): say which
     /// roles don't exist yet. (Not an error: an app opens its database, deploying its functions, before it makes its
     /// roles; a function for a role nobody has is one nobody can call.)
@@ -835,8 +838,8 @@ impl Sql {
     /// An instance for a call: an idle one, a new one while fewer than `functions.instances` exist, or the next one
     /// freed, waiting at most a few calls' time limits.
     fn take_instance(&self, b: &Arc<Bundle>) -> Result<Instance, FnError> {
-        let st = &self.functions; let max = self.cfg.functions.instances;
-        let until = Instant::now() + (self.cfg.functions.timeout * 4).max(Duration::from_secs(5));
+        let st = &self.functions; let max = self.cfg().functions.instances;
+        let until = Instant::now() + (self.cfg().functions.timeout * 4).max(Duration::from_secs(5));
         let mut pool = st.pool.lock().unwrap();
         loop {
             if let Some(i) = pool.idle.iter().position(|i| i.version == b.version) { return Ok(pool.idle.swap_remove(i)); }
@@ -859,12 +862,16 @@ impl Sql {
     /// Call a function as `sess`, with `args` (a JSON object). Its own transaction, or the one `sess` has open (whose
     /// owner commits, and retries on CONFLICT; a failure dooms it). `anonymous`: the session acts as
     /// `app.anonymousRole`, not as someone who signed in.
-    pub fn call_function(&self, sess: &mut Session, name: &str, args: &J, anonymous: bool) -> Result<J, FnError> {
+    pub fn call_function(&self, sess: &mut Session, name: &str, args: &J, anonymous: bool) -> Result<J, FnError> { self.call_function_as(sess, name, args, anonymous, false) }
+    /// `call_function`, and with `all` a function that is `enabled: false` too (the console's Try panel; everything
+    /// else gets NOT_FOUND for one).
+    pub fn call_function_as(&self, sess: &mut Session, name: &str, args: &J, anonymous: bool, all: bool) -> Result<J, FnError> {
         // who is calling, as of now: a session held across calls (a socket, a binding's handle) may have been signed
         // out or changed since it last ran anything
         self.check_identity(sess).map_err(|e| FnError::new(error_code(&e), e))?;
         let b = self.bundle_for(name)?;
         let Some(def) = b.defs.iter().find(|d| d.name == name && d.kind == Kind::Function) else { return Err(FnError::new("NOT_FOUND", format!("no function {name}"))) };
+        if !def.enabled && !all { return Err(FnError::new("NOT_FOUND", format!("{name} is off (enabled: false in its definition): the console's Try panel alone can call it"))); }
         if !may_call(def, sess, anonymous) { return Err(FnError::new("DENIED", format!("permission denied: {name} is for {}", def.roles.as_ref().map(|r| format!("the roles {}", r.join(", "))).unwrap_or_else(|| "signed-in users".into())))); }
         let args = check_args(def, args)?;
         let user = sess.user.is_some().then(|| sess.attrs.clone()); let roles = sess.roles.clone();
@@ -876,6 +883,7 @@ impl Sql {
     pub fn call_function_get(&self, sess: &mut Session, name: &str, query: &HashMap<String, String>, anonymous: bool) -> Result<J, FnError> {
         let b = self.bundle_for(name)?;
         let Some(def) = b.defs.iter().find(|d| d.name == name && d.kind == Kind::Function) else { return Err(FnError::new("NOT_FOUND", format!("no function {name}"))) };
+        if !def.enabled { return Err(FnError::new("NOT_FOUND", format!("{name} is off (enabled: false in its definition): the console's Try panel alone can call it"))); }
         if !def.get { return Err(FnError::new("METHOD", format!("{name} is called with POST and a JSON body (method: 'GET' in its definition would let it answer GET too)"))); }
         let text = |v: &str| if v.is_empty() { J::Null } else { json!(v) };   // an empty value is left out (or, for text, is the empty text)
         let args: serde_json::Map<String, J> = query.iter().map(|(k, v)| (k.clone(), match def.args.iter().find(|a| &a.name == k).map(|a| &a.ty) {
@@ -906,7 +914,7 @@ impl Sql {
     pub fn exports_json(&self) -> J {
         J::Array(self.deployed().iter().map(|d| {
             let (kind, paths, methods) = match &d.kind { Kind::Function => ("function", vec![], vec![]), Kind::Middleware { matches, .. } => ("middleware", matches.iter().map(|p| p.text.clone()).collect(), vec![]), Kind::Route { methods, pattern } => ("route", vec![pattern.text.clone()], methods.clone()) };
-            json!({"name": d.name, "file": d.file, "kind": kind, "description": d.description, "readOnly": d.read_only, "roles": d.roles, "paths": paths, "methods": methods,
+            json!({"name": d.name, "file": d.file, "kind": kind, "description": d.description, "readOnly": d.read_only, "roles": d.roles, "paths": paths, "methods": methods, "enabled": d.enabled,
                    "method": if d.kind == Kind::Function { json!(if d.get { "GET" } else { "POST" }) } else { J::Null }, "mcp": if d.kind == Kind::Function { json!(d.mcp) } else { J::Null },
                    "order": match &d.kind { Kind::Middleware { order, .. } => json!(order), _ => J::Null },
                    "args": d.args.iter().map(|a| json!({"name": a.name, "type": a.ty.describe(), "optional": a.optional, "description": a.description})).collect::<Vec<_>>(),
@@ -919,15 +927,16 @@ impl Sql {
     /// Whether middleware or routes are deployed: requests for anything but the API's own paths go through them.
     pub fn has_http(&self) -> bool { self.settle_functions(); self.functions.bundle.read().unwrap().as_ref().is_some_and(|b| !b.middleware.is_empty() || !b.routes.is_empty()) }
     /// The middleware for a request to `path` (from `match_path`), in the order they run, with each one's parameters.
-    pub fn middleware_for(&self, path: &str) -> Vec<(Def, Vec<(String, String)>)> {
+    /// `all`: the disabled ones too (the console trying a request); the app server runs the enabled ones only.
+    pub fn middleware_for(&self, path: &str, all: bool) -> Vec<(Def, Vec<(String, String)>)> {
         let Some(b) = self.functions.bundle.read().unwrap().clone() else { return vec![] };
-        b.middleware.iter().filter_map(|&i| { let d = &b.defs[i]; let Kind::Middleware { matches, .. } = &d.kind else { return None }; matches.iter().find_map(|p| p.matches(path)).map(|ps| (d.clone(), ps)) }).collect()
+        b.middleware.iter().filter_map(|&i| { let d = &b.defs[i]; if !(all || d.enabled) { return None; } let Kind::Middleware { matches, .. } = &d.kind else { return None }; matches.iter().find_map(|p| p.matches(path)).map(|ps| (d.clone(), ps)) }).collect()
     }
-    /// The route that answers `method` `path`: of those that match, the most literal (`Pattern::rank`).
-    pub fn route_for(&self, method: &str, path: &str) -> Option<(Def, Vec<(String, String)>)> {
+    /// The route that answers `method` `path`: of those that match, the most literal (`Pattern::rank`). `all`: as above.
+    pub fn route_for(&self, method: &str, path: &str, all: bool) -> Option<(Def, Vec<(String, String)>)> {
         let b = self.functions.bundle.read().unwrap().clone()?;
         let method = if method == "HEAD" { "GET" } else { method };
-        b.routes.iter().filter_map(|&i| { let d = &b.defs[i]; let Kind::Route { methods, pattern } = &d.kind else { return None }; if !methods.iter().any(|m| m == method || (m == "HEAD" && method == "GET")) { return None; } pattern.matches(path).map(|ps| (pattern.rank(), d.clone(), ps)) })
+        b.routes.iter().filter_map(|&i| { let d = &b.defs[i]; if !(all || d.enabled) { return None; } let Kind::Route { methods, pattern } = &d.kind else { return None }; if !methods.iter().any(|m| m == method || (m == "HEAD" && method == "GET")) { return None; } pattern.matches(path).map(|ps| (pattern.rank(), d.clone(), ps)) })
             .max_by_key(|(r, _, _)| *r).map(|(_, d, ps)| (d, ps))
     }
     /// Run middleware or a route for one request, as `sess`; `user`: the signed-in user's row (None: no one signed in).
@@ -951,7 +960,7 @@ impl Sql {
             Tried { handlers, status: Some(status), headers, body, error: None }
         };
         let failed = |handlers: Vec<String>, e: FnError| Tried { handlers, status: Some(http_status(&e)), headers: vec![("content-type".into(), "application/json".into())], body: serde_json::to_vec(&json!({"error": e.message, "code": e.code})).unwrap_or_default(), error: Some(e) };
-        for (def, params) in self.middleware_for(&req.path) {
+        for (def, params) in self.middleware_for(&req.path, true) {
             req.params = params; handlers.push(format!("{} (middleware)", def.name));
             match self.run_http(sess, &def, req, user.clone(), roles.clone()) {
                 Ok(HttpOut::Next(h)) => req.headers = h,
@@ -959,7 +968,7 @@ impl Sql {
                 Err(e) => return failed(handlers, e),
             }
         }
-        let Some((def, params)) = self.route_for(&req.method, &req.path) else { return Tried { handlers, status: None, headers: req.headers.clone(), body: vec![], error: None } };
+        let Some((def, params)) = self.route_for(&req.method, &req.path, true) else { return Tried { handlers, status: None, headers: req.headers.clone(), body: vec![], error: None } };
         req.params = params; req.body = Some(body); handlers.push(format!("{} (route)", def.name));
         match self.run_http(sess, &def, req, user, roles) {
             Ok(HttpOut::Respond { status, headers, body }) => answered(handlers, status, headers, body),
@@ -1123,6 +1132,20 @@ export const counts = fn({
         }
         let schema = input_schema(&s.function_defs()[0]);
         assert_eq!(schema["required"], json!(["n", "t", "k"])); assert_eq!(schema["properties"]["k"], json!({"type": "string", "enum": ["a", "b"]})); assert_eq!(schema["properties"]["t"]["description"], json!("a name"));
+    }
+    /// `enabled: false`: deployed and listed, but the app, agents and the socket get NOT_FOUND, middleware and routes
+    /// are skipped by the app server, and only the console's Try panel (the `all` lookups) reaches them.
+    #[test] fn a_disabled_export_is_reachable_from_the_console_alone() {
+        let d = tmp("disabled"); let s = open(&d, "{}"); let app = &mut Session::default();
+        deploy(&s, &[("a.ts", "import { fn, route, middleware } from 'sqzdb/functions'\nexport const draft = fn({ enabled: false, run: () => 'soon' })\nexport const live = fn({ run: () => 'now' })\nexport const page = route({ path: '/draft', enabled: false, run: () => 'page' })\nexport const guard = middleware({ match: '/x/*', enabled: false, run() { return new Response('no', { status: 403 }) } })\n")]).unwrap();
+        let e = s.call_function(app, "draft", &json!({}), false).unwrap_err(); assert_eq!(e.code, "NOT_FOUND"); assert!(e.message.contains("enabled: false"), "{}", e.message);
+        assert_eq!(s.call_function_as(app, "draft", &json!({}), false, true).unwrap(), json!("soon"), "the console's Try panel runs it");
+        assert_eq!(s.call_function(app, "live", &json!({}), false).unwrap(), json!("now"));
+        assert!(s.route_for("GET", "/draft", false).is_none() && s.route_for("GET", "/draft", true).is_some());
+        assert!(s.middleware_for("/x/y", false).is_empty() && s.middleware_for("/x/y", true).len() == 1);
+        let ex = s.exports_json(); let on = |n: &str| ex.as_array().unwrap().iter().find(|e| e["name"] == n).unwrap()["enabled"].clone();
+        assert_eq!((on("draft"), on("live"), on("page"), on("guard")), (json!(false), json!(true), json!(false), json!(false)));
+        assert!(deploy(&s, &[("a.ts", "import { fn } from 'sqzdb/functions'\nexport const f = fn({ enabled: 'yes', run: () => 1 })\n")]).unwrap_err().contains("enabled is true or false"));
     }
     #[test] fn a_get_function_reads_its_arguments_from_the_query_and_only_reads() {
         let d = tmp("get"); let s = open(&d, "{}"); let app = &mut Session::default();
@@ -1329,10 +1352,10 @@ export const bad = middleware({ match: '/oops', run: () => 'not a response' })
         deploy(&s, &[("h.ts", src)]).unwrap();
         assert!(s.has_http()); assert!(s.function_defs().is_empty(), "middleware and routes are no MCP tools");
         let names = |v: Vec<(Def, Vec<(String, String)>)>| v.into_iter().map(|(d, _)| d.name).collect::<Vec<_>>();
-        assert_eq!(names(s.middleware_for("/dashboard/x")), vec!["first", "guard"], "order 0 before order 1");
+        assert_eq!(names(s.middleware_for("/dashboard/x", false)), vec!["first", "guard"], "order 0 before order 1");
         let req = |m: &str, path: &str, q: &str, h: &[(&str, &str)], body: Option<&str>| HttpReq { method: m.into(), path: path.into(), raw_path: path.into(), query: q.into(), headers: h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ip: "203.0.113.1".into(), params: vec![], body: body.map(|b| b.as_bytes().to_vec()) };
         let run = |sess: &mut Session, def: &Def, r: &HttpReq, user: Option<HashMap<String, Value>>, roles: Vec<String>| s.run_http(sess, def, r, user, roles);
-        let guard = s.middleware_for("/dashboard").into_iter().find(|(d, _)| d.name == "guard").unwrap().0;
+        let guard = s.middleware_for("/dashboard", false).into_iter().find(|(d, _)| d.name == "guard").unwrap().0;
         // no one signed in: to the sign-in page, and back here after
         match run(&mut Session::default(), &guard, &req("GET", "/dashboard", "tab=2", &[], None), None, vec![]).unwrap() {
             HttpOut::Respond { status, headers, .. } => { assert_eq!(status, 302); assert_eq!(headers, vec![("location".to_string(), "/_sqz/sign-in?return=%2Fdashboard%3Ftab%3D2".to_string())]); }
@@ -1345,18 +1368,18 @@ export const bad = middleware({ match: '/oops', run: () => 'not a response' })
             o => panic!("{o:?}"),
         }
         // routes: the most literal match, params, query, cookies, a JSON body, a value as JSON
-        let (job, params) = s.route_for("POST", "/jobs/7").unwrap(); assert_eq!(job.name, "job");
+        let (job, params) = s.route_for("POST", "/jobs/7", false).unwrap(); assert_eq!(job.name, "job");
         let mut r = req("POST", "/jobs/7", "", &[], Some(r#"{"x":1}"#)); r.params = params;
         match run(&mut a, &job, &r, Some(HashMap::from([("uid".to_string(), Value::Int(1))])), vec!["agent".into()]).unwrap() {
             HttpOut::Respond { status, body, .. } => { assert_eq!(status, 201); assert_eq!(String::from_utf8(body).unwrap(), r#"{"id":"7","got":{"x":1},"by":1}"#); }
             o => panic!("{o:?}"),
         }
-        let (job, params) = s.route_for("GET", "/jobs/7").unwrap(); let mut r = req("GET", "/jobs/7", "q=a%20b", &[("cookie", "k=v; z=1")], Some("")); r.params = params;
+        let (job, params) = s.route_for("GET", "/jobs/7", false).unwrap(); let mut r = req("GET", "/jobs/7", "q=a%20b", &[("cookie", "k=v; z=1")], Some("")); r.params = params;
         match run(&mut Session::default(), &job, &r, None, vec![]).unwrap() { HttpOut::Respond { body, .. } => assert_eq!(String::from_utf8(body).unwrap(), r#"{"id":7,"q":"a b","cookie":"v"}"#), o => panic!("{o:?}") }
-        assert_eq!(s.route_for("GET", "/jobs/7/runs").unwrap().0.name, "anyJob");
-        assert!(s.route_for("DELETE", "/jobs/7").is_none());
+        assert_eq!(s.route_for("GET", "/jobs/7/runs", false).unwrap().0.name, "anyJob");
+        assert!(s.route_for("DELETE", "/jobs/7", false).is_none());
         // a route's roles: who isn't signed in, who lacks them
-        let (admin, _) = s.route_for("GET", "/admin").unwrap();
+        let (admin, _) = s.route_for("GET", "/admin", false).unwrap();
         assert_eq!(run(&mut Session::default(), &admin, &req("GET", "/admin", "", &[], Some("")), None, vec![]).unwrap_err().code, "AUTH");
         assert_eq!(run(&mut Session::default(), &admin, &req("GET", "/admin", "", &[], Some("")), Some(HashMap::new()), vec!["guest".into()]).unwrap_err().code, "DENIED");
         // a request tried as the console does: through the middleware, to the route, the body to the route only
@@ -1377,7 +1400,7 @@ export const bad = middleware({ match: '/oops', run: () => 'not a response' })
         let t = s.try_request(&mut Session::default(), &mut r, vec![], None, vec![]);
         assert_eq!((t.status, t.headers), (Some(200), vec![("content-type".to_string(), "text/plain; charset=utf-8".to_string())]), "text gets the type the app server gives it");
         // middleware that returns something else is a bug, said as one
-        let bad = s.middleware_for("/oops").into_iter().find(|(d, _)| d.name == "bad").unwrap().0;
+        let bad = s.middleware_for("/oops", false).into_iter().find(|(d, _)| d.name == "bad").unwrap().0;
         assert!(run(&mut Session::default(), &bad, &req("GET", "/oops", "", &[], None), None, vec![]).unwrap_err().message.contains("returns a Response"));
         // deploys that can't work
         for (src, says) in [("import { route } from 'sqzdb/functions'\nexport const r = route({ path: '/api/sql', run: () => 1 })\n", "the API's own path"),

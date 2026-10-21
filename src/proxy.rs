@@ -19,8 +19,14 @@ const HOP: [&str; 10] = ["connection", "keep-alive", "proxy-connection", "proxy-
 
 /// Whether a request is the app API's own: its endpoints, matched exactly, so an app's own `/api/…` routes still reach
 /// the app. With `app.proxy` unset, everything is the API's (unknown paths get its 404).
+/// Whether `path` is one agents' clients drive by their protocols and the API answers itself: `/mcp`, `/oauth/…` and
+/// `/.well-known/oauth-…`, with `app.mcp` on. With it off they are the app's like any other path.
+pub(crate) fn agent_path(sql: &crate::sql::Sql, path: &str) -> bool {
+    sql.cfg().app.mcp.is_some() && (path == "/mcp" || path.starts_with("/oauth/") || path.starts_with("/.well-known/oauth-"))
+}
+
 pub(crate) fn ours(sql: &crate::sql::Sql, path: &str) -> bool {
-    if sql.cfg.app.mcp.is_some() && (path == "/mcp" || path.starts_with("/oauth/") || path.starts_with("/.well-known/oauth-")) { return true; }
+    if agent_path(sql, path) { return true; }
     if path.starts_with("/_sqz/") { return true; }
     let p: Vec<&str> = path.trim_matches('/').split('/').collect();
     matches!(p.as_slice(),

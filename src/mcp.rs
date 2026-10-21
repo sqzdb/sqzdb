@@ -34,7 +34,7 @@ struct Code { client: String, redirect: String, challenge: String, user: String,
 pub(crate) fn random_hex(n: usize) -> String { let mut b = vec![0u8; n]; getrandom::fill(&mut b).expect("random"); b.iter().map(|x| format!("{x:02x}")).collect() }
 pub(crate) fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;") }
 pub(crate) fn host_of(url: &str) -> String { url.split_once("://").map(|(_, r)| r.split(['/', '?', '#']).next().unwrap_or("").to_string()).unwrap_or_else(|| url.split(':').next().unwrap_or("").to_string()) }
-fn base(sql: &Sql) -> String { sql.cfg.app.public_url.clone().unwrap_or_default() }
+fn base(sql: &Sql) -> String { sql.cfg().app.public_url.clone().unwrap_or_default() }
 /// The cookie that binds a sign-in in progress to its browser (one per request, so two tabs don't collide). Lax, so it
 /// comes back from a provider's sign-in.
 fn binding_cookie(sql: &Sql, id: &str, value: &str, max_age: u64) -> String { format!("sqz_mcp_{id}={value}; Path=/oauth/authorize; HttpOnly; SameSite=Lax; Max-Age={max_age}{}", if base(sql).starts_with("https://") { "; Secure" } else { "" }) }
@@ -56,7 +56,7 @@ fn form(req: &Req) -> HashMap<String, String> {
 /// The table people sign in to on the API's own pages (an agent's sign-in, `/_sqz/sign-in`): `app.mcp.users`, or the
 /// only table with ENABLE AUTH.
 pub(crate) fn users_table(sql: &Sql) -> Result<String, String> {
-    if let Some(t) = sql.cfg.app.mcp.as_ref().and_then(|m| m.users.clone()) { return Ok(t); }
+    if let Some(t) = sql.cfg().app.mcp.as_ref().and_then(|m| m.users.clone()) { return Ok(t); }
     let acl = sql.acl.read().unwrap(); let mut t: Vec<&String> = acl.auth.keys().collect(); t.sort();
     match t.as_slice() { [one] => Ok((*one).clone()), [] => Err("no table takes sign-ins yet (ALTER TABLE … ENABLE AUTH)".into()), _ => Err("several tables take sign-ins: set app.mcp.users to the one agents' users sign in to".into()) }
 }
@@ -105,7 +105,7 @@ fn clean_name(n: &str) -> String {
 /// Answer a request for the MCP endpoint, the OAuth server or their discovery documents; None for any other path,
 /// or when `app.mcp` is off.
 pub(crate) fn handle(sql: &Sql, st: &McpState, links: &Links, ip: IpAddr, allow: &dyn Fn() -> bool, req: &Req) -> Option<Vec<u8>> {
-    let mcp = sql.cfg.app.mcp.as_ref()?;
+    let cfg = sql.cfg(); let mcp = cfg.app.mcp.as_ref()?;
     let path = req.path.as_str();
     if !(path == "/mcp" || path.starts_with("/oauth/") || path.starts_with("/.well-known/oauth-")) { return None; }
     if req.method == "OPTIONS" {
@@ -208,6 +208,7 @@ fn decide(sql: &Sql, st: &McpState, allow: &dyn Fn() -> bool, req: &Req) -> Vec<
             // checked without the lock (a password takes a while)
             let who: Result<(String, String), String> = (|| {
                 if action == "sign-in" && !allow() { return Err("Too many sign-ins from here; wait a little and try again.".into()); }
+                if action == "sign-in" && !sql.cfg().auth.password { return Err("Password sign-in is off here: continue with a provider.".into()); }
                 let table = users_table(sql)?;
                 // a session made only to know who signed in: gone once read
                 let token = if action == "sign-in" { sql.sign_in(&table, f.get("login").map(String::as_str).unwrap_or(""), f.get("password").map(String::as_str).unwrap_or(""))?.token } else { f.get("token").cloned().unwrap_or_default() };
@@ -296,14 +297,17 @@ fn sign_in_page(sql: &Sql, id: &str, p: &Pending, err: Option<&str>) -> Vec<u8> 
     let table = match users_table(sql) { Ok(t) => t, Err(e) => return error_page(&e) };
     let login = sql.auth_table_of(&table).ok().map(|(t, a)| t.schema.columns[a.login].name.clone()).unwrap_or_else(|| "login".into());
     let host = host_of(&base(sql));
-    let providers: Vec<&String> = sql.cfg.auth.oauth.keys().collect();
+    let cfg = sql.cfg(); let providers: Vec<&String> = cfg.auth.oauth.keys().collect();
     let buttons: String = providers.iter().map(|n| format!(r#"<button class="alt" type="button" data-provider="{p}">Continue with {name}</button>"#, p = esc(n), name = esc(&title_case(n)))).collect();
-    let body = format!(r#"<h1>Sign in to {host}</h1><p><b>{name}</b> wants to connect, as you.</p>{err}
-<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="{id}"><input type="hidden" name="action" value="sign-in">
+    // auth.password off: the providers are the only way in, so no form
+    let form = if sql.cfg().auth.password { format!(r#"<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="{id}"><input type="hidden" name="action" value="sign-in">
 <label>{login_label}<input name="login" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form>
-{or}{buttons}<form id="cont" method="post" action="/oauth/authorize" hidden><input type="hidden" name="request" value="{id}"><input type="hidden" name="action" value="continue"><input type="hidden" name="token"></form>
+{or}"#, id = esc(id), login_label = esc(&title_case(&login)), or = if providers.is_empty() { "" } else { r#"<div class="or">or</div>"# }) }
+        else if providers.is_empty() { r#"<p class="err">No way to sign in is set up: password sign-in is off (auth.password) and no provider is configured.</p>"#.to_string() } else { String::new() };
+    let body = format!(r#"<h1>Sign in to {host}</h1><p><b>{name}</b> wants to connect, as you.</p>{err}
+{form}{buttons}<form id="cont" method="post" action="/oauth/authorize" hidden><input type="hidden" name="request" value="{id}"><input type="hidden" name="action" value="continue"><input type="hidden" name="token"></form>
 <p class="small">Next you choose whether to let it. It would act as you here: what you can see and change, nothing more.</p>"#,
-        host = esc(&host), name = esc(&p.name), err = err.map(|e| format!(r#"<p class="err">{}</p>"#, esc(e))).unwrap_or_default(), id = esc(id), login_label = esc(&title_case(&login)), or = if providers.is_empty() { "" } else { r#"<div class="or">or</div>"# });
+        host = esc(&host), name = esc(&p.name), err = err.map(|e| format!(r#"<p class="err">{}</p>"#, esc(e))).unwrap_or_default(), id = esc(id));
     let js = format!(r#"
 const id = {id}, table = {table};
 const b64 = (a) => btoa(String.fromCharCode(...new Uint8Array(a))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -340,7 +344,7 @@ fn agent(sql: &Sql, req: &Req) -> Result<(Session, String), Vec<u8>> {
     let b = base(sql);
     let unauthorized = |e: Option<&str>| { let mut h = open(); h.push(("WWW-Authenticate".into(), format!("Bearer resource_metadata=\"{b}/.well-known/oauth-protected-resource/mcp\", scope=\"sql\"{}", e.map(|e| format!(", error=\"invalid_token\", error_description=\"{}\"", e.replace('"', "'"))).unwrap_or_default()))); respond(401, "application/json", br#"{"error":"sign in through this server's OAuth"}"#, &h) };
     // a page in a browser may call only from the API's own origin or app.origins (DNS rebinding: the transport spec)
-    if let Some(o) = req.headers.get("origin") { let o = o.trim_end_matches('/'); if o != b && !sql.cfg.app.origins.iter().any(|x| x == "*" || x.eq_ignore_ascii_case(o)) { return Err(json_out(403, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "this origin may not call /mcp (app.origins)"}}))); } }
+    if let Some(o) = req.headers.get("origin") { let o = o.trim_end_matches('/'); if o != b && !sql.cfg().app.origins.iter().any(|x| x == "*" || x.eq_ignore_ascii_case(o)) { return Err(json_out(403, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "this origin may not call /mcp (app.origins)"}}))); } }
     let token = req.headers.get("authorization").and_then(|h| h.get(..7).filter(|p| p.eq_ignore_ascii_case("bearer ")).map(|_| h[7..].trim().to_string()));
     let Some(token) = token else { return Err(unauthorized(None)) };
     let mut sess = Session::default();
@@ -360,7 +364,7 @@ pub(crate) fn events(sql: &Sql, req: &Req) -> Result<(Session, String, Vec<(Stri
 /// event stream tells the agent to list them again.
 pub(crate) fn tools_digest(sql: &Sql, sess: &Session) -> u64 {
     use std::hash::{Hash, Hasher};
-    let Some(mcp) = sql.cfg.app.mcp.as_ref() else { return 0 };
+    let cfg = sql.cfg(); let Some(mcp) = cfg.app.mcp.as_ref() else { return 0 };
     let mut h = std::collections::hash_map::DefaultHasher::new(); tools(sql, sess, mcp).to_string().hash(&mut h); h.finish()
 }
 
@@ -376,7 +380,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
     let result: Result<J, (i64, String)> = match method {
         "initialize" => {
             let asked = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
-            let has_fns = sql.function_defs().iter().any(|d| d.mcp && crate::functions::may_call(d, &sess, false));
+            let has_fns = sql.function_defs().iter().any(|d| d.mcp && d.enabled && crate::functions::may_call(d, &sess, false));
             let instructions = match (has_fns, mcp.sql) {
                 (true, true) => "A database you act on as the user who connected you. Its own tools carry out its operations with their rules: use them for what they cover. For anything else, describe lists the tables you may use, their columns and who you are (SESSION values that row policies compare with); then query (SELECT) and execute (INSERT, UPDATE, DELETE), with ? placeholders and values in params.",
                 (true, false) => "A database you act on as the user who connected you, through its own tools: each carries out one operation, with its rules.",
@@ -390,7 +394,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let out = if sql.function_defs().iter().any(|d| d.name == name && d.mcp) {
+            let out = if sql.function_defs().iter().any(|d| d.name == name && d.mcp && d.enabled) {
                 // a function's result is any JSON; structured content is an object
                 sql.call_function(&mut sess, name, &args, false).map(|v| if v.is_object() { v } else { json!({"result": v}) }).map_err(|e| e.message)
             } else if mcp.sql && matches!(name, "describe" | "query" | "execute") { call(sql, links, mcp, &mut sess, name, &args) }
@@ -406,7 +410,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
 }
 /// The app's functions `sess` may call, those not marked `mcp: false`, then (with `app.mcp.sql`) the SQL tools.
 fn tools(sql: &Sql, sess: &Session, mcp: &crate::config::McpPolicy) -> J {
-    let mut out: Vec<J> = sql.function_defs().iter().filter(|d| d.mcp && crate::functions::may_call(d, sess, false)).map(|d| json!({
+    let mut out: Vec<J> = sql.function_defs().iter().filter(|d| d.mcp && d.enabled && crate::functions::may_call(d, sess, false)).map(|d| json!({
         "name": d.name, "title": title_case(&d.name), "description": d.description.clone().unwrap_or_else(|| format!("{} (from {})", d.name, d.file)),
         "inputSchema": crate::functions::input_schema(d), "annotations": {"readOnlyHint": d.read_only} })).collect();
     if mcp.sql { if let J::Array(t) = sql_tools() { out.extend(t); } }

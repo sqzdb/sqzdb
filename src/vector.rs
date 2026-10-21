@@ -51,7 +51,7 @@ pub(crate) fn embed_on_update(schema: &Schema, old: &[u8], new: &mut Vec<u8>) ->
 impl Sql {
     /// The embeddings of `texts` from the `[embed]` endpoint, in order.
     pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        let p = self.cfg.embed.clone().ok_or("embed: set [embed] in the configuration (an OpenAI-compatible endpoint and a model)")?;
+        let p = self.cfg().embed.clone().ok_or("embed: set [embed] in the configuration (an OpenAI-compatible endpoint and a model)")?;
         let mut body = json!({"model": p.model, "input": texts}); if let Some(d) = p.dimensions { body["dimensions"] = json!(d); }
         let v = crate::oauth::http_with(Duration::from_secs(60), move |c| async move {
             let mut r = c.post(format!("{}/embeddings", p.url)).header("content-type", "application/json").body(body.to_string());
@@ -84,7 +84,7 @@ impl Sql {
 
     /// Start the embedder (once per database, when `[embed]` is set): it wakes on writes and fills generated vectors.
     pub fn vectors_start(self: &Arc<Self>) {
-        if self.cfg.embed.is_none() || self.vectors.started.swap(true, Ordering::AcqRel) { return; }
+        if self.cfg().embed.is_none() || self.vectors.started.swap(true, Ordering::AcqRel) { return; }
         let weak = Arc::downgrade(self);
         std::thread::Builder::new().name("sqzdb-embed".into()).spawn(move || {
             let mut wait = Duration::from_secs(5);
@@ -102,7 +102,7 @@ impl Sql {
     /// One round of the embedder: up to a batch of rows whose generated vector is NULL and whose text isn't, embedded
     /// in one request and written back. Returns how many rows it looked at (0: nothing to do).
     pub fn embed_round(&self) -> Result<usize, String> {
-        let batch = self.cfg.embed.as_ref().map(|p| p.batch).unwrap_or(64);
+        let batch = self.cfg().embed.as_ref().map(|p| p.batch).unwrap_or(64);
         let mut refused = self.vectors.refused.lock().unwrap(); refused.retain(|_, at| at.elapsed() < SKIP_FOR);
         let mut todo = vec![];   // (table, column, its source planned, key, text)
         'tables: for name in self.db.table_names() {

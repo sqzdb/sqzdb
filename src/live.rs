@@ -100,7 +100,7 @@ fn key_of(row: &[Value], key_col: &Option<(usize, ColType)>) -> Option<crate::ta
 impl Reactor {
     pub fn start(sql: Arc<Sql>) -> Arc<Reactor> {
         sql.db.log.feeds.fetch_add(1, Ordering::Relaxed);  // keep the memory ring alive
-        let r = Arc::new(Reactor { sql: Arc::downgrade(&sql), log: sql.db.log.clone(), thread: Mutex::new(None), state: Arc::new(Mutex::new(State::default())), debounce: sql.cfg.live.debounce, reruns: AtomicU64::new(0), rerun_us: AtomicU64::new(0), events: AtomicU64::new(0), last_seq: AtomicU64::new(0), stop: Arc::new(AtomicBool::new(false)) });
+        let r = Arc::new(Reactor { sql: Arc::downgrade(&sql), log: sql.db.log.clone(), thread: Mutex::new(None), state: Arc::new(Mutex::new(State::default())), debounce: sql.cfg().live.debounce, reruns: AtomicU64::new(0), rerun_us: AtomicU64::new(0), events: AtomicU64::new(0), last_seq: AtomicU64::new(0), stop: Arc::new(AtomicBool::new(false)) });
         // the feed starts where the log is now, decided here rather than on the new thread: a change committed right
         // after the first subscribe() returns must not slip in before the reactor begins reading
         let start = sql.current_seq();
@@ -221,7 +221,7 @@ impl Reactor {
         // an equality on an INT column with a constant makes the subscription indexable
         let key = { let mut all: Vec<Pred> = sp.preds.clone(); match &sp.access { Access::Pk(e) => all.push(Pred { col: sp.table.schema.pk, cmp: Cmp::Eq, rhs: e.clone() }), Access::Index(ix, e) => all.push(Pred { col: ix.col, cmp: Cmp::Eq, rhs: e.clone() }), _ => {} }
             all.iter().find_map(|p| if p.cmp == Cmp::Eq && sp.table.schema.columns[p.col].ty == crate::table::ColType::Int { match &p.rhs { Expr::Lit(Value::Int(v)) => Some((p.col, *v)), Expr::Param(i) => match params.get(*i) { Some(Value::Int(v)) => Some((p.col, *v)), _ => None }, _ => None } } else { None }) };
-        let q = Arc::new(Queue::new(sql.cfg.live.queue));
+        let q = Arc::new(Queue::new(sql.cfg().live.queue));
         let mut st = self.state.lock().unwrap();
         if sess.user.is_some() && sql.acl_epoch() != epoch { continue; }
         st.subs.push(Sub { table: sp.table.id, preds, policies, q: q.clone(), key, since: sql.current_seq(), ident: sess.token.as_ref().map(|_| session_like(sess)), bound: sess.user.is_some(), acl: epoch }); st.reindex();

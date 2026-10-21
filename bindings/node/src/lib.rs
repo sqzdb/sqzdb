@@ -92,7 +92,7 @@ enum Payload { Change(Arc<sql::Change>), Live { rows: Vec<Vec<Value>>, added: Ve
 pub fn open(path: String, options: Option<String>) -> Result<Db> {
     let p = std::path::absolute(&path).map_err(|e| err_code("ERROR", &e.to_string()))?;
     let mut g = OPEN.lock().unwrap(); let reg = g.get_or_insert_with(HashMap::new);
-    if let Some(sql) = reg.get(&p).and_then(|w| w.upgrade()) { let d = sql.cfg.durable != sqzdb::config::Durability::Visible; return Ok(Db { sql: Mutex::new(Some(sql)), durable: d }); }
+    if let Some(sql) = reg.get(&p).and_then(|w| w.upgrade()) { let d = sql.cfg().durable != sqzdb::config::Durability::Visible; return Ok(Db { sql: Mutex::new(Some(sql)), durable: d }); }
     let cfg = sqzdb::config::Config::load(&p, options.as_deref()).map_err(err)?;
     let d = cfg.durable != sqzdb::config::Durability::Visible;
     let sql = Sql::open_with(&p, cfg).map_err(err)?; reg.insert(p, Arc::downgrade(&sql));

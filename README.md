@@ -44,7 +44,7 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 | **Strict types** | `INT`, `DOUBLE`, `BOOL`, `TEXT` and `BYTES` of any length (up to 16 MB) or `TEXT(n)`, `TIMESTAMP`, `UUID`, `FILE`, `VECTOR(n)`. A value of the wrong type is rejected, never stored. |
 | **Keys and ids** | Automatic integer ids that are never reused, UUID primary keys (time-ordered v7 or random v4), text primary keys, `DEFAULT now()`, and `INSERT … RETURNING`. |
 | **Row-level security** | Roles, grants and row policies enforced on every query, write and subscription. Your app passes who is asking on each request. |
-| **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table you define, with sessions; CLIs and servers sign in with a code their user approves in a browser (device login). A signed-in user's row becomes the identity the row policies read. |
+| **Sign-in** | Email and password, Google, GitHub or any OpenID Connect provider, for a users table sqzdb makes (or one you define), with sessions; CLIs and servers sign in with a code their user approves in a browser (device login). A signed-in user's row becomes the identity the row policies read. |
 | **SQL from the browser** | Browsers and mobile apps sign in and send SQL straight to the database, with no server code of their own: each statement runs as the signed-in user under the row policies, and any query can be live over one WebSocket. HTTPS is built in, with certificates from Let's Encrypt renewed automatically. A connected user costs the server about 20 KB. |
 | **Agents over MCP** | Claude, ChatGPT, Claude Code and other MCP clients connect to `/mcp`, sign their user in on the database's own OAuth page, and query and change data as that user, under the same grants and row policies. Tools added by a deploy reach connected agents at once. |
 | **Functions** | Your app's rules as TypeScript or JavaScript that runs inside the database, one transaction per call, as the caller. Each is an API endpoint and an MCP tool. Deploy a folder (on a server, a change to it deploys itself), or write them in the web console. |
@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.15.0` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.16.0` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -148,7 +148,8 @@ The Node package is on npm, with prebuilt engines for Linux (x64 and arm64, glib
 macOS (x64 and arm64):
 
 ```sh
-npm install sqzdb
+npm install sqzdb            # Node: the engine, embedded
+npm install @sqzdb/client    # browsers, React Native: the client of a sqzdb app API, no engine
 ```
 
 The other bindings are not published to PyPI or crates.io yet. Build them from source, as described in
@@ -157,6 +158,7 @@ The other bindings are not published to PyPI or crates.io yet. Build them from s
 | Language | Binding | Location |
 |---|---|---|
 | Node.js 20+ | Native addon (N-API), synchronous calls with promises where work waits | `npm install sqzdb` (`bindings/node`) |
+| Browsers, React Native, Node 22+ | The client of a sqzdb app API: sign-in, SQL as the user, live queries, functions | `npm install @sqzdb/client` (`clients/js`), or `<api>/api/client.js` from the server |
 | Python 3.11+ | Extension module (PyO3), releases the GIL while the engine works | `bindings/python` |
 | Go 1.24+ | cgo package over the C ABI | `bindings/go/sqzdb` |
 | C | Shared library `libsqzdb.so` | `src/capi.rs` |
@@ -493,14 +495,21 @@ in with a password, use the next section instead.
 
 ### Sign-in
 
-Mark a table you define as the one users sign in to. Its `UNIQUE` text column is the login, and each
-user's role comes from a column or is fixed. A signed-in user acts with their row's columns as
-`SESSION` attributes, so policies such as `USING (owner = SESSION.id)` apply per user.
+**The users table comes made.** The standalone server (`sqzdb serve` with `--app`) makes it the first time it
+runs with nothing to sign in to: `users (id UUID, email UNIQUE, name, role DEFAULT 'member', created)`, sign-in
+enabled with each user's role from `role`, a `member` role that reads and edits its own row, and sign-up open
+with `name` as the column a new account may fill in. Add what your app needs with `ALTER TABLE users ADD
+COLUMN`; `role` is the application's alone to set. It is never made over a table named `users` you have, or
+beside a table that takes sign-ins already, and the server says when it made one.
 
-In the console, **Access → Set up sign-in** does all of the below in one go: it creates the table (or takes
-one of yours), the `member` and `admin` roles, a grant and policy for a member's own row, and the sign-up
-setting, showing the SQL first; then it shows the sign-in page's address, the client snippet, and makes a
-test account. The rest of this section is what it generates.
+Or bring your own: mark a table you define as the one users sign in to. Its `UNIQUE` text column is the login,
+and each user's role comes from a column or is fixed. Either way, a signed-in user acts with their row's columns
+as `SESSION` attributes, so policies such as `USING (owner = SESSION.id)` apply per user.
+
+In the console, **Access → Set up sign-in** does all of the below in one go for a table of yours: it creates the
+table (or takes one you have), the `member` and `admin` roles, a grant and policy for a member's own row, and
+the sign-up setting, showing the SQL first; then it shows the sign-in page's address, the client snippet, and
+makes a test account. The rest of this section is what it generates.
 
 The table is yours: your columns, visible in the console, queried and joined like any other. Passwords and
 sessions are never in it. They live in sqzdb's own tables (`_auth_secrets`, `_auth_sessions`, and with
@@ -541,6 +550,9 @@ in, err := db.Auth("users").SignIn("ann@example.com", password)
 s := db.Session(); err = s.UseToken(in.Token)
 ```
 
+- **Password sign-in can be turned off** (`auth.password = false`, or Settings → Sign-in in the console): then Google,
+  GitHub or another provider is the only way in, the sign-in pages show no form, `/api/auth/<table>/sign-in` and
+  `sign-up` answer `DENIED`, and the client's `methods()` reports `password: false`.
 - **Logins** are compared trimmed and lowercased; `signUp` stores them that way. If you insert users
   yourself, store logins lowercased.
 - **Passwords** are hashed with Argon2id (19 MiB, 2 passes, OWASP's recommendation), about 9 ms each,
@@ -628,11 +640,11 @@ publicUrl = "https://api.example"     # where browsers reach it; needed for prov
 staticDir = "./dist"                  # optional: serve the app's files too
 
 [app.signUp]
-users = ["name"]                      # tables clients may make accounts in, and the columns they may set
+users = ["name"]                      # who may make accounts where (this is the default for the users table sqzdb made)
 ```
 
 ```js
-import { connect } from 'https://api.example/api/client.js'   // the server hands out its client: no build step
+import { connect } from '@sqzdb/client'   // npm install @sqzdb/client; or 'https://api.example/api/client.js', the server's own copy, with no build step
 const db = connect('https://api.example')
 
 await db.auth.signUp({ email, name }, password)               // or signIn(email, password), or signInWith('google')
@@ -640,7 +652,7 @@ await db.sql('INSERT INTO notes (owner, body) VALUES (?, ?)', [db.auth.user.id, 
 db.live('SELECT id, body FROM notes ORDER BY created DESC LIMIT 20', (rows) => render(rows))   // her notes, kept current
 ```
 
-The client (`clients/js`) runs in browsers, React Native and Node 22+. It keeps the session in
+The client (`@sqzdb/client` on npm, `clients/js` here) runs in browsers, React Native and Node 22+. It keeps the session in
 `localStorage`, carries SQL and every live query over one WebSocket, and reconnects. Its calls are
 `auth.signUp`, `signIn`, `signInWith`, `signOut`, `onChange` and `methods` (whether sign-up is open, and
 which providers are configured), then `sql(text, params)`, `batch([[text, params], …])` for one
@@ -654,8 +666,8 @@ keeps the session in an HttpOnly cookie instead, out of any script's reach (see
   `batch` of up to 100 statements, all or none. A result has at most `app.maxRows` rows.
 - **Who is asking:** a request acts as the user its session token belongs to. Without a token it acts as
   `app.anonymousRole`, or is refused with `AUTH`.
-- **Sign-up** works only in the tables `app.signUp` lists, and sets only the login column and the columns
-  listed there; the role column is never a client's to set. Other tables are sign-in only, by password or
+- **Sign-up** works only in the tables `app.signUp` lists (the users table sqzdb made is listed by default, with
+  `name`), and sets only the login column and the columns listed there; the role column is never a client's to set. Other tables are sign-in only, by password or
   by provider. Sign-up, sign-in and the code exchange are rate limited per client address: 10 at once,
   then one every 3 seconds.
 - **Providers:** `signInWith('google')` sends the browser to the API, which sends it to Google. Google
@@ -964,6 +976,9 @@ went through.
 - **`readOnly: true`** allows `SELECT` only.
 - **`method: 'GET'`** lets it answer GET as well as POST (above), and makes it read-only.
 - **`mcp: false`** keeps it off the agents' tool list. Agents get every other function their user may call.
+- **`enabled: false`** deploys it switched off: the app, agents and the socket get `NOT_FOUND`, and only the console's
+  Try panel runs it, so a function can be tried against real data before anything can reach it. A route or
+  middleware with it is skipped by the app server the same way, and the console lists each with "off".
 
 **Arguments** are checked before the function runs:
 
@@ -1035,8 +1050,8 @@ anyone asks.
 - **sqzdb's own paths** are answered by sqzdb, after your middleware (below) has let the request through:
   - `/api/…`, matched endpoint by endpoint, so your app's own `/api` routes still reach it;
   - its sign-in pages under `/_sqz/`;
-  - `/mcp`, `/oauth/…` and `/.well-known/oauth-…`, the paths agents' clients drive by their protocols:
-    these alone run no middleware.
+  - `/mcp`, `/oauth/…` and `/.well-known/oauth-…` while `app.mcp` is on, the paths agents' clients drive by
+    their protocols: these alone run no middleware. With `app.mcp` off they are your app's, like any other.
 - **Everything else goes to the app**, after middleware and routes (below):
   - bodies stream both ways, and a page that renders in pieces arrives in pieces;
   - WebSocket upgrades are passed through, and no other kind: a client can't turn a connection into a
@@ -1100,7 +1115,7 @@ export const hooks = route({
 - **Middleware:**
   - it runs for the paths it `match`es, in `order` and then by file and name, sqzdb's own endpoints
     included: a `match` of `/api/*` stands in front of every function call, SQL request, upload and
-    sign-up (not `/mcp`, `/oauth/…` or `/.well-known/…`). A route can't take sqzdb's own paths;
+    sign-up (not `/mcp`, `/oauth/…` or `/.well-known/oauth-…` while `app.mcp` is on). A route can't take sqzdb's own paths;
     middleware can guard them;
   - it returns a `Response` to answer, or nothing to let the request go on, with any headers it set or
     removed;
@@ -1206,8 +1221,12 @@ the server would start with it, then written with comments and the rest of the f
 reads the server's environment, so references are added or moved to another key in the file on the server, never
 from the console, and a secret that comes from one doesn't follow a new address from here either. Errors name the key and the line,
 never a value.
-Settings apply when the server restarts: **Restart now** does that in place (same process, same console token),
-and is refused while the file would keep the server from starting. Its **Backup** tab
+Settings apply in place when saved, and an edit to the file by hand applies within two seconds, with no restart: the
+public address, origins, the anonymous role, sign-up, providers, session length, MCP, the proxy target, static files
+and the function limits all change under the running server. The few that can't (the listeners, TLS, durability,
+backup, following, snapshots, the log, embeddings, the functions folder and instance count) are marked "at the next
+restart", and **Restart now** does that in place (same process, same console token), refused while the file would
+keep the server from starting. Its **Backup** tab
 shows whether uploads are healthy, how far the bucket is behind, the last error and a connection test;
 when backup is off, it writes the settings file and the restart command for your bucket. It is one HTML page compiled into the binary, with no build step. Bind it
 to loopback unless you intend otherwise: it acts as the application and sees everything.
@@ -1270,8 +1289,8 @@ Python takes the same keys as keyword arguments, `sqzdb.Database(path, backup={.
 | `listen.token` | none | The shared secret for TCP and the console; required when either is on. The `sqzdb` command generates one if you don't pass `--token`. |
 | `listen.app` | none | The app API for browsers and mobile apps (`--app`). Users sign in; no shared token. See [the app API](#the-app-api-sql-from-the-browser). |
 | `app.origins` | `[]` | Web origins whose pages may call the app API, besides its own. `"*"` allows any. |
-| `app.publicUrl` | none | The URL the app API is reached at. Needed for provider sign-in. |
-| `app.signUp.<table>` | none | A table clients may make accounts in, and the columns they may set besides the login. Tables not listed are sign-in only. |
+| `app.publicUrl` | derived | The URL the app API is reached at, which provider sign-in and MCP build their links with. Derived when unset: `https://` the first TLS domain, else `http://localhost:<port>` for an app address on every interface, else the address itself. Set it when the world reaches the server by a name. |
+| `app.signUp.<table>` | `users = ["name"]` for the users table sqzdb made, else none | A table clients may make accounts in, and the columns they may set besides the login. Tables not listed are sign-in only. |
 | `app.anonymousRole` | none | The role of a request without a session. Without it, such requests are refused. |
 | `app.maxRows` | `10000` | The most rows one result for a client may have. |
 | `app.staticDir` | none | Files to serve beside the API (the app itself), with `index.html` for paths without a file. |
@@ -1302,6 +1321,7 @@ Python takes the same keys as keyword arguments, `sqzdb.Database(path, backup={.
 | `log.threadsIdleAfter` | off | Let log threads exit when idle; for many idle databases in one process. |
 | `auth.sessionTtl` | `30d` | How long a session from sign-in lasts. At least `60s`. |
 | `auth.passwordMin` | `8` | The shortest password `signUp` and `setPassword` accept, in characters. |
+| `auth.password` | `true` | Whether people sign in and up with a password at all. `false`: the providers are the only way in; the sign-in pages show no form, and the password endpoints answer `DENIED`. |
 | `auth.oauth.<name>` | none | An OAuth provider: `clientId`, `clientSecret`; for providers other than `google` and `github`, `kind = "oidc"`, `authUrl`, `tokenUrl`, `jwksUrl` and `issuer`. Optional `scopes`. See [sign-in](#sign-in). |
 | `embed.url` / `model` | none | An OpenAI-compatible embeddings endpoint (https, or http on this machine) and its model, for generated `VECTOR` columns and `embed()`. |
 | `embed.apiKey` | none | Sent as `Authorization: Bearer`. |
@@ -1510,7 +1530,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.15.0`. The release workflow runs the
+Releases are tags that match the version in `Cargo.toml`, such as `v0.16.0`. The release workflow runs the
 unit tests, builds Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and if all of
 that passes publishes them with `SHA256SUMS` and `install.sh`, so a tag is pushed together with its commit.
 

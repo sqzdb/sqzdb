@@ -358,6 +358,8 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 .fn-group .t { flex:1; min-width:0; display:flex; flex-direction:column; gap:1px }
 .fn-group .n { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font:12.5px var(--mono); color:var(--text); overflow-wrap:anywhere }
 .fn-group .d { color:var(--text-3); font-size:11.5px; overflow-wrap:anywhere }
+.fn-group li.off .n, .fn-group li.off .f { color:var(--text-3) }
+.fn-group li.off .k { opacity:.5 }
 .fn-group .f { flex:none; margin-top:3px; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:11px var(--mono); color:var(--text-3) }
 .fn-group .none { margin:0; padding:2px 14px 6px; color:var(--text-3); font-size:12px }
 .fn-chip { display:inline-flex; align-items:center; height:16px; padding:0 5px; border-radius:4px; border:1px solid var(--line-2); font:10px var(--mono); color:var(--text-3) }
@@ -1075,7 +1077,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     if (auth.length && !si.open) { $('si').innerHTML = siStatusView(A); siWire(); return; }
     if (!si.open) {
       $('si').innerHTML = `<div class="ab-top"><h3>Sign-in</h3><span class="si-tag">not set up</span></div>
-        <p class="si-p">Nobody can sign in yet. Sign-in needs a table that holds the people (the users table), roles that say what they may do, and a choice of who may create an account. <b>Set up sign-in</b> makes those choices with you, shows the SQL and the setting it generates, and runs them.</p>
+        <p class="si-p">Nobody can sign in yet. With the app API on, sqzdb makes a <code>users</code> table itself when it starts (id, email, name, role, created; sign-up open)${tableNames().some((n) => n.toLowerCase() === 'users') ? ', but a table named users is here already, so it is left as yours' : ''}. Or choose here: the table that holds the people, roles that say what they may do, and who may create an account. <b>Set up sign-in</b> makes those choices with you, shows the SQL and the setting it generates, and runs them.</p>
         <div class="row"><button class="btn btn-primary btn-sm" id="siopen">Set up sign-in</button></div>`;
       $('siopen').onclick = () => { si.open = true; si.err = ''; renderSignin(); }; return;
     }
@@ -1118,17 +1120,18 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     const providers = Object.keys((s.auth && s.auth.oauth) || {});
     const cap = (x) => x[0].toUpperCase() + x.slice(1);
     const blocks = A.auth.map((t) => {
-      const su = s.app && s.app.signUp && s.app.signUp[t.table];
+      // the file's setting if there is one (it may await a restart), else what the server runs with (the default for the table it made)
+      const su = (s.app && s.app.signUp && s.app.signUp[t.table]) || t.signUp;
       const tb = tablesCache.find((x) => x.name === t.table), nameCol = tb && tb.columns.some((c) => c.name === 'name');
       const origin = base || 'https://your-app.example';
       const snippet = `import { connect } from '${origin}/api/client.js'\nconst db = connect('${origin}')\nawait db.auth.signUp({ ${t.login}${nameCol ? ', name' : ''} }, password)\n// or: signIn(${t.login}, password)${providers.length ? `, signInWith('${providers[0]}')` : ''}\nawait db.sql('SELECT …')   // as that user`;
-      return `<dl class="si-kv"><dt>table</dt><dd><code>${esc(t.table)}</code>${tb ? ` · ${fmtN(tb.rows)} account${tb.rows === 1 ? '' : 's'}` : ''}</dd>
+      return `<dl class="si-kv"><dt>table</dt><dd><code>${esc(t.table)}</code>${tb ? ` · ${fmtN(tb.rows)} account${tb.rows === 1 ? '' : 's'}` : ''}${t.made ? ' · made by sqzdb when the app API first ran; add columns under Tables' : ''}</dd>
         <dt>login</dt><dd><code>${esc(t.login || '')}</code> and a password${providers.length ? `, or ${providers.map(cap).join(' / ')}` : ''}</dd>
         <dt>role</dt><dd>${t.role.column ? `from the <code>${esc(t.role.column)}</code> column` : `everyone is <code>${esc(t.role.fixed || '')}</code>`}${A.roles.length ? ` · roles: ${A.roles.map((r) => `<code>${esc(r)}</code>`).join(', ')}` : ''}</dd>
-        <dt>sign-up</dt><dd>${su ? `open to anyone${su.length ? ` (a sign-up may fill in ${su.map((f) => `<code>${esc(f)}</code>`).join(', ')})` : ''}` : 'invite only: the app creates accounts'}${siSettings && siSettings.saved ? ' <em class="si-warn">(saved; applies at the next restart)</em> <button class="btn btn-ghost btn-sm" id="sirestart">Restart now</button>' : ''}</dd>
+        <dt>sign-up</dt><dd>${su ? `open to anyone${su.length ? ` (a sign-up may fill in ${su.map((f) => `<code>${esc(f)}</code>`).join(', ')})` : ''}` : 'invite only: the app creates accounts'}</dd>
         <dt>only the app sets</dt><dd>${(t.appOnly || []).map((c) => `<code>${esc(c)}</code>`).join(', ') || '—'}</dd></dl>
         <div class="si-next">
-          <div><h4>The sign-in page</h4><p>${base ? `<a href="${esc(base)}/_sqz/sign-in" target="_blank" rel="noopener">${esc(base)}/_sqz/sign-in</a>: sign in${su ? ', create an account' : ''}${providers.length ? ', or use a provider' : ''}; it sets the session and returns to your app. Your app can also do all of it itself, right.` : 'The app API isn’t listening: start with --app, or set it under Settings → App server. Then the page is at &lt;app address&gt;/_sqz/sign-in.'}</p></div>
+          <div><h4>The built-in sign-in page</h4><p>${base ? `<a href="${esc(base)}/_sqz/sign-in" target="_blank" rel="noopener">${esc(base)}/_sqz/sign-in</a>: sign in${su ? ', create an account' : ''}${providers.length ? ', or use a provider' : ''}. It is the sign-in for an app served behind sqzdb (a proxy or static files: the session is a cookie), and a way to try sign-in by hand for any other; a page of your own on another origin signs in with the client, right.` : 'The app API isn’t listening: start with --app, or set it under Settings → App server. Then the page is at &lt;app address&gt;/_sqz/sign-in.'}</p></div>
           <div><h4>From your app</h4><pre class="si-code">${esc(snippet)}</pre></div>
           <div><h4>Create a test account</h4><p>Made here as the application, whether sign-up is open or not.</p><form class="ab-fields" data-sitest="${esc(t.table)}"><label class="ab-f">${esc(t.login || 'login')}<input class="input" name="login" autocomplete="off" spellcheck="false" required></label>${nameCol ? '<label class="ab-f">name<input class="input" name="name" autocomplete="off"></label>' : ''}<label class="ab-f">password<input class="input" name="password" type="password" autocomplete="new-password" required></label><button class="btn btn-sm" type="submit">Create</button></form><div class="need hidden" data-sierr="${esc(t.table)}"></div></div>
         </div>`;
@@ -1483,7 +1486,8 @@ export const guard = middleware({
     const routes = ex.filter((d) => d.kind === 'route').sort(by((d) => d.paths[0], (d) => d.name));
     const fns = ex.filter((d) => d.kind === 'function').sort(by((d) => d.name));
     const orders = mws.some((d) => d.order);   // the order values are shown once any is set
-    const row = (d, main, detail, lead = '') => `<li><button data-file="${esc(d.file)}" data-name="${esc(d.name)}" title="Open ${esc(d.file)} at ${esc(d.name)}">${lead}<span class="t"><span class="n">${main}</span><span class="d">${detail}</span></span><span class="f">${esc(d.file)}</span></button></li>`;
+    // an export with enabled: false is deployed but off: the app server skips it, and only Try it below reaches it
+    const row = (d, main, detail, lead = '') => `<li${d.enabled === false ? ' class="off"' : ''}><button data-file="${esc(d.file)}" data-name="${esc(d.name)}" title="Open ${esc(d.file)} at ${esc(d.name)}">${lead}<span class="t"><span class="n">${main}${d.enabled === false ? '<span class="fn-chip" title="enabled: false in its definition: Try it runs it, nothing else does">off</span>' : ''}</span><span class="d">${detail}</span></span><span class="f">${esc(d.file)}</span></button></li>`;
     const group = (title, about, items, none) => `<section class="fn-group"><h4 title="${about}">${title}</h4>${items.length ? `<ul>${items.join('')}</ul>` : `<p class="none">${none}</p>`}</section>`;
     $('fnexports').innerHTML =
       group('Middleware', 'Runs in this order, before a request is answered', mws.map((d, i) => row(d, esc(d.name), `before ${esc(d.paths.join(', '))}${orders ? ` · order ${d.order ?? 0}` : ''}`, `<span class="k">${i + 1}</span>`)), 'None: requests go straight on')
@@ -1576,7 +1580,8 @@ export const guard = middleware({
     for (const file of e.target.files) { const f = file.name.replace(/[^\w.-]/g, '_'); fnEdits[f] = await file.text(); fnRemoved.delete(f); fnCur = f; }
     e.target.value = ''; renderFunctions();
   });
-  $('fndelete').onclick = () => { if (fnCur == null) return; if (fnCur in fnFiles) fnRemoved.add(fnCur); delete fnEdits[fnCur]; fnCur = fnNames()[0] ?? null; renderFunctions(); };
+  // Delete file: gone at once. A deployed file is removed by deploying the rest; one never deployed just drops its edits
+  $('fndelete').onclick = () => { if (fnCur == null) return; const deployed = fnCur in fnFiles; if (deployed) fnRemoved.add(fnCur); delete fnEdits[fnCur]; fnCur = fnNames()[0] ?? null; renderFunctions(); if (deployed) fnDeploy(); };
   $('fnrevert').onclick = () => { fnEdits = {}; fnRemoved = new Set(); if (!fnNames().includes(fnCur)) fnCur = fnNames()[0] ?? null; $('fnerr').classList.add('hidden'); renderFunctions(); };
   async function fnDeploy() {
     const files = Object.fromEntries(fnNames().map((f) => [f, fnText(f)]));
@@ -1606,7 +1611,7 @@ export const guard = middleware({
     const d = fnTried(); if (!d) return;
     if (d.kind !== 'function') return fnSend(d, who);
     $('fnmeta').textContent = 'calling…';
-    try { const r = await api('/api/functions/call', { method: 'POST', body: JSON.stringify({ name: d.name, args, as: who }) }); out.textContent = JSON.stringify(r.result, null, 2); $('fnmeta').textContent = `${r.ms.toFixed(2)} ms`; }
+    try { const r = await api('/api/functions/call', { method: 'POST', body: JSON.stringify({ name: d.name, args, as: who }) }); out.textContent = JSON.stringify(r.result, null, 2); $('fnmeta').textContent = `${r.ms.toFixed(2)} ms${d.enabled === false ? ' · off: runs from here only (enabled: false)' : ''}`; }
     catch (e) { if (e.auth) return; out.classList.add('bad'); out.textContent = `${e.code}: ${e.message}`; $('fnmeta').textContent = ''; }
   }
   const REASON = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 303: 'See Other', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 500: 'Internal Server Error', 503: 'Service Unavailable' };
@@ -1624,7 +1629,7 @@ export const guard = middleware({
     $('fnmeta').textContent = 'sending…';
     try {
       const r = await api('/api/functions/request', { method: 'POST', body: JSON.stringify({ method, path, headers, body, as: who }) });
-      $('fnmeta').textContent = `${r.ms.toFixed(2)} ms · ${!r.guarded ? 'middleware does not run for the agent sign-in paths (/mcp, /oauth/…, /.well-known/…)' : r.handlers.length ? r.handlers.join(' → ') : 'no middleware or route for it'}`;
+      $('fnmeta').textContent = `${r.ms.toFixed(2)} ms · ${!r.guarded ? 'middleware does not run for the agent sign-in paths (/mcp, /oauth/…, /.well-known/oauth-…) while MCP is on' : r.handlers.length ? r.handlers.join(' → ') : 'no middleware or route for it'}`;
       const lines = (h) => h.map(([k, v]) => `${k}: ${v}`).join('\n');
       if (r.status == null) { out.textContent = `No route answers ${method} ${path}: ${r.onTo === 'api' ? "sqzdb's own endpoint answers it" : 'the request would go on to your app'}${r.headers.length ? ', with these headers:\n' + lines(r.headers) : '.'}`; return; }
       if (r.status >= 400) out.classList.add('bad');
@@ -1637,14 +1642,14 @@ export const guard = middleware({
   for (const id of ['fnargs', 'fnattrs', 'fnrole', 'fnpath', 'fnbody', 'fnheaders']) $(id).addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); fnCall(); } });
   addEventListener('beforeunload', (e) => { if (fnDirty()) { e.preventDefault(); e.returnValue = ''; } });
 
-  // ---- settings: the server's settings file, as a form and as text; saved, then applied by a restart
+  // ---- settings: the server's settings file, as a form and as text; saved and applied in place (a few keys at the next start)
   const ST = [
     { id: 'app', title: 'App server', lead: 'The HTTP server for your application and its users (--app). It answers the API that your app, the browser client and mobile apps call (SQL, sign-in, files, your functions), serves the built-in sign-in pages and the MCP endpoint for agents, and can stand in front of your own app as a reverse proxy, so one address and one certificate serve both.', fields: [
       ['listen.app', 'Address', 'text', '0.0.0.0:443', 'where the app server listens (--app): 0.0.0.0:443 for everyone, with HTTPS below; 127.0.0.1:7780 for this machine only. Empty: no app server'],
       ['app.publicUrl', 'Public address', 'text', 'https://api.example.com', 'the URL the outside world reaches this server at (your domain, through any load balancer); sign-in with Google or GitHub and agents over MCP build their links with it. Derived from the first HTTPS domain, and on this machine (127.0.0.1 or localhost) from the address above'],
       ['app.proxy', 'Your app behind it', 'text', 'http://127.0.0.1:3000', 'a reverse proxy: every request that isn’t sqzdb’s own (the API, sign-in, MCP) is passed on to your app at this address, such as a Next.js server on this machine'],
       ['app.staticDir', 'Static files folder', 'text', './dist', 'a built site (HTML, JS, CSS) served beside the API as the app itself, instead of an app behind it (one or the other); a path without a file gets its index.html'],
-      ['app.signUp', 'Sign-up tables', 'tables', 'users', 'the sign-in tables people may create their own account in, from the sign-in page and the client; any other is invite-only'],
+      ['app.signUp', 'Sign-up tables', 'tables', 'users', 'the sign-in tables people may create their own account in, from the sign-in page and the client; any other is invite-only. Unset: open for the users table sqzdb made, with name'],
       ['app.origins', 'Other origins', 'list', 'https://app.example.com', 'other websites whose pages may call this API from the browser (CORS); the public address itself is always allowed, and "*" means any'],
       ['app.anonymousRole', 'Anonymous role', 'text', 'none: sign in first', 'what a request without a sign-in may do: a role you created, or nothing at all'],
       ['app.maxRows', 'Rows per result', 'int', '10000', 'the most rows one query returns to a client'],
@@ -1656,13 +1661,16 @@ export const guard = middleware({
       ['app.tls.redirect', 'Plain HTTP from', 'text', '0.0.0.0:80', 'also listen here, and send http:// visitors on to https://'],
       ['app.tls.cert', 'Own certificate', 'text', '/etc/ssl/fullchain.pem', 'instead of Let’s Encrypt: the path on the server of a PEM certificate chain'],
       ['app.tls.key', 'Its private key', 'text', '/etc/ssl/privkey.pem', 'the path of the matching PEM key'] ] },
-    { id: 'signin', title: 'Sign-in', lead: 'How people sign in to your app: with an email and password (the built-in sign-in page and the client), or with their Google or GitHub account. Providers call back to the public address, so set that first. Who signs in at all (the users table, roles, open or invite-only sign-up) is set up under Access → Set up sign-in.', fields: [
+    { id: 'signin', title: 'Sign-in', lead: 'How people sign in to your app: with an email and password (the built-in sign-in page and the client), or with their Google or GitHub account. Providers call back to the public address, so set that first. The users table is made for you when the app API first runs; roles, and who may create an account, are under Access.', fields: [
       ['auth.sessionTtl', 'A session lasts', 'text', '30d', 'how long a sign-in stays valid before the user must sign in again'],
       ['auth.passwordMin', 'Shortest password', 'int', '8', 'the fewest characters a password may have'],
-      ['auth.oauth.google.clientId', 'Google client id', 'text', '…apps.googleusercontent.com', 'from Google Cloud → APIs & Services → Credentials (an OAuth client for a web app); its redirect URI is <public address>/api/auth/<table>/oauth/google/callback'],
-      ['auth.oauth.google.clientSecret', 'Google client secret', 'secret', '', 'from the same page'],
-      ['auth.oauth.github.clientId', 'GitHub client id', 'text', '', 'from GitHub → Settings → Developer settings → OAuth Apps; its callback URL is <public address>/api/auth/<table>/oauth/github/callback'],
-      ['auth.oauth.github.clientSecret', 'GitHub client secret', 'secret', '', 'from the same page'] ] },
+      ['auth.password', 'Email and password', 'bool', '', 'whether people sign in, and create accounts, with a password at all; off, Google or GitHub below is the only way in, and the sign-in page shows no form'] ] },
+    { id: 'google', title: 'Sign in with Google', nav: 'Google', toggle: 'auth.oauth.google', lead: 'Let people sign in with their Google account. Make an OAuth client of type Web application in Google Cloud → APIs & Services → Credentials, with the authorized redirect URI <public address>/api/auth/<table>/oauth/google/callback (the public address is under App server), and put its id and secret here.', fields: [
+      ['auth.oauth.google.clientId', 'Client id', 'text', '…apps.googleusercontent.com', 'from the OAuth client’s page'],
+      ['auth.oauth.google.clientSecret', 'Client secret', 'secret', '', 'from the same page; kept on the server, never shown here again'] ] },
+    { id: 'github', title: 'Sign in with GitHub', nav: 'GitHub', toggle: 'auth.oauth.github', lead: 'Let people sign in with their GitHub account. Make an OAuth App in GitHub → Settings → Developer settings → OAuth Apps, with the callback URL <public address>/api/auth/<table>/oauth/github/callback, and put its id and secret here. A sign-in needs a verified primary email on GitHub.', fields: [
+      ['auth.oauth.github.clientId', 'Client id', 'text', 'Iv1.…', 'from the OAuth App’s page'],
+      ['auth.oauth.github.clientSecret', 'Client secret', 'secret', '', 'from the same page; kept on the server, never shown here again'] ] },
     { id: 'mcp', title: 'Agents over MCP', nav: 'Agents (MCP)', toggle: 'app.mcp', lead: 'Let AI agents (Claude, ChatGPT, Claude Code, Cursor and others) connect to this database as a tool server at <public address>/mcp. An agent signs in as one of your users through the standard OAuth flow, and gets the functions you deploy as its tools, under that user’s role and policies.', fields: [
       ['app.mcp.users', 'Sign-in table', 'text', 'the only one there is', 'with more than one sign-in table (ALTER TABLE … ENABLE AUTH), the one an agent’s user signs in against when connecting; with one, that one'],
       ['app.mcp.sql', 'SQL tools', 'bool', '', 'also give agents describe, query and execute tools for direct SQL (the user’s role and policies still apply)'],
@@ -1685,15 +1693,19 @@ export const guard = middleware({
   ];
   let stData = null, stText = '', stSec = store.get('sqzdb.stsec', 'app');
   const dig = (o, key) => key.split('.').reduce((v, k) => (v && typeof v === 'object' ? v[k] : undefined), o);
+  // the settings the server takes only at a start (the listeners, TLS, durability, backup, the functions folder); the rest apply when saved
+  const restartOnly = (key) => /^(listen\.|app\.tls\.|backup|durable|snapshot\.|log\.|embed|follow|functions\.(dir|watch|instances)$)/.test(key);
   const shown = (type, v) => v === undefined || v === null ? '' : type === 'list' ? (Array.isArray(v) ? v.join(', ') : String(v)) : type === 'tables' ? (v && typeof v === 'object' ? Object.keys(v).join(', ') : '') : type === 'text' && typeof v === 'object' ? String(v.to ?? '') : String(v);   // an app behind it may be a table: its address is .to
   const flagOf = (key) => dig(stData.flags, key);
   function stRender() {
     const d = stData;
     if (!d.editable) { $('stnav').classList.add('hidden'); $('stbar').classList.add('hidden'); $('sthead').innerHTML = '<div><h3>Settings</h3><p>This database runs inside its application, which configures it in its code (or the file it names). Change them there.</p></div>'; $('stgrid').innerHTML = ''; for (const id of ['stsave', 'streset', 'stfilesave']) $(id).disabled = true; $('sttext').value = ''; $('sttext').readOnly = true; stSync(); return; }
-    $('stbadge').classList.toggle('hidden', !d.saved);
-    $('sthead').className = 'card st-head' + (d.saved ? ' st-pending' : '');
+    // settings apply in place when saved; `pending` names the few that take effect only at the next start
+    const pending = d.pending || [];
+    $('stbadge').classList.toggle('hidden', !pending.length);
+    $('sthead').className = 'card st-head' + (pending.length ? ' st-pending' : '');
     $('sthead').innerHTML = `<div><h3>Settings</h3><p>Kept in <code>${esc(d.path)}</code>${d.exists ? '' : ' (written when you first save)'}, readable by its owner only. Options on the command line win over it, and show here as fixed.</p></div>`
-      + (d.saved ? `<div><h3>Saved: they apply when the server restarts</h3><p>A restart takes a moment: the database reopens from its snapshot, and this page reconnects by itself.</p></div><button class="btn btn-primary" id="strestart">Restart now</button>` : '');
+      + (pending.length ? `<div><h3>Saved; ${esc(pending.join(', '))} take${pending.length === 1 ? 's' : ''} effect at the next start</h3><p>Everything else applied at once. A restart takes a moment: the database reopens from its snapshot, and this page reconnects by itself.</p></div><button class="btn btn-primary" id="strestart">Restart now</button>` : '');
     if ($('strestart')) $('strestart').onclick = stRestart;
     $('stgrid').innerHTML = ST.map((sec, si) => {
       const on = !sec.toggle || dig(d.values, sec.toggle) !== undefined || flagOf(sec.toggle) !== undefined;
@@ -1708,7 +1720,7 @@ export const guard = middleware({
           else if (type === 'secret') input = `<input class="input" type="password" id="${id}" data-key="${esc(key)}" data-type="secret" autocomplete="new-password" placeholder="${sec2 === undefined ? 'not set' : sec2 ? esc(sec2) : 'set: type to change'}"${fixed !== undefined || !on ? ' disabled' : ''}>`;
           else input = `<input class="input" id="${id}" data-key="${esc(key)}" data-type="${type}" value="${esc(shown(type, fixed !== undefined ? fixed : v))}" placeholder="${esc(ph)}" spellcheck="false" autocomplete="off"${fixed !== undefined || !on ? ' disabled' : ''}>`;
           const clear = type === 'secret' && sec2 !== undefined && fixed === undefined ? `<button class="clear" data-unset="${esc(key)}">remove</button>` : '';
-          return `<label class="st-f"><span>${esc(label)}${fixed !== undefined ? '<em class="fixed">from the command line</em>' : ''}${clear}${hint ? `<small>${esc(hint)}</small>` : ''}</span>${input}</label>`;
+          return `<label class="st-f"><span>${esc(label)}${fixed !== undefined ? '<em class="fixed">from the command line</em>' : restartOnly(key) ? '<em class="fixed">at the next restart</em>' : ''}${clear}${hint ? `<small>${esc(hint)}</small>` : ''}</span>${input}</label>`;
         }).join('') + '</section>';
     }).join('');
     for (const el of $('stgrid').querySelectorAll('[data-key], [data-toggle]')) el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', stDirty);
@@ -1725,8 +1737,13 @@ export const guard = middleware({
     const el = $('stmcp'); if (!el || !stData) return;
     const listen = String(stCur('listen.app') ?? ''); const pub = String(stCur('app.publicUrl') ?? '');
     const doms = stCur('app.tls.domains'); const dom = (Array.isArray(doms) ? doms : String(doms ?? '').split(/[,\n]/)).map((x) => String(x).trim()).filter(Boolean)[0];
-    const local = /^(127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(listen);
-    const addr = pub || (dom ? 'https://' + dom : '') || (local ? 'http://' + listen : '');
+    // as the server derives it: the first domain, else http://localhost:<port> for an address on every interface, else the address
+    const derived = listen ? 'http://' + listen.replace(/^(0\.0\.0\.0|\[::\]|)(?=:)/, 'localhost') : '';
+    const addr = pub || (dom ? 'https://' + dom : '') || derived;
+    // the public address the server derives when none is set, shown as the field's placeholder: the first HTTPS domain,
+    // else http://localhost:<port> for an address on every interface, else the address itself
+    const pf = $('st-app-publicUrl');
+    if (pf && flagOf('app.publicUrl') === undefined) pf.placeholder = dom ? `https://${dom}  (derived from the first domain)` : listen ? `http://${listen.replace(/^(0\.0\.0\.0|\[::\]|)(?=:)/, 'localhost')}  (derived from the address)` : 'https://api.example.com';
     const go = (key, text) => `<a href="#" data-gofield="${esc(key)}">${text}</a>`;
     if (!listen) el.innerHTML = `<b>Needs the app server:</b> agents connect through it. Set its ${go('listen.app', 'Address')} under App server (or start with --app).`;
     else if (!addr) el.innerHTML = `<b>Needs the address agents reach this server at.</b> Set ${go('app.publicUrl', 'Public address')} under App server to your https URL, or ${go('app.tls.domains', 'Domains')} under HTTPS certificate. For this machine only, an Address of <code>127.0.0.1:${esc(listen.split(':').pop() || '7780')}</code> is enough.`;
@@ -1783,7 +1800,9 @@ export const guard = middleware({
   async function stSave(body) {
     try {
       const r = await api('/api/settings', { method: 'POST', body: JSON.stringify(body) });
-      $('sterr').classList.add('hidden'); toast(r.saved ? 'Saved: restart to apply' : 'Nothing changed'); await loadSettings();
+      $('sterr').classList.add('hidden');
+      toast(!r.saved ? 'Nothing changed' : r.applyError ? `Saved, but not applied: ${r.applyError}` : r.pending && r.pending.length ? `Saved and applied; ${r.pending.join(', ')} at the next restart` : 'Saved and applied', !!r.applyError);
+      await loadSettings();
     } catch (e) { if (e.auth) return; $('sterr').innerHTML = `<span class="ecode">${esc(e.code || 'ERROR')}</span><span class="msg">${esc(e.message + '\nNothing was saved.')}</span>`; $('sterr').classList.remove('hidden'); }
   }
   $('stsave').onclick = () => stSave({ set: stChanges() });

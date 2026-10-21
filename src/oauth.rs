@@ -58,7 +58,7 @@ async fn json_of(r: reqwest::Response, what: &str) -> Result<serde_json::Value, 
 }
 
 impl Sql {
-    fn provider(&self, name: &str) -> Result<&OAuthProvider, String> { self.cfg.auth.oauth.get(name).ok_or_else(|| fail(format!("no sign-in provider {name} (set auth.oauth.{name})"))) }
+    fn provider(&self, name: &str) -> Result<OAuthProvider, String> { self.cfg().auth.oauth.get(name).cloned().ok_or_else(|| fail(format!("no sign-in provider {name} (set auth.oauth.{name})"))) }
 
     /// Begin a sign-in with `provider` for users of `table`: send the browser to `url`; the provider sends it back to
     /// `redirect_uri` with a code and `state`. With `link_token` (a session of a signed-in user), the provider

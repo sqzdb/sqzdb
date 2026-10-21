@@ -22,13 +22,13 @@ use std::net::IpAddr;
 
 const FORM_COOKIE: &str = "sqz_form";
 
-fn https(sql: &Sql) -> bool { sql.cfg.app.public_url.as_deref().is_some_and(|u| u.starts_with("https://")) || sql.cfg.app.tls.is_some() }
+fn https(sql: &Sql) -> bool { sql.cfg().app.public_url.as_deref().is_some_and(|u| u.starts_with("https://")) || sql.cfg().app.tls.is_some() }
 fn secure(sql: &Sql) -> &'static str { if https(sql) { "; Secure" } else { "" } }
 /// The session cookie's name: over https `__Host-sqz_session`, which a browser takes only from this very host (Secure,
 /// Path=/, no Domain), so a sibling subdomain can't plant one; `sqz_session` over http (local development).
 pub fn session_name(sql: &Sql) -> &'static str { if https(sql) { "__Host-sqz_session" } else { "sqz_session" } }
 /// The session cookie for `token`, lasting as long as sessions do.
-pub(crate) fn session_cookie(sql: &Sql, token: &str) -> String { format!("{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}", session_name(sql), sql.cfg.auth.session_ttl.as_secs(), secure(sql)) }
+pub(crate) fn session_cookie(sql: &Sql, token: &str) -> String { format!("{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}", session_name(sql), sql.cfg().auth.session_ttl.as_secs(), secure(sql)) }
 pub(crate) fn clear_session(sql: &Sql) -> String { format!("{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}", session_name(sql), secure(sql)) }
 /// Whether a request's Origin is the API's own site: its host, or `app.publicUrl`. A browser sends `Origin: null`
 /// from a page whose Referrer-Policy is no-referrer, and from sandboxed frames and data: pages: then only its
@@ -36,14 +36,14 @@ pub(crate) fn clear_session(sql: &Sql) -> String { format!("{}=; Path=/; HttpOnl
 fn own_site(sql: &Sql, origin: &str, host: Option<&str>, fetch_site: Option<&str>) -> bool {
     if origin == "null" { return fetch_site == Some("same-origin"); }
     let o = origin.trim_end_matches('/');
-    o.split_once("://").is_some_and(|(_, h)| host.is_some_and(|x| x.eq_ignore_ascii_case(h))) || sql.cfg.app.public_url.as_deref() == Some(o)
+    o.split_once("://").is_some_and(|(_, h)| host.is_some_and(|x| x.eq_ignore_ascii_case(h))) || sql.cfg().app.public_url.as_deref() == Some(o)
 }
 /// Whether a request may act on the session cookie. Browsers send Origin with what they post, and with fetches and
 /// sockets across origins: the cookie counts only without one (a navigation; not a browser) or from the API's own
 /// site (`own_site`), or an origin `app.origins` names ("*" lets any page call the API, never act as its visitor).
 pub(crate) fn cookie_origin_ok(sql: &Sql, origin: Option<&str>, host: Option<&str>, fetch_site: Option<&str>) -> bool {
     let Some(o) = origin else { return true };
-    own_site(sql, o, host, fetch_site) || sql.cfg.app.origins.iter().any(|x| x != "*" && x.eq_ignore_ascii_case(o.trim_end_matches('/')))
+    own_site(sql, o, host, fetch_site) || sql.cfg().app.origins.iter().any(|x| x != "*" && x.eq_ignore_ascii_case(o.trim_end_matches('/')))
 }
 /// The session a request carries: `Authorization: Bearer …`, or the session cookie (from the API's own site).
 pub(crate) fn token_of(sql: &Sql, req: &Req) -> Option<String> {
@@ -53,7 +53,7 @@ pub(crate) fn token_of(sql: &Sql, req: &Req) -> Option<String> {
 }
 /// The address this API is reached at: `app.publicUrl`, or the scheme and host this request came to.
 pub(crate) fn site(sql: &Sql, req: &Req) -> String {
-    if let Some(u) = &sql.cfg.app.public_url { return u.trim_end_matches('/').to_string(); }
+    if let Some(u) = &sql.cfg().app.public_url { return u.trim_end_matches('/').to_string(); }
     format!("{}://{}", if https(sql) { "https" } else { "http" }, req.headers.get("host").map(String::as_str).unwrap_or("localhost"))
 }
 /// The session token of a browser signed in here (a session that still holds).
@@ -94,10 +94,11 @@ pub(crate) fn handle(sql: &Sql, ip: IpAddr, allow: &dyn Fn() -> bool, req: &Req)
             let f = form(req); let back = back_to(sql, f.get("return").map(String::as_str).unwrap_or("/"));
             let up = f.get("action").map(String::as_str) == Some("sign-up");
             if !same_browser(sql, req, &f) { return Some(sign_in_page(sql, &back, up, Some("This form expired, or came from another page. Try again."))); }
+            if !sql.cfg().auth.password { return Some(sign_in_page(sql, &back, up, Some("Password sign-in is off here: continue with a provider."))); }
             if !allow() { return Some(sign_in_page(sql, &back, up, Some("Too many sign-ins from here; wait a little and try again."))); }
             let (login, password) = (f.get("login").cloned().unwrap_or_default(), f.get("password").cloned().unwrap_or_default());
             let signed = users_table(sql).and_then(|table| if up {
-                if !sql.cfg.app.sign_up.contains_key(&table.to_ascii_lowercase()) { return Err(format!("accounts in {table} are made by the app, not here")); }
+                if !sql.cfg().app.sign_up.contains_key(&table.to_ascii_lowercase()) { return Err(format!("accounts in {table} are made by the app, not here")); }
                 let (t, at) = sql.auth_table_of(&table)?;
                 sql.sign_up(&table, &[(t.schema.columns[at.login].name.clone(), crate::table::Value::Text(login.trim().to_string()))], &password)
             } else { sql.sign_in(&table, &login, &password) });
@@ -159,10 +160,11 @@ fn with_form(sql: &Sql, title: &str, body: impl Fn(&str) -> String, status: u16)
 fn sign_in_page(sql: &Sql, back: &str, up: bool, err: Option<&str>) -> Vec<u8> {
     let table = match users_table(sql) { Ok(t) => t, Err(e) => return page(500, "Can't sign in", &format!("<h1>Can't sign in</h1><p>{}</p>", esc(&e)), None) };
     let login = sql.auth_table_of(&table).ok().map(|(t, a)| t.schema.columns[a.login].name.clone()).unwrap_or_else(|| "login".into());
-    let can_sign_up = sql.cfg.app.sign_up.contains_key(&table.to_ascii_lowercase());
+    let can_sign_up = sql.cfg().app.sign_up.contains_key(&table.to_ascii_lowercase());
     let up = up && can_sign_up;
-    let host = host_of(sql.cfg.app.public_url.as_deref().unwrap_or(""));
-    let providers: Vec<&String> = if sql.cfg.app.public_url.is_some() { sql.cfg.auth.oauth.keys().collect() } else { vec![] };
+    let host = host_of(sql.cfg().app.public_url.as_deref().unwrap_or(""));
+    let cfg = sql.cfg();
+    let providers: Vec<&String> = if cfg.app.public_url.is_some() { cfg.auth.oauth.keys().collect() } else { vec![] };
     let (b, t) = (esc(back), esc(&table));
     let buttons: String = providers.iter().map(|p| format!(r#"<form method="get" action="/api/auth/{t}/oauth/{p}"><input type="hidden" name="cookie" value="1"><input type="hidden" name="return" value="{b}"><button class="alt">Continue with {name}</button></form>"#, p = esc(p), name = esc(&title_case(p)))).collect();
     let (title, action, button, pw, other) = if up {
@@ -170,12 +172,16 @@ fn sign_in_page(sql: &Sql, back: &str, up: bool, err: Option<&str>) -> Vec<u8> {
     } else {
         ("Sign in", "sign-in", "Sign in", "current-password", if can_sign_up { format!(r#"<p class="small">No account? <a href="/_sqz/sign-in?mode=up&amp;return={}">Create one</a></p>"#, crate::app::enc(back)) } else { String::new() })
     };
+    // auth.password off: the providers are the only way in, so no form and no account links
+    let pw_on = sql.cfg().auth.password;
+    let other = if pw_on { other } else { String::new() };
     let status = if err.is_some() { 400 } else { 200 };
     with_form(sql, title, |v| format!(r#"<h1>{title}{to}</h1>{err}
-<form method="post" action="/_sqz/sign-in"><input type="hidden" name="form" value="{v}"><input type="hidden" name="return" value="{b}"><input type="hidden" name="action" value="{action}">
+{form}{buttons}{other}"#, to = if host.is_empty() { String::new() } else { format!(" to {}", esc(&host)) }, err = err.map(|e| format!(r#"<p class="err">{}</p>"#, esc(e))).unwrap_or_default(),
+        form = if pw_on { format!(r#"<form method="post" action="/_sqz/sign-in"><input type="hidden" name="form" value="{v}"><input type="hidden" name="return" value="{b}"><input type="hidden" name="action" value="{action}">
 <label>{label}<input name="login" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="{pw}" required></label><button>{button}</button></form>
-{or}{buttons}{other}"#, to = if host.is_empty() { String::new() } else { format!(" to {}", esc(&host)) }, err = err.map(|e| format!(r#"<p class="err">{}</p>"#, esc(e))).unwrap_or_default(),
-        label = esc(&title_case(&login)), or = if providers.is_empty() { "" } else { r#"<div class="or">or</div>"# }), status)
+{or}"#, label = esc(&title_case(&login)), or = if providers.is_empty() { "" } else { r#"<div class="or">or</div>"# }) }
+               else if providers.is_empty() { r#"<p class="err">No way to sign in is set up: password sign-in is off (auth.password) and no provider is configured.</p>"#.to_string() } else { String::new() }), status)
 }
 fn sign_out_page(sql: &Sql, back: &str) -> Vec<u8> {
     with_form(sql, "Sign out", |v| format!(r#"<h1>Sign out?</h1><form method="post" action="/_sqz/sign-out"><input type="hidden" name="form" value="{v}"><input type="hidden" name="return" value="{b}"><button>Sign out</button></form>"#, b = esc(back)), 200)

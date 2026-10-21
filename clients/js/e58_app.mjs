@@ -61,8 +61,8 @@ try {
   for (const fields of [{ email: 'mal@x.com', role: 'admin' }, { email: 'mal@x.com', id: 999 }]) await assert.rejects(connect(url, { storage: null }).auth.signUp(fields, 'mal password'), (e) => e.code === 'DENIED', JSON.stringify(fields));
   await assert.rejects(connect(url, { storage: null, users: 'staff' }).auth.signUp({ login: 'mal' }, 'mal password'), (e) => e.code === 'DENIED');
   // what a sign-in page needs to know, and the client itself, from the server
-  assert.deepEqual(await ann.auth.methods(), { signUp: true, providers: ['idp'] });
-  assert.deepEqual(await connect(url, { storage: null, users: 'staff' }).auth.methods(), { signUp: false, providers: ['idp'] });
+  assert.deepEqual(await ann.auth.methods(), { signUp: true, providers: ['idp'], password: true });
+  assert.deepEqual(await connect(url, { storage: null, users: 'staff' }).auth.methods(), { signUp: false, providers: ['idp'], password: true });
   const js = await fetch(`${url}/api/client.js`); assert.equal(js.status, 200); assert.match(js.headers.get('content-type'), /javascript/);
   assert.equal(await js.text(), fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8'));
   await ann.sql('INSERT INTO notes (owner, body) VALUES (?, ?)', [a.user.id, 'ann 1']);

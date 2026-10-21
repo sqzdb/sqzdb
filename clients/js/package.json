@@ -1,7 +1,7 @@
 {
-  "name": "sqzdb-client",
-  "version": "0.15.0",
-  "description": "Sign in and run SQL with live queries against a sqzdb app API, from a browser, React Native or Node",
+  "name": "@sqzdb/client",
+  "version": "0.16.0",
+  "description": "The browser client for a sqzdb app API: sign in, run SQL as the signed-in user, keep live queries current, call the app's functions",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
@@ -13,11 +13,21 @@
   },
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "README.md"
   ],
   "engines": {
     "node": ">=22"
   },
+  "keywords": ["sqzdb", "database", "client", "sql", "live-queries", "auth", "browser", "react-native"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sqzdb/sqzdb.git",
+    "directory": "clients/js"
+  },
+  "homepage": "https://github.com/sqzdb/sqzdb#the-app-api-sql-from-the-browser",
   "license": "MIT",
-  "private": true
+  "publishConfig": {
+    "access": "public"
+  }
 }

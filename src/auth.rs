@@ -44,6 +44,35 @@ const SWEEP_EVERY_US: i64 = 3_600_000_000;
 /// Names under `_auth_` and `_sqz_` are the engine's own: SQL can't create, read or change them.
 pub fn is_system(name: &str) -> bool { let n = name.as_bytes(); (n.len() >= 6 && n[..6].eq_ignore_ascii_case(b"_auth_")) || (n.len() >= 5 && n[..5].eq_ignore_ascii_case(b"_sqz_")) }
 
+/// The catalog record that says sqzdb made the users table itself: sign-up to it is then open (with `name`) unless
+/// `app.signUp` says otherwise.
+pub const USERS_MADE: &str = "SET sqzdb_users = 'default'";
+/// The users table the standalone server makes when the app API is on and nothing takes sign-ins yet
+/// (`Config::make_users`): what every app needs, for the app to extend with ALTER TABLE. Members read and edit their
+/// own row; `role` is theirs to read only (a role column is the application's to set).
+pub const USERS_TABLE: &[&str] = &[
+    "CREATE TABLE users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email TEXT UNIQUE NOT NULL, name TEXT, role TEXT NOT NULL DEFAULT 'member', created TIMESTAMP DEFAULT now())",
+    "ALTER TABLE users ENABLE AUTH (ROLE FROM role)",
+    "GRANT SELECT, UPDATE ON users TO member",
+    "CREATE POLICY own_account ON users FOR ALL TO member USING (id = SESSION.id)",
+];
+impl Sql {
+    /// Whether the users table is the one sqzdb made (`USERS_TABLE`).
+    pub fn users_made(&self) -> bool { self.auth.made_users.load(std::sync::atomic::Ordering::Acquire) }
+    /// Make the users table (`USERS_TABLE`) and the `member` role, unless a table named users is there or some table
+    /// takes sign-ins already: those are the app's own choices, left alone. Whether it was made now.
+    pub(crate) fn make_users(&self) -> Result<bool, String> {
+        let has_member = { let a = self.acl.read().unwrap(); if !a.auth.is_empty() { return Ok(false); } a.roles.contains("member") };
+        if self.db.table_names().iter().any(|n| n.eq_ignore_ascii_case("users")) { return Ok(false); }
+        let mut stmts = vec![USERS_TABLE[0]]; if !has_member { stmts.push("CREATE ROLE member"); } stmts.extend_from_slice(&USERS_TABLE[1..]);
+        let mut app = Session::default();
+        for st in stmts { self.exec_s(&mut app, st, &[]).map_err(|e| format!("users: {st}: {e}"))?; }
+        self.auth.made_users.store(true, std::sync::atomic::Ordering::Release);
+        self.db.log.append_meta(USERS_MADE);
+        Ok(true)
+    }
+}
+
 /// Where a signed-in user's role comes from.
 #[derive(Clone, Debug)] pub enum RoleSrc { Column(usize), Fixed(String) }
 /// A table users sign in to: its UNIQUE text column is the login.
@@ -60,7 +89,9 @@ pub fn is_system(name: &str) -> bool { let n = name.as_bytes(); (n.len() >= 6 &&
     /// device login: the devices waiting for a signed-in browser to let them in, by device code
     devices: Mutex<HashMap<String, Device>>,
     /// bumped by every change to roles, grants, policies, users or sign-in tables (`Sql::acl_epoch`)
-    pub(crate) acl: std::sync::atomic::AtomicU64 }
+    pub(crate) acl: std::sync::atomic::AtomicU64,
+    /// whether the users table is the one sqzdb made (`USERS_TABLE`; the catalog record `USERS_MADE`)
+    pub(crate) made_users: std::sync::atomic::AtomicBool }
 /// A device waiting to be let in (device login, RFC 8628): the code its user enters, the name it gave itself, the
 /// address it asked from, when it asked and last polled; once someone decided, the session made for it (and its
 /// table) or a refusal.
@@ -580,7 +611,7 @@ impl Sql {
     }
 
     fn check_password(&self, pw: &str) -> Result<(), String> {
-        let min = self.cfg.auth.password_min;
+        let min = self.cfg().auth.password_min;
         if pw.chars().count() < min { return Err(format!("the password is too short: at least {min} characters")); }
         if pw.len() > PASSWORD_MAX { return Err(format!("the password is too long: at most {PASSWORD_MAX} bytes")); }
         Ok(())
@@ -608,7 +639,7 @@ impl Sql {
         Ok(token)
     }
     fn session_row(&self, sessions: &Table, secret_id: &str, generation: &Value) -> Result<(String, Vec<u8>), String> {
-        let (raw, row) = self.session_row_for(sessions, secret_id, generation, self.cfg.auth.session_ttl, b"")?;
+        let (raw, row) = self.session_row_for(sessions, secret_id, generation, self.cfg().auth.session_ttl, b"")?;
         Ok((format!("{TOKEN_PREFIX}{}", hex(&raw)), row))
     }
     /// A session row `ttl` long, its id the SHA-256 of `tag` and the token's random bytes (see `token_id`).
@@ -897,5 +928,82 @@ mod tests {
         }
         { let s = Sql::open_with(&d, Config::default()).unwrap(); q(&s, "ALTER TABLE users DISABLE AUTH"); assert!(as_token(&s, &token).err().unwrap().contains("no longer takes sign-ins")); }
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod users_table_tests {
+    use super::*;
+    use crate::config::Config;
+    fn tmp(name: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("sqzdb-users-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
+    fn cfg(make_users: bool) -> Config { Config { make_users, ..Config::default() } }
+    fn q(s: &Sql, sql: &str) -> Vec<Vec<Value>> { s.exec_s(&mut Session::default(), sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}")) }
+    fn names() -> Vec<String> { vec!["name".into()] }
+
+    /// The standalone server with the app API on makes the users table: sign-in enabled with the role from `role`, the
+    /// member role on its own row, sign-up open with name. A restart finds it made (the catalog says so) and keeps the
+    /// default. A users table of the app's, or any table that takes sign-ins already, leaves it unmade.
+    #[test] fn the_users_table_comes_made() {
+        let d = tmp("made");
+        let s = Sql::open_with(&d, cfg(true)).unwrap();
+        assert!(s.users_made());
+        let cols: Vec<String> = s.db.table("users").unwrap().schema.columns.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(cols, ["id", "email", "name", "role", "created"]);
+        { let a = s.acl.read().unwrap(); assert!(a.roles.contains("member")); assert!(a.auth.contains_key("users")); assert!(a.policies.iter().any(|p| p.name == "own_account" && p.table == "users")); }
+        assert_eq!(s.cfg().app.sign_up.get("users"), Some(&names()), "open to sign-up, with name");
+        let f = |email: &str| vec![("email".to_string(), Value::Text(email.into())), ("name".to_string(), Value::Text("Ann".into()))];
+        let si = s.sign_up("users", &f("ann@x.test"), "the password 1").unwrap();
+        s.sign_up("users", &f("bob@x.test"), "the password 2").unwrap();
+        // Ann sees and edits her own row only, and can't set her role
+        let mut ann = Session::default(); s.session_from_token(&mut ann, &si.token).unwrap();
+        assert_eq!(s.exec_s(&mut ann, "SELECT email FROM users", &[]).unwrap(), vec![vec![Value::Text("ann@x.test".into())]]);
+        s.exec_s(&mut ann, "UPDATE users SET name = 'Anne' WHERE email = 'ann@x.test'", &[]).unwrap();
+        assert!(s.exec_s(&mut ann, "UPDATE users SET role = 'admin' WHERE email = 'ann@x.test'", &[]).is_err());
+        assert_eq!(q(&s, "SELECT name, role FROM users WHERE email = 'ann@x.test'"), vec![vec![Value::Text("Anne".into()), Value::Text("member".into())]]);
+        s.close(); drop(s);
+        // again: made already, the default still on, the rows there
+        let s = Sql::open_with(&d, cfg(true)).unwrap();
+        assert!(s.users_made()); assert_eq!(s.db.table("users").unwrap().schema.columns.len(), 5); assert_eq!(s.cfg().app.sign_up.get("users"), Some(&names()));
+        assert_eq!(q(&s, "SELECT count(*) FROM users"), vec![vec![Value::Int(2)]]);
+        // the app's own setting wins over the default
+        s.close(); drop(s);
+        let mut c = cfg(true); c.app.sign_up.insert("users".into(), vec![]);
+        let s = Sql::open_with(&d, c).unwrap(); assert_eq!(s.cfg().app.sign_up.get("users"), Some(&vec![])); s.close(); drop(s);
+        // the app's own users table: left alone, no sign-in enabled, no default sign-up
+        let d = tmp("own");
+        let s = Sql::open_with(&d, cfg(false)).unwrap(); q(&s, "CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE)"); s.close(); drop(s);
+        let s = Sql::open_with(&d, cfg(true)).unwrap();
+        assert!(!s.users_made()); assert_eq!(s.db.table("users").unwrap().schema.columns.len(), 2); assert!(s.acl.read().unwrap().auth.is_empty()); assert!(s.cfg().app.sign_up.is_empty());
+        s.close(); drop(s);
+        // a table that takes sign-ins already: no users table made
+        let d = tmp("other");
+        let s = Sql::open_with(&d, cfg(false)).unwrap();
+        for st in ["CREATE TABLE people (id SERIAL PRIMARY KEY, email TEXT UNIQUE, role TEXT DEFAULT 'member')", "CREATE ROLE member", "ALTER TABLE people ENABLE AUTH (ROLE FROM role)"] { q(&s, st); }
+        s.close(); drop(s);
+        let s = Sql::open_with(&d, cfg(true)).unwrap(); assert!(!s.users_made()); assert!(s.db.table("users").is_none()); s.close(); drop(s);
+        // a member role there already is used, not made again
+        let d = tmp("member");
+        let s = Sql::open_with(&d, cfg(false)).unwrap(); q(&s, "CREATE ROLE member"); s.close(); drop(s);
+        let s = Sql::open_with(&d, cfg(true)).unwrap(); assert!(s.users_made()); s.close(); drop(s);
+    }
+
+    /// The configuration reloads in place for what can change while running; what can't keeps its running value and
+    /// is named; a role the file names must exist; the users table sqzdb made stays open to sign-up.
+    #[test] fn the_configuration_reloads_in_place() {
+        let d = tmp("reload");
+        let s = Sql::open_with(&d, cfg(true)).unwrap();
+        q(&s, "CREATE ROLE visitor");
+        let mut c = Config::default(); c.app.origins = vec!["https://app.example".into()]; c.app.anonymous_role = Some("visitor".into()); c.auth.password = false;
+        c.listen.tcp = Some("127.0.0.1:0".into()); c.functions.instances = 1;
+        let g = s.cfg_generation();
+        assert_eq!(s.reload_config(c.clone()).unwrap(), vec!["listen", "functions.instances"], "named: they take effect at the next start");
+        let now = s.cfg();
+        assert_eq!((now.app.origins.clone(), now.app.anonymous_role.as_deref(), now.auth.password), (vec!["https://app.example".to_string()], Some("visitor"), false), "applied");
+        assert!(now.listen.tcp.is_none() && now.functions.instances != 1, "kept as the server runs");
+        assert_eq!(now.app.sign_up.get("users"), Some(&names()), "the made table's default sign-up stays");
+        assert_eq!(s.cfg_generation(), g + 1);
+        c.app.anonymous_role = Some("ghost".into());
+        assert!(s.reload_config(c).unwrap_err().contains("no such role ghost")); assert_eq!(s.cfg_generation(), g + 1, "refused: nothing changed");
+        s.close(); drop(s);
     }
 }

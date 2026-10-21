@@ -75,7 +75,7 @@ fn serve(a: &[String]) {
     match flag(a, "--token") { Some(t) => { listen.insert("token".into(), json!(t)); } None => if listen.contains_key("http") || listen.contains_key("tcp") { let t = generated(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t); } }
     if !listen.is_empty() { opts.insert("listen".into(), J::Object(listen.clone())); }
     let flags = { let mut f = opts.clone(); f.remove("configFile"); J::Object(f) };
-    let cfg = match load(&opts) {
+    let mut cfg = match load(&opts) {
         // the settings file opens a console or a TCP port and names no token: one is generated, as with --ui
         Err(e) if e.contains("needs listen.token") && printed_token.is_none() => {
             let t = generated(); listen.insert("token".into(), json!(t.clone())); printed_token = Some(t);
@@ -83,8 +83,12 @@ fn serve(a: &[String]) {
         }
         r => r.unwrap_or_else(|e| fail(e)),
     };
+    // the app API without a sign-in table serves no one: the server makes the users table (auth.rs), unless the app
+    // brought its own
+    cfg.make_users = cfg.listen.app.is_some();
     sqzdb::ui::serve_settings(settings.clone(), flags);
     let t = Instant::now(); let sql = Sql::open_with(&dir, cfg.clone()).unwrap_or_else(|e| fail(e));
+    sqzdb::ui::watch_settings(std::sync::Arc::downgrade(&sql));   // edits to the settings file apply in place
     let rows = sql.snapshot_rows();
     println!("sqzdb serving {} ({} tables, {} rows, opened in {:.0} ms)", dir.display(), sql.db.table_names().len(), rows, t.elapsed().as_secs_f64() * 1e3);
     println!("  durability: {:?}{}", cfg.durable, cfg.backup.as_ref().map(|b| format!("; backup to {}/{} every {:?}{}", b.bucket, b.prefix.trim_matches('/'), b.interval, if b.passphrase.is_some() { ", encrypted" } else { "" })).unwrap_or_default());
@@ -92,10 +96,11 @@ fn serve(a: &[String]) {
     if let Some(t) = &cfg.listen.tcp { println!("  tcp:        {t}"); }
     if let Some(h) = &cfg.listen.http { println!("  console:    http://{h}/"); }
     if let Some(h) = &cfg.listen.app {
-        let url = match &cfg.app.tls { Some(_) => cfg.app.public_url.clone().unwrap_or_else(|| format!("https://{h}")), None => format!("http://{h}") };
+        let url = cfg.app.public_url.clone().unwrap_or_else(|| format!("{}://{h}", if cfg.app.tls.is_some() { "https" } else { "http" }));
         let tls = cfg.app.tls.as_ref().map(|t| if t.cert.is_some() { format!("  (on {h}, your certificate)") } else { format!("  (on {h}, certificate from {})", t.acme.split('/').nth(2).unwrap_or(&t.acme)) }).unwrap_or_default();
         println!("  app API:    {url}/api/{tls}{}", cfg.app.static_dir.as_ref().map(|d| format!("  (and the files in {})", d.display())).unwrap_or_default());
         if let Some(r) = cfg.app.tls.as_ref().and_then(|t| t.redirect.as_ref()) { println!("  redirect:   http://{r}/ to https"); }
+        if sql.users_made() { println!("  sign-in:    users, made by sqzdb (id, email, name, role, created){}", if sql.cfg().app.sign_up.contains_key("users") { "; anyone may sign up" } else { "" }); }
         if let Some(p) = &cfg.app.proxy { println!("  proxy:      everything else to {}", p.to); }
     }
     if let Some(d) = &cfg.functions.dir { let names: Vec<String> = sql.function_defs().into_iter().map(|f| f.name).collect(); println!("  functions:  {} from {}{}: {}", names.len(), d.display(), if cfg.functions.watch { " (watched)" } else { "" }, names.join(", ")); }

@@ -28,6 +28,38 @@ static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 pub fn serve_settings(path: std::path::PathBuf, flags: J) { let _ = SERVE.set(ServeSettings { path, flags }); }
 /// Whether the console asked the server to restart (to start with the settings saved).
 pub fn restart_requested() -> bool { RESTART.load(Relaxed) }
+/// The settings file's text as last applied in place (so the watcher applies an edit once, and not a save of the
+/// console's twice).
+static APPLIED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Apply the settings file as it is now: checked as the server would start with it, then put in place for what can
+/// change while running (`Sql::reload_config`). The names of what can't, for the next start.
+pub fn settings_apply(sql: &Sql) -> Result<Vec<&'static str>, String> {
+    let Some(sv) = SERVE.get() else { return Ok(vec![]) };
+    if !sv.path.exists() { return Ok(vec![]); }
+    crate::config::private_file(&sv.path)?;
+    let text = std::fs::read_to_string(&sv.path).map_err(|e| format!("{}: {e}", sv.path.display()))?;
+    let cfg = crate::config::Config::check(&text, Some(&sv.flags.to_string())).map_err(|e| plain_error(&redact(&crate::config::scrub(&e, &text), &[&text])))?;
+    let pending = sql.reload_config(cfg)?;
+    *APPLIED.lock().unwrap() = text;
+    Ok(pending)
+}
+/// Watch the settings file for edits by hand (the console's own saves apply themselves): every two seconds, a file
+/// that changed since it was last applied is applied, and the server's log says what came of it.
+pub fn watch_settings(sql: std::sync::Weak<Sql>) {
+    let Some(sv) = SERVE.get() else { return };
+    *APPLIED.lock().unwrap() = std::fs::read_to_string(&sv.path).unwrap_or_default();
+    std::thread::Builder::new().name("sqzdb-settings".into()).spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let Some(sql) = sql.upgrade() else { return };
+        let text = std::fs::read_to_string(&sv.path).unwrap_or_default();
+        if text == *APPLIED.lock().unwrap() { continue; }
+        match settings_apply(&sql) {
+            Ok(p) if p.is_empty() => eprintln!("settings: {} changed: applied", sv.path.display()),
+            Ok(p) => eprintln!("settings: {} changed: applied, but {} take effect at the next start", sv.path.display(), p.join(", ")),
+            Err(e) => { eprintln!("settings: {}: {e}; the server runs on as before", sv.path.display()); *APPLIED.lock().unwrap() = text; }
+        }
+    }).expect("a thread");
+}
 /// Keys whose values are secrets: shown as set or not (or as the `${VAR}` they come from), never sent back.
 const SECRETS: &[&str] = &["secretKey", "passphrase", "clientSecret", "apiKey", "token"];
 /// A secret's value as the console shows the file's text; saved back, it keeps the value the file has.
@@ -275,8 +307,8 @@ fn serve(weak: std::sync::Weak<Sql>, stream: TcpStream, token: &str) -> std::io:
                         ("GET", "/api/status") => json_resp(&mut w, 200, &api_status(&sql))?,
                         ("GET", "/api/acl") => json_resp(&mut w, 200, &api_acl(&sql))?,
                         ("POST", "/api/auth/sign-up") => { let (st, v) = api_sign_up(&sql, &req.body); json_resp(&mut w, st, &v)? }
-                        ("GET", "/api/settings") => json_resp(&mut w, 200, &api_settings())?,
-                        ("POST", "/api/settings") => { let (st, v) = api_save_settings(&req.body); json_resp(&mut w, st, &v)? }
+                        ("GET", "/api/settings") => json_resp(&mut w, 200, &api_settings(&sql))?,
+                        ("POST", "/api/settings") => { let (st, v) = api_save_settings(&sql, &req.body); json_resp(&mut w, st, &v)? }
                         ("POST", "/api/restart") => match restart_check() {
                             Err((st, e)) => json_resp(&mut w, st, &json!({"error": e, "code": if st == 409 { "CONFLICT" } else { "CONFIG" }}))?,
                             Ok(()) => { json_resp(&mut w, 200, &json!({"restarting": true}))?; std::thread::spawn(|| { std::thread::sleep(Duration::from_millis(150)); RESTART.store(true, Relaxed); }); }
@@ -301,7 +333,7 @@ fn serve(weak: std::sync::Weak<Sql>, stream: TcpStream, token: &str) -> std::io:
 
 /// Check the configured bucket the way the uploader uses it (list, write, delete), step by step.
 fn api_backup_test(sql: &Sql) -> J {
-    let Some(b) = sql.cfg.backup.as_ref() else { return json!({"error": "backup is not configured", "code": "CONFIG"}) };
+    let cfg = sql.cfg(); let Some(b) = cfg.backup.as_ref() else { return json!({"error": "backup is not configured", "code": "CONFIG"}) };
     let steps = crate::cloud::probe(&b.cloud());
     json!({ "ok": steps.iter().all(|s| s.1) && steps.len() == 3, "steps": steps.iter().map(|(name, ok, ms, err)| json!({"step": name, "ok": ok, "ms": ms, "error": if err.is_empty() { J::Null } else { json!(err) }})).collect::<Vec<_>>() })
 }
@@ -336,7 +368,7 @@ fn api_tables(sql: &Sql) -> J {
 fn api_status(sql: &Sql) -> J {
     use crate::config::Durability;
     let (seq, durable, bytes) = { let s = sql.db.log.st.lock().unwrap(); (s.seq, s.durable, s.bytes) };
-    let cfg = &sql.cfg;
+    let cfg = sql.cfg();
     let backup = sql.backup_stats().map(|st| {
         let b = cfg.backup.as_ref(); let ms = |v: u64| if v == 0 { J::Null } else { json!(v) };
         let e = st.last_error(); let last_error = if e.is_empty() { J::Null } else { json!(e) };
@@ -360,9 +392,11 @@ fn cmp_sym(c: crate::sql::Cmp) -> &'static str { use crate::sql::Cmp::*; match c
 
 /// The settings file: its text, its values (secrets masked), which keys the command line fixes, and whether it was
 /// saved since the server started.
-fn api_settings() -> J {
+fn api_settings(sql: &Sql) -> J {
     let Some(sv) = SERVE.get() else { return json!({"editable": false}) };
     let text = std::fs::read_to_string(&sv.path).unwrap_or_default();
+    // `pending`: the settings in the file that differ from what the server runs with and take effect only at a start
+    let pending: Vec<&str> = if text.is_empty() { vec![] } else { crate::config::Config::check(&text, Some(&sv.flags.to_string())).map(|c| crate::config::restart_only(&sql.cfg(), &c)).unwrap_or_default() };
     let mut values = toml::from_str::<toml::Value>(&text).ok().and_then(|v| serde_json::to_value(v).ok()).unwrap_or(json!({}));
     let mut secrets = serde_json::Map::new();
     fn mask(v: &mut J, at: &str, out: &mut serde_json::Map<String, J>) {
@@ -376,12 +410,12 @@ fn api_settings() -> J {
     mask(&mut values, "", &mut secrets);
     let mut flags = sv.flags.clone(); mask_json(&mut flags);
     json!({"editable": true, "path": sv.path.display().to_string(), "exists": sv.path.exists(), "text": masked_text(&text), "values": values, "secrets": secrets,
-           "flags": flags, "saved": SAVED.load(Relaxed), "broken": unparsable(&text)})
+           "flags": flags, "saved": SAVED.load(Relaxed), "pending": pending, "broken": unparsable(&text)})
 }
 /// Save the settings: `{"text": …}` (the whole file), or `{"set": {"app.publicUrl": …, "backup": null, …}}` (keys
 /// changed in the file as it is, comments and all; null removes one). Checked as the server would start with it
 /// (its flags over it) before it is written; written whole (a temporary file, renamed), readable by its owner only.
-fn api_save_settings(body: &[u8]) -> (u16, J) {
+fn api_save_settings(sql: &Sql, body: &[u8]) -> (u16, J) {
     let Some(sv) = SERVE.get() else { return (409, json!({"error": "this database's settings come from its application's code", "code": "CONFLICT"})) };
     let Ok(v) = serde_json::from_slice::<J>(body) else { return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})) };
     let current = std::fs::read_to_string(&sv.path).unwrap_or_default();
@@ -391,12 +425,18 @@ fn api_save_settings(body: &[u8]) -> (u16, J) {
         _ => return (400, json!({"error": "send {\"text\"} or {\"set\": {key: value}}", "code": "ARGUMENTS"})),
     };
     if let Some(e) = new_reference(&current, &text).or_else(|| redirected(&current, &text)) { return (400, json!({"error": e, "code": "CONFIG"})); }
-    if let Err(e) = crate::config::Config::check(&text, Some(&sv.flags.to_string())) { return (400, json!({"error": plain_error(&redact(&crate::config::scrub(&e, &text), &[&current, &text])), "code": "CONFIG"})); }
-    if text == current { return (200, json!({"saved": false, "text": masked_text(&text)})); }
+    let checked = match crate::config::Config::check(&text, Some(&sv.flags.to_string())) { Ok(c) => c, Err(e) => return (400, json!({"error": plain_error(&redact(&crate::config::scrub(&e, &text), &[&current, &text])), "code": "CONFIG"})) };
+    // what the running database alone can check: a role the file names must exist
+    if let Some(r) = &checked.app.anonymous_role { if !sql.acl.read().unwrap().roles.contains(r) { return (400, json!({"error": format!("app.anonymousRole: no such role {r} (create it under Access first)"), "code": "CONFIG"})); } }
+    if text == current { return (200, json!({"saved": false, "pending": crate::config::restart_only(&sql.cfg(), &checked), "text": masked_text(&text)})); }
     if sv.path.exists() { if let Err(e) = crate::config::private_file(&sv.path) { return (409, json!({"error": e, "code": "CONFIG"})); } }
     if let Err(e) = write_private(&sv.path, text.as_bytes()) { return (500, json!({"error": format!("{}: {e}", sv.path.display()), "code": "ERROR"})); }
     SAVED.store(true, Relaxed);
-    (200, json!({"saved": true, "text": masked_text(&text)}))
+    // in place at once, for what can change while running; the rest at the next start
+    match settings_apply(sql) {
+        Ok(pending) => (200, json!({"saved": true, "pending": pending, "text": masked_text(&text)})),
+        Err(e) => (200, json!({"saved": true, "pending": [], "applyError": e, "text": masked_text(&text)})),
+    }
 }
 /// Whether the server can restart into its settings file as it is now (it may have been edited by hand since): the
 /// checks its start makes, so a restart never leaves it down.
@@ -452,14 +492,14 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// The deploy: its files as written, its exports, why it doesn't load (if it doesn't), where it comes from, and the
 /// MCP endpoint agents reach its functions at.
 fn api_functions(sql: &Sql) -> J {
-    let dir = sql.cfg.functions.dir.as_ref().map(|d| d.display().to_string());
+    let dir = sql.cfg().functions.dir.as_ref().map(|d| d.display().to_string());
     let files: serde_json::Map<String, J> = sql.deployed_files().into_iter().map(|(k, v)| (k, J::String(v))).collect();
-    json!({"files": files, "exports": sql.exports_json(), "broken": sql.functions_broken_reason(), "folder": dir, "watch": sql.cfg.functions.watch,
-           "mcp": sql.cfg.app.mcp.as_ref().map(|m| json!({"url": sql.cfg.app.public_url.as_ref().map(|u| format!("{}/mcp", u.trim_end_matches('/'))), "sql": m.sql}))})
+    json!({"files": files, "exports": sql.exports_json(), "broken": sql.functions_broken_reason(), "folder": dir, "watch": sql.cfg().functions.watch,
+           "mcp": sql.cfg().app.mcp.as_ref().map(|m| json!({"url": sql.cfg().app.public_url.as_ref().map(|u| format!("{}/mcp", u.trim_end_matches('/'))), "sql": m.sql}))})
 }
 /// Deploy these files (`{"files": {path: source}}`), replacing the deploy in use; refused while a folder is the source.
 fn api_deploy(sql: &Sql, body: &[u8]) -> (u16, J) {
-    if let Some(d) = &sql.cfg.functions.dir { return (409, json!({"error": format!("the functions are deployed from {} (at start, and as it changes): edit the files there", d.display()), "code": "CONFLICT"})); }
+    if let Some(d) = &sql.cfg().functions.dir { return (409, json!({"error": format!("the functions are deployed from {} (at start, and as it changes): edit the files there", d.display()), "code": "CONFLICT"})); }
     let files = serde_json::from_slice::<J>(body).ok().and_then(|v| v.get("files").and_then(|f| f.as_object()).map(|m| m.iter().map(|(k, s)| s.as_str().map(|s| (k.clone(), s.to_string()))).collect::<Option<Vec<_>>>())).flatten();
     let Some(files) = files else { return (400, json!({"error": "send {\"files\": {path: source}}", "code": "ARGUMENTS"})) };
     match sql.deploy_functions(&Session::default(), files) {
@@ -476,7 +516,8 @@ fn api_call(sql: &Sql, body: &[u8]) -> (u16, J) {
     }
     let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let t = Instant::now();
-    match sql.call_function(&mut sess, name, v.get("args").unwrap_or(&json!({})), false) {
+    // (a function that is `enabled: false` runs from here, and from nowhere else)
+    match sql.call_function_as(&mut sess, name, v.get("args").unwrap_or(&json!({})), false, true) {
         Ok(r) => (200, json!({"result": r, "ms": t.elapsed().as_secs_f64() * 1000.0})),
         Err(e) => (400, json!({"error": e.message, "code": e.code})),
     }
@@ -500,7 +541,7 @@ fn api_request(sql: &Sql, body: &[u8]) -> (u16, J) {
         Some(who) => { let mut s = Session::default(); if let Err(e) = sql.assume_json(&mut s, &who.to_string()) { return (400, json!({"error": e, "code": "ARGUMENTS"})); } let (u, r) = (s.attrs.clone(), s.roles.clone()); (s, Some(u), r) }
         None => { let (s, r) = crate::app::visitor_session(sql); (s, None, r) }
     };
-    let guarded = crate::app::guarded(&raw_path);
+    let guarded = crate::app::guarded(sql, &raw_path);
     let ours = crate::proxy::ours(sql, &raw_path);
     let mut req = crate::functions::HttpReq { method, path, raw_path, query, headers, ip: "127.0.0.1".into(), params: vec![], body: None };
     let t = Instant::now();
@@ -532,7 +573,9 @@ fn api_acl(sql: &Sql) -> J {
     users.sort_by_key(|x| x["name"].as_str().unwrap_or("").to_string());
     let mut auth: Vec<J> = a.auth.iter().map(|(t, at)| {
         let (cols, only) = sql.db.table(t).map(|tb| (tb.schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(), a.app_only(&tb.schema).into_iter().map(|(c, _)| tb.schema.columns[c].name.clone()).collect::<Vec<_>>())).unwrap_or_default();
-        json!({"table": t, "login": cols.get(at.login), "role": match &at.role { crate::auth::RoleSrc::Column(c) => json!({"column": cols.get(*c)}), crate::auth::RoleSrc::Fixed(r) => json!({"fixed": r}) }, "appOnly": only})
+        // `signUp`: the columns a sign-up may set as the server runs now (app.signUp, or the default for the table sqzdb made); null when closed
+        json!({"table": t, "login": cols.get(at.login), "role": match &at.role { crate::auth::RoleSrc::Column(c) => json!({"column": cols.get(*c)}), crate::auth::RoleSrc::Fixed(r) => json!({"fixed": r}) }, "appOnly": only,
+               "signUp": sql.cfg().app.sign_up.get(t.as_str()).map(|c| json!(c)).unwrap_or(J::Null), "made": t == "users" && sql.users_made()})
     }).collect();
     auth.sort_by_key(|x| x["table"].as_str().unwrap_or("").to_string());
     json!({

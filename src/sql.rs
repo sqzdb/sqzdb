@@ -1703,8 +1703,9 @@ impl<'a> Sink<'a> {
 }
 
 pub struct Sql { pub db: Arc<Database>, cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>, pub acl: std::sync::RwLock<Acl>, pub epoch: Arc<std::sync::atomic::AtomicU64>, alters: Mutex<Vec<std::thread::JoinHandle<Result<(), String>>>>, pub live: std::sync::OnceLock<Arc<crate::live::Reactor>>,
-    /// The configuration this database was opened with (defaults when opened through the lab constructors).
-    pub cfg: crate::config::Config, pub(crate) services: Mutex<Option<Services>>,
+    /// The configuration as the server runs with it (defaults when opened through the lab constructors): read through
+    /// `cfg()`, and put in place anew by `reload_config` for what can change while running; `cfg_gen` counts the reloads.
+    cfg: std::sync::RwLock<Arc<crate::config::Config>>, cfg_gen: std::sync::atomic::AtomicU64, pub(crate) services: Mutex<Option<Services>>,
     /// Sign-in bookkeeping (failed attempts, the session sweep): see `auth.rs`.
     pub(crate) auth: crate::auth::AuthState,
     /// Provider sign-ins in progress and cached signing keys: see `oauth.rs`.
@@ -1780,7 +1781,29 @@ pub struct Follower { pub applied: Arc<std::sync::atomic::AtomicU64>, stop: Arc<
 impl Follower { pub fn applied(&self) -> u64 { self.applied.load(std::sync::atomic::Ordering::Acquire) } }
 impl Drop for Follower { fn drop(&mut self) { self.stop.store(true, std::sync::atomic::Ordering::Relaxed); if let Some(h) = self.thread.take() { h.join().ok(); } } }
 impl Sql {
-    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: crate::config::Config::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), files: Default::default(), vectors: Default::default(), functions: Default::default(), dir_lock: Mutex::new(None) } }
+    pub fn new(db: Arc<Database>) -> Sql { Sql { db, cache: Arc::new(Mutex::new(HashMap::new())), acl: std::sync::RwLock::new(Acl::default()), epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)), alters: Mutex::new(vec![]), live: std::sync::OnceLock::new(), cfg: std::sync::RwLock::new(Arc::new(crate::config::Config::default())), cfg_gen: Default::default(), services: Mutex::new(None), auth: Default::default(), oauth: Default::default(), files: Default::default(), vectors: Default::default(), functions: Default::default(), dir_lock: Mutex::new(None) } }
+    /// The configuration as the server runs with it now. A reload swaps it whole, so take it once per request.
+    pub fn cfg(&self) -> Arc<crate::config::Config> { self.cfg.read().unwrap().clone() }
+    /// Bumped by every reload: the app listener rebuilds what it derived from the configuration when this changes.
+    pub fn cfg_generation(&self) -> u64 { self.cfg_gen.load(std::sync::atomic::Ordering::Acquire) }
+    /// Put `new` in place of the running configuration, for everything that can change while the server runs. What
+    /// can't (the listeners, TLS, durability, backup, following, snapshots, the log, embeddings, the functions folder
+    /// and its instance count) stays as it is, and the names of those that differ are returned: they take effect at the
+    /// next start. Refused, with nothing changed, when it names a role that doesn't exist.
+    pub fn reload_config(&self, new: crate::config::Config) -> Result<Vec<&'static str>, String> {
+        if let Some(r) = &new.app.anonymous_role { if !self.acl.read().unwrap().roles.contains(r) { return Err(format!("app.anonymousRole: no such role {r}")); } }
+        let cur = self.cfg();
+        let pending = crate::config::restart_only(&cur, &new);
+        let mut next = new;
+        next.listen = cur.listen.clone(); next.app.tls = cur.app.tls.clone(); next.durable = cur.durable.clone(); next.backup = cur.backup.clone(); next.follow = cur.follow.clone();
+        next.snapshot = cur.snapshot.clone(); next.log = cur.log.clone(); next.embed = cur.embed.clone(); next.recover_threads = cur.recover_threads; next.create = cur.create; next.make_users = cur.make_users;
+        next.functions.dir = cur.functions.dir.clone(); next.functions.watch = cur.functions.watch; next.functions.instances = cur.functions.instances;
+        // the users table sqzdb made stays open to sign-up unless the file says otherwise (as at open)
+        if self.users_made() && next.app.sign_up.is_empty() { next.app.sign_up.insert("users".into(), vec!["name".into()]); }
+        *self.cfg.write().unwrap() = Arc::new(next);
+        self.cfg_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(pending)
+    }
     /// Build the new schema and the old-row -> new-row converter for a list of ALTER operations.
     fn alter_schema(old: &Schema, ops: &[AlterOp]) -> Result<(Schema, Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>), String> {
         // working list: (column, source: Some(old index) | None, default, retyped from old type)
@@ -1883,10 +1906,14 @@ impl Sql {
         }
         let db = Arc::new(Database::open(dir, cfg.durable == Durability::Fsync));
         crate::table::write_meta_if_missing(dir).map_err(|e| format!("{}: cannot write {}: {e}", dir.display(), crate::table::META_FILE))?;
-        let mut sql = Sql::new(db.clone()); sql.cfg = cfg.clone();
+        let mut sql = Sql::new(db.clone()); sql.cfg = std::sync::RwLock::new(Arc::new(cfg.clone()));
         db.recover(cfg.recover_threads, &mut |text| sql.apply_meta(text))?;
         db.log.st.lock().unwrap().sync_delay = cfg.log.sync_delay;
         match cfg.log.threads_idle_after { Some(d) => db.start_idle(d), None => db.start() }
+        // the standalone server with the app API on (`make_users`): a users table, unless the app brought its own. The
+        // one sqzdb made is open to sign-up, with `name`, unless app.signUp says otherwise
+        if cfg.make_users { sql.make_users()?; }
+        if sql.users_made() && sql.cfg().app.sign_up.is_empty() { let mut c = (*sql.cfg()).clone(); c.app.sign_up.insert("users".into(), vec!["name".into()]); *sql.cfg.write().unwrap() = Arc::new(c); }
         let sql = Arc::new(sql);
         if restored { sql.check_restored_files(); }   // the bucket's files against the restored records
         for (name, _) in sql.db.tables_with_shadow() { sql.resume_copy(name); }   // resume an interrupted ALTER
@@ -1910,7 +1937,7 @@ impl Sql {
         if let Some(a) = &cfg.listen.http { sv.listeners.push(start_http(&sql, a, cfg.listen.token.as_deref().unwrap_or(""))?); }
         if let Some(a) = &cfg.listen.app { sv.listeners.push(crate::app::start(sql.clone(), a)?); }
         if sql.db.table(crate::files::FILES).is_some() { sql.files_gc_start(); }
-        if sql.cfg.embed.is_some() { sql.vectors_start(); }
+        if sql.cfg().embed.is_some() { sql.vectors_start(); }
         else if let Some(t) = sql.db.table_names().iter().find(|n| sql.db.table(n).is_some_and(|t| t.schema.columns.iter().any(|c| c.embed.is_some()))) { eprintln!("embed: {t} has generated VECTOR columns; set [embed] to have them filled"); }
         *sql.services.lock().unwrap() = Some(sv);
         Ok(sql)
@@ -2026,6 +2053,7 @@ impl Sql {
     /// Execute a catalog statement (DDL or ACL) without logging it.
     fn apply_meta(&self, text: &str) -> Result<(), String> {
         if text == LONG_TEXT_ERA { self.db.long_era.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
+        if text == crate::auth::USERS_MADE { self.auth.made_users.store(true, std::sync::atomic::Ordering::Release); return Ok(()); }
         if let Some(j) = text.strip_prefix(crate::functions::FUNCTIONS_META) { self.functions_from_catalog(j); return Ok(()); }
         let legacy = !self.db.long_era.load(std::sync::atomic::Ordering::Acquire);
         LEGACY_TEXT.with(|l| l.set(legacy)); let r = self.apply_meta_in(text); LEGACY_TEXT.with(|l| l.set(false)); r

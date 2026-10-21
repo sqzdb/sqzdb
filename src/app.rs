@@ -75,7 +75,24 @@ const OUT_QUEUE: usize = 64;
 /// `upstream`: the app behind the API (`app.proxy`); `tls`: whether the API speaks https.
 /// `turns`: the app's code (functions, middleware, routes) runs on this runtime's threads, at most this many at once;
 /// the rest wait as tasks, not threads, so a flood of one can't stall everything else.
-struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore, links: Arc<Links>, mcp: crate::mcp::McpState, upstream: Option<crate::proxy::Upstream>, tls: bool, turns: tokio::sync::Semaphore, turn_wait: Duration }
+struct AppState { limits: Mutex<HashMap<IpAddr, (f64, Instant)>>, codes: Mutex<HashMap<String, (J, String, Instant)>>, hashing: tokio::sync::Semaphore, mcp: crate::mcp::McpState, tls: bool, turns: tokio::sync::Semaphore, turn_wait: Duration,
+    /// derived from the configuration, with the reload count they were derived at (`Sql::cfg_generation`): the file
+    /// links' base and the app behind the API follow a reload
+    links: std::sync::RwLock<(u64, Arc<Links>)>, upstream: std::sync::RwLock<(u64, Option<Arc<crate::proxy::Upstream>>)> }
+impl AppState {
+    /// What was derived from the configuration, made again when it has been reloaded since.
+    fn refresh(&self, sql: &Sql) {
+        let g = sql.cfg_generation();
+        if self.upstream.read().unwrap().0 == g { return; }
+        let cfg = sql.cfg();
+        let up = cfg.app.proxy.as_ref().map(|p| Arc::new(crate::proxy::Upstream::new(p)));
+        let links = Links::load(sql).ok().map(Arc::new);
+        let mut u = self.upstream.write().unwrap();
+        if u.0 != g { *u = (g, up); if let Some(l) = links { *self.links.write().unwrap() = (g, l); } }
+    }
+    fn upstream(&self, sql: &Sql) -> Option<Arc<crate::proxy::Upstream>> { self.refresh(sql); self.upstream.read().unwrap().1.clone() }
+    fn links(&self, sql: &Sql) -> Arc<Links> { self.refresh(sql); self.links.read().unwrap().1.clone() }
+}
 /// Links to files: signed with this database's key (`files/link.key`), under `base` (`app.publicUrl`, or none: a link
 /// relative to the API), and working for a `ttl`. A link's expiry is rounded to half the ttl, so the same file gets
 /// the same link for a while and browsers can cache it.
@@ -91,7 +108,7 @@ impl Links {
             o.open(&p).and_then(|mut f| { use std::io::Write; f.write_all(&k)?; f.sync_all() }).map_err(|e| format!("files: {}: {e}", p.display()))?;
             k.to_vec()
         } };
-        Ok(Links { key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key), base: sql.cfg.app.public_url.clone().unwrap_or_default(), ttl: sql.cfg.app.file_link_ttl.as_secs() as i64 })
+        Ok(Links { key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key), base: sql.cfg().app.public_url.clone().unwrap_or_default(), ttl: sql.cfg().app.file_link_ttl.as_secs() as i64 })
     }
     fn sig(&self, id: &str, exp: i64) -> String { ring::hmac::sign(&self.key, format!("{id}.{exp}").as_bytes()).as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect() }
     fn url(&self, id: &str) -> String { let half = (self.ttl / 2).max(1); let exp = (now_secs() / half + 2) * half; format!("{}/api/files/{id}?e={exp}&s={}", self.base, self.sig(id, exp)) }
@@ -119,7 +136,7 @@ impl Shape {
 /// Whether statements may wait on something slow besides the CPU: a commit's fsync or the bucket, or (with
 /// `[embed]`) the embeddings endpoint, which any statement may call through `embed()`. Those run off the runtime's
 /// threads. (Deciding by the statement's text would be fooled by `embed (` or a JSON escape.)
-fn sql_may_wait(sql: &Sql) -> bool { sql.cfg.durable != Durability::Visible || sql.cfg.embed.is_some() }
+fn sql_may_wait(sql: &Sql) -> bool { sql.cfg().durable != Durability::Visible || sql.cfg().embed.is_some() }
 impl AppState {
     /// A token bucket per client address for sign-up, sign-in and code exchange: 10 at once, then one every 3 s.
     fn allow(&self, ip: IpAddr) -> bool {
@@ -134,27 +151,28 @@ impl AppState {
 }
 
 pub fn start(sql: Arc<Sql>, addr: &str) -> Result<crate::net::Listener, String> {
-    if let Some(r) = &sql.cfg.app.anonymous_role { if !sql.acl.read().unwrap().roles.contains(r) { return Err(format!("app.anonymousRole: no such role {r}")); } }
+    if let Some(r) = &sql.cfg().app.anonymous_role { if !sql.acl.read().unwrap().roles.contains(r) { return Err(format!("app.anonymousRole: no such role {r}")); } }
     let fail = |e: io::Error| format!("listen.app {addr}: {e}");
     let std_listener = std::net::TcpListener::bind(addr).map_err(fail)?; std_listener.set_nonblocking(true).map_err(fail)?;
     let local = std_listener.local_addr().map_err(fail)?;
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4);
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).max_blocking_threads(64).thread_name("sqzdb-app").enable_all().build().map_err(fail)?;
     let listener = { let _in = rt.enter(); tokio::net::TcpListener::from_std(std_listener).map_err(fail)? };
-    let tls = match &sql.cfg.app.tls { Some(p) => Some(Arc::new(crate::tls::Tls::start(p, &sql.db.dir, rt.handle())?)), None => None };
-    if let Some(p) = sql.cfg.app.tls.as_ref().filter(|p| p.redirect.is_some()) {
+    let tls = match &sql.cfg().app.tls { Some(p) => Some(Arc::new(crate::tls::Tls::start(p, &sql.db.dir, rt.handle())?)), None => None };
+    if let Some(p) = sql.cfg().app.tls.as_ref().filter(|p| p.redirect.is_some()) {
         let to = p.redirect.clone().unwrap_or_default();
-        let hosts = if !p.domains.is_empty() { p.domains.clone() } else { sql.cfg.app.public_url.as_deref().and_then(|u| u.split('/').nth(2)).map(|h| vec![h.split(':').next().unwrap_or(h).to_string()]).ok_or("app.tls.redirect: needs app.tls.domains or app.publicUrl, the host to send browsers to")? };
+        let hosts = if !p.domains.is_empty() { p.domains.clone() } else { sql.cfg().app.public_url.as_deref().and_then(|u| u.split('/').nth(2)).map(|h| vec![h.split(':').next().unwrap_or(h).to_string()]).ok_or("app.tls.redirect: needs app.tls.domains or app.publicUrl, the host to send browsers to")? };
         let l = std::net::TcpListener::bind(&to).and_then(|l| l.set_nonblocking(true).map(|()| l)).map_err(|e| format!("app.tls.redirect {to}: {e}"))?;
         let l = { let _in = rt.enter(); tokio::net::TcpListener::from_std(l).map_err(|e| format!("app.tls.redirect {to}: {e}"))? };
         rt.spawn(crate::tls::redirect(l, hosts, Some(local.port()).filter(|p| *p != 443)));
     }
     let links = Arc::new(Links::load(&sql)?);
-    let upstream = { let _in = rt.enter(); sql.cfg.app.proxy.as_ref().map(crate::proxy::Upstream::new) };
-    let (sql_turns, turn_wait) = (sql.cfg.functions.instances, (sql.cfg.functions.timeout * 4).max(Duration::from_secs(5)));
+    let upstream = { let _in = rt.enter(); sql.cfg().app.proxy.as_ref().map(|p| Arc::new(crate::proxy::Upstream::new(p))) };
+    let (sql_turns, turn_wait) = (sql.cfg().functions.instances, (sql.cfg().functions.timeout * 4).max(Duration::from_secs(5)));
+    let g = sql.cfg_generation();
     let weak = Arc::downgrade(&sql); drop(sql);
-    let st = Arc::new(AppState { limits: Default::default(), codes: Default::default(), hashing: tokio::sync::Semaphore::new(workers), links, mcp: Default::default(), upstream, tls: tls.is_some(),
-                                 turns: tokio::sync::Semaphore::new(sql_turns), turn_wait });
+    let st = Arc::new(AppState { limits: Default::default(), codes: Default::default(), hashing: tokio::sync::Semaphore::new(workers), mcp: Default::default(), tls: tls.is_some(),
+                                 turns: tokio::sync::Semaphore::new(sql_turns), turn_wait, links: std::sync::RwLock::new((g, links)), upstream: std::sync::RwLock::new((g, upstream)) });
     Ok(crate::net::spawn_listener(local, move |stop| {
         rt.block_on(async move {
             loop {
@@ -234,7 +252,7 @@ fn allowed_origin(sql: &Sql, req: &Req) -> Result<Option<String>, ()> {
     let o = o.trim_end_matches('/').to_string();
     let host = req.headers.get("host").map(|h| h.as_str()).unwrap_or("");
     let same = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")).map(|h| h.eq_ignore_ascii_case(host)).unwrap_or(false);
-    let cfg = &sql.cfg.app;
+    let cfg = &sql.cfg().app;
     if same || cfg.public_url.as_deref() == Some(o.as_str()) || cfg.origins.iter().any(|x| x == "*" || x.eq_ignore_ascii_case(&o)) { Ok(Some(o)) } else { Err(()) }
 }
 fn cors(origin: &Option<String>) -> Vec<(String, String)> {
@@ -246,14 +264,14 @@ fn session_for(sql: &Sql, token: Option<&str>) -> Result<Session, J> {
     let mut s = Session::default();
     match token {
         Some(t) => sql.session_from_token(&mut s, t).map_err(err_json)?,
-        None => match &sql.cfg.app.anonymous_role { Some(r) => sql.assume(&mut s, &[r.clone()], HashMap::new()).map_err(err_json)?, None => return Err(json!({"error": "session: sign in first", "code": "AUTH"})) },
+        None => match &sql.cfg().app.anonymous_role { Some(r) => sql.assume(&mut s, &[r.clone()], HashMap::new()).map_err(err_json)?, None => return Err(json!({"error": "session: sign in first", "code": "AUTH"})) },
     }
     Ok(s)
 }
 /// A socket's session before it signs in, and after it signs out: the anonymous role, if any.
 fn anonymous_session(sql: &Sql) -> Session {
     let mut s = Session::default();
-    if let Some(r) = &sql.cfg.app.anonymous_role { let _ = sql.assume(&mut s, &[r.clone()], HashMap::new()); }
+    if let Some(r) = &sql.cfg().app.anonymous_role { let _ = sql.assume(&mut s, &[r.clone()], HashMap::new()); }
     s
 }
 /// A statement a client may send: SELECT, INSERT, UPDATE or DELETE, of bounded size.
@@ -277,7 +295,7 @@ pub(crate) fn run(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> Result
     let p = client_statement(sql, v.get("sql").and_then(|s| s.as_str()).unwrap_or(""))?;
     let params = params_of(v)?;
     let rows = sql.execute_s(sess, &p, &params).map_err(err_json)?;
-    let max = sql.cfg.app.max_rows;
+    let max = sql.cfg().app.max_rows;
     if rows.len() > max { return Err(json!({"error": format!("the result has more than {max} rows (app.maxRows); add a LIMIT"), "code": "ARGUMENTS"})); }
     let shape = Shape::of(sql, &p);
     let mut out = json!({"columns": names(&shape.cols), "rows": shape.rows(sql, links, &rows)});
@@ -301,7 +319,8 @@ pub(crate) fn run_batch(sql: &Sql, links: &Links, sess: &mut Session, v: &J) -> 
 /// column or one the table lists there. The column a user's role comes from is never a client's to set.
 fn sign_up_fields(sql: &Sql, table: &str, v: &J) -> Result<Vec<(String, Value)>, J> {
     let denied = |m: String| json!({"error": format!("permission denied: {m}"), "code": "DENIED"});
-    let Some(open) = sql.cfg.app.sign_up.get(&table.to_ascii_lowercase()) else { return Err(denied(format!("clients don't make accounts in {table} (app.signUp lists the tables they may)"))) };
+    let cfg = sql.cfg();
+    let Some(open) = cfg.app.sign_up.get(&table.to_ascii_lowercase()) else { return Err(denied(format!("clients don't make accounts in {table} (app.signUp lists the tables they may)"))) };
     let (t, at) = sql.auth_table_of(table).map_err(err_json)?;
     let fields = match v.get("fields") { None | Some(J::Null) => return Ok(vec![]), Some(J::Object(m)) => m, _ => return Err(json!({"error": "fields is an object", "code": "ARGUMENTS"})) };
     fields.iter().map(|(k, x)| {
@@ -339,9 +358,9 @@ pub(crate) fn return_ok(sql: &Sql, url: &str) -> bool {
     // under the API's OAuth server, only back to a sign-in in progress: its other URLs redirect on, and the sign-in's
     // code (in the fragment) would go with them
     if let Some(rest) = url.strip_prefix(origin.as_str()).filter(|r| r.starts_with("/oauth/")) {
-        return rest.strip_prefix("/oauth/authorize?request=").is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) && sql.cfg.app.public_url.as_deref() == Some(origin.as_str());
+        return rest.strip_prefix("/oauth/authorize?request=").is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) && sql.cfg().app.public_url.as_deref() == Some(origin.as_str());
     }
-    let cfg = &sql.cfg.app;
+    let cfg = &sql.cfg().app;
     cfg.public_url.as_deref() == Some(origin.as_str()) || cfg.origins.iter().any(|x| x.eq_ignore_ascii_case(&origin))
 }
 pub(crate) fn redirect(to: &str, cookies: &[String]) -> Vec<u8> {
@@ -481,7 +500,7 @@ async fn handlers(sql: &Arc<Sql>, st: &AppState, ip: IpAddr, mut req: hyper::Req
             }
         }
     };
-    for (def, params) in sql.middleware_for(&at) {
+    for (def, params) in sql.middleware_for(&at, false) {
         h.params = params;
         let Some(_turn) = turn(st).await else { return Err(busy()) };
         let r = tokio::task::block_in_place(|| sql.run_http(&mut sess, &def, &h, user.clone(), roles.clone()));
@@ -489,7 +508,7 @@ async fn handlers(sql: &Arc<Sql>, st: &AppState, ip: IpAddr, mut req: hyper::Req
         if let Some(a) = answer(r) { return Err(a); }
     }
     if h.headers != given { let map = as_left(req.headers(), &given, &h.headers); *req.headers_mut() = map; }
-    let Some((def, params)) = sql.route_for(&h.method, &at) else { return Ok(req) };
+    let Some((def, params)) = sql.route_for(&h.method, &at, false) else { return Ok(req) };
     let (_, mut body) = req.into_parts();
     h.params = params;
     h.body = Some(match read_body(&mut body, max).await { Ok(b) => b, Err(e) => return Err(into_response(json_resp(if e["code"] == "TOO_LARGE" { 413 } else { 400 }, &json!({"error": e["error"], "code": "ARGUMENTS"}), &[]))) });
@@ -519,11 +538,12 @@ fn handler_session(sql: &Sql, headers: &hyper::HeaderMap, host: Option<&str>) ->
     (s, None, roles)
 }
 /// Whether the app's middleware runs for a request to `path` (as sent): every path but the ones agents' clients drive
-/// by their protocols, `/mcp`, `/oauth/…` and `/.well-known/…`, which a middleware's answer would only break.
-pub(crate) fn guarded(path: &str) -> bool { !(path == "/mcp" || path.starts_with("/oauth/") || path.starts_with("/.well-known/")) }
+/// by their protocols (`/mcp`, `/oauth/…` and `/.well-known/oauth-…`, with `app.mcp` on), which a middleware's answer
+/// would only break. With `app.mcp` off those paths are the app's, and guarded like the rest.
+pub(crate) fn guarded(sql: &Sql, path: &str) -> bool { !crate::proxy::agent_path(sql, path) }
 /// Who a request with no sign-in acts for: `app.anonymousRole`, or no one, with no grants at all.
 pub(crate) fn visitor_session(sql: &Sql) -> (Session, Vec<String>) {
-    if let Some(r) = &sql.cfg.app.anonymous_role { let mut s = Session::default(); if sql.assume(&mut s, &[r.clone()], HashMap::new()).is_ok() { return (s, vec![r.clone()]); } }
+    if let Some(r) = &sql.cfg().app.anonymous_role { let mut s = Session::default(); if sql.assume(&mut s, &[r.clone()], HashMap::new()).is_ok() { return (s, vec![r.clone()]); } }
     (Session { user: Some("(no one)".into()), ..Session::default() }, vec![])
 }
 /// The session token a request carries: `Authorization: Bearer …`, or the session cookie (from the API's own site;
@@ -572,8 +592,8 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
     let (method, path) = (req.method().as_str().to_string(), req.uri().path().to_string());
     let (max, ip, trusted, ours) = {
         let Some(sql) = weak.upgrade() else { return into_response(respond(503, "text/plain", b"shutting down", &[])) };
-        let trusted = sql.cfg.app.trust_proxy.iter().any(|n| n.contains(peer));
-        (sql.cfg.app.max_request, crate::proxy::client_ip(&sql.cfg.app.trust_proxy, peer, req.headers()), trusted, crate::proxy::ours(&sql, &path))
+        let trusted = sql.cfg().app.trust_proxy.iter().any(|n| n.contains(peer));
+        (sql.cfg().app.max_request, crate::proxy::client_ip(&sql.cfg().app.trust_proxy, peer, req.headers()), trusted, crate::proxy::ours(&sql, &path))
     };
     // a request for the app, not the API: a client's X-Sqz-… are dropped (only the API sets them)
     if !ours {
@@ -582,8 +602,8 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
     }
     // the app's middleware runs, for the API's own endpoints as for the app's pages (the agent sign-in paths apart),
     // then a route of the app's answers it, or it goes on: to the API's endpoint, the app behind, or a file
-    if guarded(&path) {
-        if let Some(sql) = weak.upgrade() {
+    if let Some(sql) = weak.upgrade() {
+        if guarded(&sql, &path) {
             // the app's guards can't run: nothing is served unguarded meanwhile
             if sql.functions_broken() {
                 return into_response(if ours { json_resp(503, &json!({"error": "the deployed functions don't load, so nothing is served until they do; the server's log says why", "code": "FUNCTION"}), &[]) }
@@ -592,13 +612,14 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
             if sql.has_http() { req = match handlers(&sql, st, ip, req, max).await { Ok(r) => r, Err(answer) => return answer }; }
         }
     }
-    let proxied = st.upstream.is_some() && !ours;
+    let upstream = weak.upgrade().and_then(|s| st.upstream(&s));
+    let proxied = upstream.is_some() && !ours;
     if proxied {
         let host = host_of(&req); let who = weak.upgrade().map(|sql| identity(&sql, req.headers(), host.as_deref())).unwrap_or_default();
-        return st.upstream.as_ref().expect("an upstream").forward(req, ip, peer, trusted, st.tls, &who).await;
+        return upstream.as_ref().expect("an upstream").forward(req, ip, peer, trusted, st.tls, &who).await;
     }
-    if method == "GET" && path.trim_matches('/') == "api/socket" { return websocket(weak, st.links.clone(), req); }
-    if method == "GET" && path == "/mcp" && weak.upgrade().is_some_and(|s| s.cfg.app.mcp.is_some()) { return mcp_events(weak, req); }
+    if method == "GET" && path.trim_matches('/') == "api/socket" { let links = weak.upgrade().map(|s| st.links(&s)).unwrap_or_else(|| st.links.read().unwrap().1.clone()); return websocket(weak, links, req); }
+    if method == "GET" && path == "/mcp" && weak.upgrade().is_some_and(|s| s.cfg().app.mcp.is_some()) { return mcp_events(weak, req); }
     if method == "POST" && path == "/api/files" { return upload(weak, st, req).await; }
     if (method == "GET" || method == "HEAD") && path.starts_with("/api/files/") { return download(weak, st, req).await; }
     let (parts, mut body) = req.into_parts();
@@ -620,7 +641,7 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
 
 /// One HTTP request (not the socket): the whole response.
 fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
-    if let Some(r) = crate::mcp::handle(sql, &st.mcp, &st.links, ip, &|| st.allow(ip), req) { return r; }
+    if let Some(r) = crate::mcp::handle(sql, &st.mcp, &st.links(sql), ip, &|| st.allow(ip), req) { return r; }
     if let Some(r) = crate::signin::handle(sql, ip, &|| st.allow(ip), req) { return r; }
     let api = req.path.starts_with("/api/");
     let origin = match allowed_origin(sql, req) { Ok(o) => o, Err(()) if api => return json_resp(403, &json!({"error": "permission denied: this origin may not call the API (app.origins)", "code": "DENIED"}), &[]), Err(()) => None };
@@ -629,7 +650,7 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
     let path: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     match (req.method.as_str(), path.as_slice()) {
         ("OPTIONS", ["api", ..]) => { let mut h = h.clone(); h.extend([("Access-Control-Allow-Methods".into(), "GET, POST, OPTIONS".into()), ("Access-Control-Allow-Headers".into(), "Authorization, Content-Type".into()), ("Access-Control-Max-Age".into(), "600".into())]); respond(204, "text/plain", b"", &h) }
-        ("POST", ["api", op @ ("sql" | "batch")]) => reply(body_json(req).and_then(|v| { let mut s = session_for(sql, crate::signin::token_of(sql, req).as_deref())?; if *op == "sql" { run(sql, &st.links, &mut s, &v) } else { run_batch(sql, &st.links, &mut s, &v) } })),
+        ("POST", ["api", op @ ("sql" | "batch")]) => reply(body_json(req).and_then(|v| { let mut s = session_for(sql, crate::signin::token_of(sql, req).as_deref())?; if *op == "sql" { run(sql, &st.links(sql), &mut s, &v) } else { run_batch(sql, &st.links(sql), &mut s, &v) } })),
         ("POST", ["api", "fn", name]) => {
             let r = (if req.body.iter().all(|b| b.is_ascii_whitespace()) { Ok(J::Null) } else { body_json(req) }).and_then(|v| { let token = crate::signin::token_of(sql, req); let mut s = session_for(sql, token.as_deref())?; call(sql, &mut s, name, &v, token.is_none()) });
             match r { Err(e) if e["code"] == "NOT_FOUND" => json_resp(404, &e, &h), r => reply(r) }
@@ -642,8 +663,9 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
         }
         ("GET", ["api", "me"]) => reply(session_for(sql, crate::signin::token_of(sql, req).as_deref()).map(|s| json!({"user": J::Object(s.attrs.iter().map(|(k, v)| (k.clone(), value_json(v, None))).collect()), "roles": s.roles}))),
         ("GET", ["api", "auth", table, "methods"]) => reply(sql.auth_table_of(table).map_err(err_json).map(|_| {
-            let providers: Vec<&String> = if sql.cfg.app.public_url.is_some() { sql.cfg.auth.oauth.keys().collect() } else { vec![] };
-            json!({"signUp": sql.cfg.app.sign_up.contains_key(&table.to_ascii_lowercase()), "providers": providers})
+            let cfg = sql.cfg();
+            let providers: Vec<&String> = if cfg.app.public_url.is_some() { cfg.auth.oauth.keys().collect() } else { vec![] };
+            json!({"signUp": sql.cfg().app.sign_up.contains_key(&table.to_ascii_lowercase()), "providers": providers, "password": sql.cfg().auth.password})
         })),
         ("POST", ["api", "auth", "sign-out"]) => {
             if let Some(t) = crate::signin::token_of(sql, req) { let _ = sql.sign_out(&t); }
@@ -681,14 +703,14 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
                 _ => Err(json!({"error": "sign-in failed: an unknown or expired sign-in code, or one this page did not start; sign in again", "code": "AUTH"})),
             }
         }).map(|(signed, c)| signed_reply(sql, signed, c, &h)).unwrap_or_else(|e| json_resp(status_of(&e), &e, &h)) },
-        ("POST", ["api", "auth", table, op @ ("sign-up" | "sign-in")]) => if !st.allow(ip) { json_resp(429, &limited(), &h) } else { body_json(req).and_then(|v| {
+        ("POST", ["api", "auth", table, op @ ("sign-up" | "sign-in")]) => if !sql.cfg().auth.password { json_resp(403, &json!({"error": "password sign-in is off here (auth.password): sign in with a provider", "code": "DENIED"}), &h) } else if !st.allow(ip) { json_resp(429, &limited(), &h) } else { body_json(req).and_then(|v| {
             let pw = v.get("password").and_then(|p| p.as_str()).unwrap_or("");
             let r = if *op == "sign-up" { sql.sign_up(table, &sign_up_fields(sql, table, &v)?, pw) } else { sql.sign_in(table, v.get("login").and_then(|l| l.as_str()).unwrap_or(""), pw) };
             r.map(|si| (signed_json(sql, table, &si), v.get("cookie") == Some(&J::Bool(true)))).map_err(err_json)
         }).map(|(signed, c)| signed_reply(sql, signed, c, &h)).unwrap_or_else(|e| json_resp(status_of(&e), &e, &h)) },
         ("GET", ["api", "auth", table, "oauth", provider]) => {
             let back = req.query.get("return").cloned().unwrap_or_default();
-            let Some(base) = sql.cfg.app.public_url.clone() else { return json_resp(400, &json!({"error": "set app.publicUrl to sign in with a provider", "code": "CONFIG"}), &h) };
+            let Some(base) = sql.cfg().app.public_url.clone() else { return json_resp(400, &json!({"error": "set app.publicUrl to sign in with a provider", "code": "CONFIG"}), &h) };
             // `cookie=1`: the session comes back as the session cookie, and the browser to `return` on this site (the
             // API's own sign-in page, the client in cookie mode); otherwise as a one-time code for the page to trade
             let cookie_mode = req.query.get("cookie").map(String::as_str) == Some("1");
@@ -715,7 +737,7 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
             let result = match (req.query.get("error"), req.query.get("code"), req.query.get("state")) {
                 (Some(e), _, _) => Err(format!("sign-in failed: the provider answered {e}")),
                 _ if challenge.is_none() && !cookie_mode => Err("sign-in failed: this browser did not start this sign-in".into()),
-                (None, Some(code), Some(state)) => { let create = sql.cfg.app.sign_up.contains_key(&table.to_ascii_lowercase()); sql.oauth_finish_as(table, provider, code, state, &cookie(req, "sqz_oauth").unwrap_or_default(), create) }
+                (None, Some(code), Some(state)) => { let create = sql.cfg().app.sign_up.contains_key(&table.to_ascii_lowercase()); sql.oauth_finish_as(table, provider, code, state, &cookie(req, "sqz_oauth").unwrap_or_default(), create) }
                 _ => Err("sign-in failed: the provider sent no code".into()),
             };
             match (back, result) {
@@ -732,7 +754,7 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
             }
         }
         ("GET", ["api", "client.js"]) => { let mut h = h.clone(); h.push(("Cache-Control".into(), "no-cache".into())); respond(200, "text/javascript; charset=utf-8", CLIENT_JS.as_bytes(), &h) }
-        ("GET", _) if !api => match &sql.cfg.app.static_dir { Some(dir) => static_file(dir, &req.path), None => respond(404, "text/plain", b"not found", &[]) },
+        ("GET", _) if !api => match &sql.cfg().app.static_dir { Some(dir) => static_file(dir, &req.path), None => respond(404, "text/plain", b"not found", &[]) },
         _ => json_resp(404, &json!({"error": "no such endpoint", "code": "ERROR"}), &h),
     }
 }
@@ -750,7 +772,7 @@ async fn upload(weak: &Weak<Sql>, st: &AppState, req: hyper::Request<Incoming>) 
     let ready = (|| -> Result<(u64, std::path::PathBuf), (u16, J)> {
         if origin.is_err() { return Err((403, json!({"error": "permission denied: this origin may not call the API (app.origins)", "code": "DENIED"}))); }
         let len = head.headers.get("content-length").and_then(|v| v.parse::<u64>().ok()).ok_or((411, json!({"error": "an upload needs a Content-Length", "code": "ARGUMENTS"})))?;
-        let max = sql.cfg.app.file_max;
+        let max = sql.cfg().app.file_max;
         if len > max { return Err((413, json!({"error": format!("the file is larger than {max} bytes (app.files.maxSize)"), "code": "ARGUMENTS"}))); }
         match crate::signin::token_of(&sql, &head) { Some(t) => sql.session_from_token(&mut sess, &t).map_err(|e| (401, err_json(e)))?, None => return Err((401, json!({"error": "session: sign in to upload files", "code": "AUTH"}))) }
         Ok((len, sql.file_staging().map_err(|e| (500, err_json(e)))?))
@@ -772,7 +794,7 @@ async fn upload(weak: &Weak<Sql>, st: &AppState, req: hyper::Request<Incoming>) 
     let sha = match copied { Ok(sha) => sha, Err(e) => { let _ = std::fs::remove_file(&staged); return reply(400, json!({"error": format!("upload: {e}"), "code": "ARGUMENTS"})) } };
     let name = head.query.get("name").cloned().unwrap_or_else(|| "file".into());
     let ctype = head.headers.get("content-type").cloned().unwrap_or_else(|| "application/octet-stream".into());
-    let added = { let (sql, links) = (sql.clone(), st.links.clone());
+    let added = { let (sql, links) = (sql.clone(), st.links(&sql));
         tokio::task::spawn_blocking(move || sql.file_add(&sess, &staged, &name, &ctype, len, sha).map(|m| file_json(&sql, &links, &m.id))).await };
     match added { Ok(Ok(v)) => reply(200, v), Ok(Err(e)) => reply(status_of(&err_json(e.clone())), err_json(e)), Err(_) => reply(500, json!({"error": "the upload failed", "code": "ERROR"})) }
 }
@@ -825,7 +847,7 @@ async fn download(weak: &Weak<Sql>, st: &AppState, req: hyper::Request<Incoming>
     let mut h = cors(&origin);
     let id = req.path["/api/files/".len()..].to_string();
     let q = |k: &str| req.query.get(k).map(String::as_str).unwrap_or("");
-    if !st.links.check(&id, q("e"), q("s")) { return into_response(json_resp(403, &json!({"error": "permission denied: this link is not one this server made, or it has expired; read the row again for a new one", "code": "DENIED"}), &h)); }
+    if !st.links(&sql).check(&id, q("e"), q("s")) { return into_response(json_resp(403, &json!({"error": "permission denied: this link is not one this server made, or it has expired; read the row again for a new one", "code": "DENIED"}), &h)); }
     let Some(m) = sql.file_meta(&id) else { return into_response(json_resp(404, &json!({"error": "no such file", "code": "NOT_FOUND"}), &h)) };
     let etag = format!("\"{}\"", m.sha256[..16].iter().map(|b| format!("{b:02x}")).collect::<String>());
     let age = q("e").parse::<i64>().unwrap_or(0) - now_secs();
@@ -934,7 +956,7 @@ async fn socket<R: AsyncRead + Unpin, W: AsyncWrite + Unpin + Send + 'static>(we
 /// The socket's reader: each message runs as the socket's session, and its replies queue for the writer.
 async fn read_loop<R: AsyncRead + Unpin>(weak: &Weak<Sql>, conn: &Arc<Conn>, r: &mut BufReader<R>, tx: &mpsc::Sender<Out>) -> io::Result<()> {
     let mut msg: Vec<u8> = vec![]; let mut text = false;
-    let Some(max) = weak.upgrade().map(|s| s.cfg.app.max_request) else { return Ok(()) };
+    let Some(max) = weak.upgrade().map(|s| s.cfg().app.max_request) else { return Ok(()) };
     loop {
         let (fin, op, p) = timeout(SOCKET_TIMEOUT, read_frame(r, max)).await.map_err(|_| io::Error::other("the client went quiet"))??;
         match op {
@@ -1013,7 +1035,7 @@ fn message(sql: &Arc<Sql>, conn: &Conn, v: &J) -> (Vec<J>, Option<(u64, Subscrip
                 if !matches!(p.plan, Plan::Select(_)) { return Err(json!({"error": "a live query is a SELECT", "code": "ARGUMENTS"})); }
                 let params = params_of(v)?; let shape = Shape::of(sql, &p);
                 let (sub, rows) = sql.reactor().watch(&conn.sess.lock().unwrap(), &p.text, &params).map_err(err_json)?;
-                if rows.len() > sql.cfg.app.max_rows { return Err(json!({"error": format!("the result has more than {} rows (app.maxRows); add a LIMIT", sql.cfg.app.max_rows), "code": "ARGUMENTS"})); }
+                if rows.len() > sql.cfg().app.max_rows { return Err(json!({"error": format!("the result has more than {} rows (app.maxRows); add a LIMIT", sql.cfg().app.max_rows), "code": "ARGUMENTS"})); }
                 let first = json!({"live": true, "initial": true, "columns": names(&shape.cols), "rows": shape.rows(sql, &conn.links, &rows)});
                 Ok((first, lid, sub, shape))
             })();

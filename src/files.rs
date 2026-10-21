@@ -110,7 +110,7 @@ impl Sql {
     }
     /// Hand a new file to the backup, if there is one; with `durable = "cloud"`, return once it is in the bucket.
     fn file_to_bucket(&self, id: &str) -> Result<(), String> {
-        let wait = self.cfg.durable == crate::config::Durability::Cloud;
+        let wait = self.cfg().durable == crate::config::Durability::Cloud;
         let rx = match self.services.lock().unwrap().as_ref().and_then(|s| s.files_backup.as_ref()) { Some(b) => b.put(id, wait), None => return Ok(()) };
         rx.map_or(Ok(()), |rx| rx.recv().unwrap_or_else(|_| Err("files: the backup stopped before the file reached the bucket".into())))
     }

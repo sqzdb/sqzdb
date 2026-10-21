@@ -154,3 +154,6 @@ jobs:
           # the package asks for exactly this version of each engine
           node -e "const f='bindings/node/package.json'; const p=require('./'+f); p.version='$v'; for (const k in p.optionalDependencies) p.optionalDependencies[k]='$v'; require('fs').writeFileSync(f, JSON.stringify(p, null, 2) + '\n')"
           publish bindings/node
+          # the browser client (@sqzdb/client): plain JavaScript with its types, no engine
+          node -e "const f='clients/js/package.json'; const p=require('./'+f); p.version='$v'; require('fs').writeFileSync(f, JSON.stringify(p, null, 2) + '\n')"
+          publish clients/js

@@ -58,6 +58,8 @@ export interface Definition<S extends Record<string, ArgType>, R> {
   method?: 'GET' | 'POST';
   /** Whether agents get it as an MCP tool (the default); false keeps it off their list. */
   mcp?: boolean;
+  /** false: deployed, but reachable from the console's Try panel only, not from the app, agents or the socket (NOT_FOUND). */
+  enabled?: boolean;
   /** Its result is any JSON value (a Date becomes its ISO text, BYTES 0x-prefixed hex). Throwing rolls the call back;
    *  an Error with a `code` (UPPER_CASE) gives the caller that code. */
   run(ctx: Context, args: ArgsOf<S>): R | Promise<R>;
@@ -107,6 +109,8 @@ export interface MiddlewareDefinition {
   match: Pattern | readonly Pattern[];
   /** Lower runs first (default 0); then by file and name. */
   order?: number;
+  /** false: deployed, but run by the console's Try panel only; the app server skips it. */
+  enabled?: boolean;
   /** Return a Response to answer the request; nothing to let it go on. */
   run(ctx: Context, req: Request): ResponseLike | void | Promise<ResponseLike | void>;
 }
@@ -117,6 +121,8 @@ export interface RouteDefinition {
   /** Who may call it; without roles, anyone (check `ctx.user` yourself). */
   roles?: readonly string[];
   description?: string;
+  /** false: deployed, but answered for the console's Try panel only; the app server passes the request on. */
+  enabled?: boolean;
   /** A Response; or a value, sent as JSON; or nothing (204). */
   run(ctx: Context, req: Request): unknown;
 }

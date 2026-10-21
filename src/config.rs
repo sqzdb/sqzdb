@@ -37,6 +37,9 @@ pub struct Config {
     pub embed: Option<EmbedPolicy>,
     /// The application's functions (`functions.rs`): a folder to deploy at open, and the sandbox's limits.
     pub functions: FunctionsPolicy,
+    /// Make the users table when nothing takes sign-ins yet (`auth.rs`, `USERS_TABLE`): set by the standalone server
+    /// when the app API is on, never from a file or the bindings' options.
+    pub make_users: bool,
 }
 /// `functions`: `dir`, a folder deployed at open (and again whenever it changes, with `watch`); how long one call may
 /// run, how much memory its instance may use, and how many calls run at once (each in its own instance).
@@ -47,7 +50,7 @@ impl Default for FunctionsPolicy { fn default() -> Self { FunctionsPolicy { dir:
 /// their vectors), and how many texts go in one request.
 #[derive(Clone, Debug)] pub struct EmbedPolicy { pub url: String, pub model: String, pub api_key: Option<String>, pub dimensions: Option<usize>, pub batch: usize }
 impl Default for Config {
-    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default(), embed: None, functions: FunctionsPolicy::default() } }
+    fn default() -> Config { Config { durable: Durability::Visible, create: true, recover_threads: 4, backup: None, follow: None, snapshot: SnapshotPolicy::default(), listen: Listen::default(), live: LivePolicy::default(), log: LogPolicy::default(), auth: AuthPolicy::default(), app: AppPolicy::default(), embed: None, functions: FunctionsPolicy::default(), make_users: false } }
 }
 impl Config {
     pub fn durable(mut self, d: Durability) -> Config { self.durable = d; self }
@@ -196,19 +199,44 @@ pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// A name a CA can check over TLS-ALPN-01: letters, digits and hyphens in dot-separated labels, no wildcard, not an IP.
 /// On this machine only (`listen.app` on 127.0.0.1, localhost or [::1], with a port): the address agents connect to
 /// and sign-in links use is the one it listens on, so trying MCP or a provider locally needs no `app.publicUrl`.
+/// The public URL an app address implies when none is set and there is no TLS: `http://localhost:<port>` for an
+/// address on every interface (where a browser on this machine reaches it, as PocketBase's default does), else
+/// `http://<host>:<port>` as given.
 fn local_url(listen: &str) -> Option<String> {
     let (host, port) = listen.rsplit_once(':')?;
-    if !["127.0.0.1", "localhost", "[::1]"].contains(&host) || port.is_empty() || port.len() > 5 || port == "0" || !port.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    if port.is_empty() || port.len() > 5 || port == "0" || !port.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    let host = match host { "" | "0.0.0.0" | "[::]" => "localhost", h => h };
     Some(format!("http://{host}:{port}"))
+}
+/// The settings that take effect only at the next start, of those that differ between `cur` (as the server runs) and
+/// `new` (as the file now reads): the listeners, TLS, durability, backup, following, snapshots, the log, embeddings,
+/// and the functions folder and instance count. Compared as they print, which every policy derives.
+pub fn restart_only(cur: &Config, new: &Config) -> Vec<&'static str> {
+    let mut out = vec![];
+    let mut d = |name: &'static str, a: String, b: String| if a != b { out.push(name) };
+    d("listen", format!("{:?}", cur.listen), format!("{:?}", new.listen));
+    d("app.tls", format!("{:?}", cur.app.tls), format!("{:?}", new.app.tls));
+    d("durable", format!("{:?}", cur.durable), format!("{:?}", new.durable));
+    d("backup", format!("{:?}", cur.backup), format!("{:?}", new.backup));
+    d("follow", format!("{:?}", cur.follow), format!("{:?}", new.follow));
+    d("snapshot", format!("{:?}", cur.snapshot), format!("{:?}", new.snapshot));
+    d("log", format!("{:?}", cur.log), format!("{:?}", new.log));
+    d("embed", format!("{:?}", cur.embed), format!("{:?}", new.embed));
+    d("functions.dir", format!("{:?}", cur.functions.dir), format!("{:?}", new.functions.dir));
+    d("functions.watch", format!("{:?}", cur.functions.watch), format!("{:?}", new.functions.watch));
+    d("functions.instances", format!("{:?}", cur.functions.instances), format!("{:?}", new.functions.instances));
+    out
 }
 fn is_dns_name(d: &str) -> bool {
     let label = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     d.len() <= 253 && d.split('.').all(label) && !d.rsplit('.').next().unwrap_or("").bytes().all(|b| b.is_ascii_digit())
 }
 /// Sign-in (see `auth.rs`): how long a session lasts, and the shortest password `signUp` and `setPassword` accept.
-#[derive(Clone, Debug)] pub struct AuthPolicy { pub session_ttl: Duration, pub password_min: usize, /// sign-in providers by name (see `oauth.rs`)
+#[derive(Clone, Debug)] pub struct AuthPolicy { pub session_ttl: Duration, pub password_min: usize,
+    /// whether people sign in (and up) with a password at all; off, the providers are the only way in
+    pub password: bool, /// sign-in providers by name (see `oauth.rs`)
     pub oauth: std::collections::BTreeMap<String, OAuthProvider> }
-impl Default for AuthPolicy { fn default() -> AuthPolicy { AuthPolicy { session_ttl: Duration::from_secs(30 * 24 * 3600), password_min: 8, oauth: Default::default() } } }
+impl Default for AuthPolicy { fn default() -> AuthPolicy { AuthPolicy { session_ttl: Duration::from_secs(30 * 24 * 3600), password_min: 8, password: true, oauth: Default::default() } } }
 /// How a provider tells who signed in: an OpenID Connect ID token (Google and others), or GitHub's user API.
 #[derive(Clone, Debug, PartialEq)] pub enum OAuthKind { Oidc, Github }
 /// An OAuth2 provider: the application's client id and secret, the provider's endpoints, and what to ask for.
@@ -288,7 +316,7 @@ pub struct ListenFile { pub socket: Option<String>, pub tcp: Option<String>, pub
 pub struct LiveFile { pub debounce: Option<Dur>, pub queue: Option<usize> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AuthFile { #[serde(alias = "session_ttl")] pub session_ttl: Option<Dur>, #[serde(alias = "password_min")] pub password_min: Option<usize>, pub oauth: Option<std::collections::BTreeMap<String, OAuthFile>> }
+pub struct AuthFile { #[serde(alias = "session_ttl")] pub session_ttl: Option<Dur>, #[serde(alias = "password_min")] pub password_min: Option<usize>, pub password: Option<bool>, pub oauth: Option<std::collections::BTreeMap<String, OAuthFile>> }
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OAuthFile { pub kind: Option<String>, #[serde(alias = "client_id")] pub client_id: Option<String>, #[serde(alias = "client_secret")] pub client_secret: Option<String>,
@@ -345,7 +373,7 @@ impl ConfigFile {
             embed: nest(self.embed, o.embed, |a, b| EmbedFile { url: pick(a.url, b.url), model: pick(a.model, b.model), api_key: pick(a.api_key, b.api_key), dimensions: pick(a.dimensions, b.dimensions), batch: pick(a.batch, b.batch) }),
             live: nest(self.live, o.live, |a, b| LiveFile { debounce: pick(a.debounce, b.debounce), queue: pick(a.queue, b.queue) }),
             log: nest(self.log, o.log, |a, b| LogFile { threads_idle_after: pick(a.threads_idle_after, b.threads_idle_after), sync_delay: pick(a.sync_delay, b.sync_delay) }),
-            auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min), oauth: nest(a.oauth, b.oauth, |mut x, y| { for (k, v) in y { let merged = match x.remove(&k) { Some(old) => old.overlay(v), None => v }; x.insert(k, merged); } x }) }),
+            auth: nest(self.auth, o.auth, |a, b| AuthFile { session_ttl: pick(a.session_ttl, b.session_ttl), password_min: pick(a.password_min, b.password_min), password: pick(a.password, b.password), oauth: nest(a.oauth, b.oauth, |mut x, y| { for (k, v) in y { let merged = match x.remove(&k) { Some(old) => old.overlay(v), None => v }; x.insert(k, merged); } x }) }),
         }
     }
     /// Defaults, validation, and typed values. Errors name the key.
@@ -455,6 +483,7 @@ impl ConfigFile {
         if let Some(a) = self.auth {
             if let Some(d) = a.session_ttl { let d = dur_of(d, "auth.sessionTtl")?; if d < Duration::from_secs(60) { return Err("auth.sessionTtl: at least 60s".into()); } c.auth.session_ttl = d; }
             if let Some(n) = a.password_min { if !(1..=256).contains(&n) { return Err("auth.passwordMin: between 1 and 256".into()); } c.auth.password_min = n; }
+            if let Some(p) = a.password { c.auth.password = p; }
             for (name, f) in a.oauth.unwrap_or_default() { if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') { return Err(format!("auth.oauth: provider names are letters, digits, - and _ (got {name:?})")); } c.auth.oauth.insert(name.clone(), resolve_oauth(&name, f)?); }
         }
         Ok(c)
@@ -534,9 +563,9 @@ mod tests {
         assert_eq!(url(r#"{"listen":{"app":"127.0.0.1:7780"}}"#).unwrap().as_deref(), Some("http://127.0.0.1:7780"));
         assert_eq!(url(r#"{"listen":{"app":"localhost:7780"},"app":{"mcp":{"sql":false}}}"#).unwrap().as_deref(), Some("http://localhost:7780"), "so MCP works here with nothing set");
         assert_eq!(url(r#"{"listen":{"app":"[::1]:7780"},"app":{}}"#).unwrap().as_deref(), Some("http://[::1]:7780"));
-        assert_eq!(url(r#"{"listen":{"app":"0.0.0.0:7780"}}"#).unwrap(), None, "an address others reach: the public one is theirs to say");
-        assert_eq!(url(r#"{"listen":{"app":"127.0.0.2:7780"}}"#).unwrap(), None);
-        assert!(url(r#"{"listen":{"app":"0.0.0.0:7780"},"app":{"mcp":{"sql":false}}}"#).unwrap_err().contains("publicUrl"));
+        assert_eq!(url(r#"{"listen":{"app":"0.0.0.0:7780"}}"#).unwrap().as_deref(), Some("http://localhost:7780"), "every interface: this machine's browser reaches it as localhost (the public one is theirs to set)");
+        assert_eq!(url(r#"{"listen":{"app":"127.0.0.2:7780"}}"#).unwrap().as_deref(), Some("http://127.0.0.2:7780"));
+        assert_eq!(url(r#"{"listen":{"app":"0.0.0.0:7780"},"app":{"mcp":{"sql":false}}}"#).unwrap().as_deref(), Some("http://localhost:7780"), "so MCP works on this machine with nothing set");
         assert_eq!(url(r#"{"listen":{"app":"127.0.0.1:7780"},"app":{"publicUrl":"https://api.example.com"}}"#).unwrap().as_deref(), Some("https://api.example.com"), "one given stays");
     }
     #[test] fn app_tls() {
