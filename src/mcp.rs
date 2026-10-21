@@ -376,7 +376,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
     let result: Result<J, (i64, String)> = match method {
         "initialize" => {
             let asked = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
-            let has_fns = sql.function_defs().iter().any(|d| crate::functions::may_call(d, &sess, false));
+            let has_fns = sql.function_defs().iter().any(|d| d.mcp && crate::functions::may_call(d, &sess, false));
             let instructions = match (has_fns, mcp.sql) {
                 (true, true) => "A database you act on as the user who connected you. Its own tools carry out its operations with their rules: use them for what they cover. For anything else, describe lists the tables you may use, their columns and who you are (SESSION values that row policies compare with); then query (SELECT) and execute (INSERT, UPDATE, DELETE), with ? placeholders and values in params.",
                 (true, false) => "A database you act on as the user who connected you, through its own tools: each carries out one operation, with its rules.",
@@ -390,7 +390,7 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let out = if sql.function_defs().iter().any(|d| d.name == name) {
+            let out = if sql.function_defs().iter().any(|d| d.name == name && d.mcp) {
                 // a function's result is any JSON; structured content is an object
                 sql.call_function(&mut sess, name, &args, false).map(|v| if v.is_object() { v } else { json!({"result": v}) }).map_err(|e| e.message)
             } else if mcp.sql && matches!(name, "describe" | "query" | "execute") { call(sql, links, mcp, &mut sess, name, &args) }
@@ -404,9 +404,9 @@ fn rpc(sql: &Sql, links: &Links, mcp: &crate::config::McpPolicy, req: &Req) -> V
     };
     json_out(200, &match result { Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}), Err((code, m)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": m}}) })
 }
-/// The app's functions `sess` may call, then (with `app.mcp.sql`) the SQL tools.
+/// The app's functions `sess` may call, those not marked `mcp: false`, then (with `app.mcp.sql`) the SQL tools.
 fn tools(sql: &Sql, sess: &Session, mcp: &crate::config::McpPolicy) -> J {
-    let mut out: Vec<J> = sql.function_defs().iter().filter(|d| crate::functions::may_call(d, sess, false)).map(|d| json!({
+    let mut out: Vec<J> = sql.function_defs().iter().filter(|d| d.mcp && crate::functions::may_call(d, sess, false)).map(|d| json!({
         "name": d.name, "title": title_case(&d.name), "description": d.description.clone().unwrap_or_else(|| format!("{} (from {})", d.name, d.file)),
         "inputSchema": crate::functions::input_schema(d), "annotations": {"readOnlyHint": d.read_only} })).collect();
     if mcp.sql { if let J::Array(t) = sql_tools() { out.extend(t); } }

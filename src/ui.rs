@@ -274,6 +274,7 @@ fn serve(weak: std::sync::Weak<Sql>, stream: TcpStream, token: &str) -> std::io:
                         ("GET", "/api/tables") => json_resp(&mut w, 200, &api_tables(&sql))?,
                         ("GET", "/api/status") => json_resp(&mut w, 200, &api_status(&sql))?,
                         ("GET", "/api/acl") => json_resp(&mut w, 200, &api_acl(&sql))?,
+                        ("POST", "/api/auth/sign-up") => { let (st, v) = api_sign_up(&sql, &req.body); json_resp(&mut w, st, &v)? }
                         ("GET", "/api/settings") => json_resp(&mut w, 200, &api_settings())?,
                         ("POST", "/api/settings") => { let (st, v) = api_save_settings(&req.body); json_resp(&mut w, st, &v)? }
                         ("POST", "/api/restart") => match restart_check() {
@@ -350,7 +351,7 @@ fn api_status(sql: &Sql) -> J {
     json!({ "dir": sql.db.dir.display().to_string(), "durable": match cfg.durable { Durability::Visible => "visible", Durability::Fsync => "fsync", Durability::Cloud => "cloud" }, "seq": seq, "durableSeq": durable, "logBytes": bytes,
             "snapshotsByPolicy": sql.snapshots_taken(), "snapshotPolicy": {"logBytes": cfg.snapshot.log_bytes, "idleAfterMs": cfg.snapshot.idle_after.map(|d| d.as_millis() as u64)},
             "altersInProgress": sql.db.tables_with_shadow().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-            "listen": {"socket": cfg.listen.socket.as_ref().map(|p| p.display().to_string()), "tcp": cfg.listen.tcp, "http": cfg.listen.http},
+            "listen": {"socket": cfg.listen.socket.as_ref().map(|p| p.display().to_string()), "tcp": cfg.listen.tcp, "http": cfg.listen.http, "app": cfg.listen.app},
             "backup": backup, "followerApplied": sql.follower_applied(), "tables": sql.db.table_names().len(), "reactor": sql.live.get().map(|r| json!({"events": r.events.load(Relaxed), "reruns": r.reruns.load(Relaxed)})) })
 }
 fn cmp_sym(c: crate::sql::Cmp) -> &'static str { use crate::sql::Cmp::*; match c { Eq => "=", Ne => "<>", Lt => "<", Le => "<=", Gt => ">", Ge => ">=", IsNull => "IS NULL", IsNotNull => "IS NOT NULL", In => "IN", NotIn => "NOT IN" } }
@@ -481,6 +482,18 @@ fn api_call(sql: &Sql, body: &[u8]) -> (u16, J) {
 }
 
 fn cmds_str(m: u8) -> Vec<&'static str> { let mut v = vec![]; if m & P_SELECT != 0 { v.push("SELECT"); } if m & P_INSERT != 0 { v.push("INSERT"); } if m & P_UPDATE != 0 { v.push("UPDATE"); } if m & P_DELETE != 0 { v.push("DELETE"); } v }
+/// An account in a sign-in table, made here as the application (whether sign-up is open to clients or not):
+/// `{"table", "fields": {column: value}, "password"}`. The row comes back; the session token doesn't (nobody here needs it).
+fn api_sign_up(sql: &Sql, body: &[u8]) -> (u16, J) {
+    let v: J = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return (400, json!({"error": format!("bad JSON: {e}"), "code": "ARGUMENTS"})) };
+    let table = v.get("table").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let fields: Vec<(String, Value)> = v.get("fields").and_then(|f| f.as_object()).map(|m| m.iter().map(|(k, x)| (k.clone(), j_to_value(x))).collect()).unwrap_or_default();
+    let password = v.get("password").and_then(|p| p.as_str()).unwrap_or("");
+    match sql.sign_up(&table, &fields, password) {
+        Ok(s) => (200, json!({"user": s.user.iter().map(|(k, x)| (k.clone(), value_json(x, None))).collect::<serde_json::Map<_, _>>(), "created": s.created})),
+        Err(e) => (400, json!({"error": e, "code": "AUTH"})),
+    }
+}
 fn api_acl(sql: &Sql) -> J {
     let a = sql.acl.read().unwrap();
     let mut roles: Vec<String> = a.roles.iter().cloned().collect(); roles.sort();

@@ -58,6 +58,18 @@ export const myJobs = fn({
   roles: ['member'],
   run: ({ db }) => db.all('SELECT id, title, status FROM jobs ORDER BY id DESC LIMIT 50'),
 })
+
+// reached over GET too, its arguments from the query string; agents get it as a tool like any other
+export const jobCount = fn({
+  description: 'How many of your jobs are in a status',
+  args: { status: 'text', mine: 'bool?' },
+  roles: ['member'],
+  method: 'GET',
+  run: ({ db }, { status, mine }) => ({ status, mine: mine ?? null, n: db.get('SELECT count(*) AS n FROM jobs WHERE status = ?', [status])!.n }),
+})
+
+// not a tool for agents
+export const secret = fn({ description: 'For the app only', roles: ['member'], mcp: false, run: () => 42 })
 `);
 fs.mkdirSync(`${fns}/lib`);
 fs.writeFileSync(`${fns}/lib/checks.ts`, `export function must<T>(v: T | null, code: string, message: string): T {
@@ -99,6 +111,14 @@ try {
   [st, v] = await call(ann, 'reportRun', { runId: runs[1], status: 'kaput' }); assert.deepEqual([st, v.code], [400, 'ARGUMENTS']); pr('a wrong argument', v.error);
   [st, v] = await call(ann, 'nope', {}); assert.deepEqual([st, v.code], [404, 'NOT_FOUND']);
   [st, v] = await call(null, 'myJobs', {}); assert.deepEqual([st, v.code], [401, 'AUTH'], 'no anonymous role: sign in first');
+  // a function with method: 'GET': its arguments in the query string, read as its args say
+  const get = async (path, token) => { const r = await fetch(base + path, { headers: token ? { authorization: `Bearer ${token}` } : {} }); return [r.status, await r.json()]; };
+  [st, v] = await get('/api/fn/jobCount?status=running&mine=true', ann); assert.deepEqual([st, v], [200, { result: { status: 'running', mine: true, n: 1 } }]);
+  [st, v] = await get('/api/fn/jobCount?status=running&mine=yes', ann); assert.deepEqual([st, v.code], [400, 'ARGUMENTS']); pr('a GET argument that isn\'t its type', v.error);
+  [st, v] = await get('/api/fn/myJobs', ann); assert.deepEqual([st, v.code], [405, 'METHOD']); pr('GET on a POST function', v.error);
+  [st, v] = await get('/api/fn/nope', ann); assert.deepEqual([st, v.code], [404, 'NOT_FOUND']);
+  [st, v] = await call(ann, 'jobCount', { status: 'running' }); assert.deepEqual([st, v.result.n], [200, 1], 'a GET function still answers POST');
+  [st, v] = await call(ann, 'secret', {}); assert.deepEqual([st, v], [200, { result: 42 }], 'mcp: false changes nothing for the app');
   // the rules can't be skipped: a member writes jobs and runs only through the functions
   v = await (await json('/api/sql', { sql: "UPDATE runs SET status = 'running' WHERE id = ?", params: [runs[0]] }, { authorization: `Bearer ${ann}` })).json();
   assert.equal(v.code, 'DENIED'); pr('ann updating runs herself', v.error);
@@ -134,7 +154,9 @@ try {
   const reader = events.body.getReader(); let said = '';
   const listChanged = (async () => { while (!said.includes('notifications/tools/list_changed')) { const { value, done } = await reader.read(); if (done) return false; said += new TextDecoder().decode(value); } return true; })();
   const tools = (await rpc('tools/list', {})).result.tools;
-  assert.deepEqual(tools.map((t) => t.name), ['myJobs', 'park', 'reportRun', 'startRun'], 'the functions, and no SQL tools');
+  assert.deepEqual(tools.map((t) => t.name).sort(), ['jobCount', 'myJobs', 'park', 'reportRun', 'startRun'], 'the functions but the one with mcp: false, and no SQL tools');
+  assert.equal(tools.find((t) => t.name === 'jobCount').annotations.readOnlyHint, true, 'a GET function is read-only');
+  assert.equal((await rpc('tools/call', { name: 'secret', arguments: {} })).error.code, -32602, 'mcp: false: not a tool, by name either');
   const report = tools.find((t) => t.name === 'reportRun');
   assert.deepEqual(report.inputSchema, { type: 'object', properties: { runId: { type: 'integer' }, status: { type: 'string', enum: ['completed', 'failed'] }, outcome: { type: 'string', description: 'what the run produced (Markdown)' } }, required: ['runId', 'status'], additionalProperties: false });
   assert.equal(tools.find((t) => t.name === 'myJobs').annotations.readOnlyHint, true);

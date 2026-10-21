@@ -1,6 +1,6 @@
 [package]
 name = "sqzdb"
-version = "0.13.1"
+version = "0.14.0"
 homepage = "https://sqzdb.dev"
 repository = "https://github.com/sqzdb/sqzdb"
 edition = "2024"
@@ -67,6 +67,13 @@ ui = []
 bundled = ["lab", "rusqlite/bundled"]
 
 # Release artifacts: `cargo build --profile dist` (what `make install` and the release workflow build)
+# The Node addon (bindings/node) is a member so it shares this lockfile and these profiles, and a release builds
+# the crate once for the command and the addon (make build WITH_NODE=1). A plain `cargo build` builds sqzdb alone;
+# the addon is `-p sqzdb_node` (make node, make node-dist).
+[workspace]
+members = ["bindings/node"]
+default-members = ["."]
+
 [profile.dist]
 inherits = "release"
 debug = false

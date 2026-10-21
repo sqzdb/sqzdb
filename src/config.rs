@@ -194,6 +194,13 @@ pub fn secure_url(u: &str) -> bool {
 }
 pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// A name a CA can check over TLS-ALPN-01: letters, digits and hyphens in dot-separated labels, no wildcard, not an IP.
+/// On this machine only (`listen.app` on 127.0.0.1, localhost or [::1], with a port): the address agents connect to
+/// and sign-in links use is the one it listens on, so trying MCP or a provider locally needs no `app.publicUrl`.
+fn local_url(listen: &str) -> Option<String> {
+    let (host, port) = listen.rsplit_once(':')?;
+    if !["127.0.0.1", "localhost", "[::1]"].contains(&host) || port.is_empty() || port.len() > 5 || port == "0" || !port.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    Some(format!("http://{host}:{port}"))
+}
 fn is_dns_name(d: &str) -> bool {
     let label = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     d.len() <= 253 && d.split('.').all(label) && !d.rsplit('.').next().unwrap_or("").bytes().all(|b| b.is_ascii_digit())
@@ -422,6 +429,7 @@ impl ConfigFile {
                 } }
                 c.app.tls = Some(TlsPolicy { domains, email: some(t.email), cert, key, acme, acme_root: some(t.acme_root).map(PathBuf::from), dir: some(t.dir).map(PathBuf::from), redirect: some(t.redirect) });
             }
+            if c.app.public_url.is_none() && c.app.tls.is_none() { c.app.public_url = c.listen.app.as_deref().and_then(local_url); }
             if let Some(m) = a.mcp {
                 let mut p = McpPolicy { users: m.users.filter(|u| !u.is_empty()).map(|u| u.to_ascii_lowercase()), ..McpPolicy::default() };
                 if let Some(d) = m.token_ttl { let d = dur_of(d, "app.mcp.tokenTtl")?; if d < Duration::from_secs(300) || d > Duration::from_secs(86400) { return Err("app.mcp.tokenTtl: between 5m and 1d".into()); } p.token_ttl = d; }
@@ -436,6 +444,7 @@ impl ConfigFile {
                 c.app.mcp = Some(p);
             }
         }
+        if c.app.public_url.is_none() && c.app.tls.is_none() { c.app.public_url = c.listen.app.as_deref().and_then(local_url); }
         if let Some(f) = self.functions.map(FunctionsIn::full) {
             c.functions.dir = f.dir.filter(|d| !d.is_empty()).map(PathBuf::from);
             if let Some(w) = f.watch { c.functions.watch = w; }
@@ -519,6 +528,16 @@ mod tests {
         assert_eq!(c.log.sync_delay, None, "fsync right away unless asked");
         assert_eq!(Config::from_json(r#"{"log":{"syncDelay":"200ms","threadsIdleAfter":"1s"}}"#).unwrap().log.sync_delay, Some(Duration::from_millis(200)));
         assert!(Config::from_json(r#"{"log":{"syncDelay":"5m"}}"#).unwrap_err().contains("syncDelay"));
+    }
+    #[test] fn a_local_app_address_is_its_own_public_url() {
+        let url = |j: &str| Config::from_json(j).map(|c| c.app.public_url);
+        assert_eq!(url(r#"{"listen":{"app":"127.0.0.1:7780"}}"#).unwrap().as_deref(), Some("http://127.0.0.1:7780"));
+        assert_eq!(url(r#"{"listen":{"app":"localhost:7780"},"app":{"mcp":{"sql":false}}}"#).unwrap().as_deref(), Some("http://localhost:7780"), "so MCP works here with nothing set");
+        assert_eq!(url(r#"{"listen":{"app":"[::1]:7780"},"app":{}}"#).unwrap().as_deref(), Some("http://[::1]:7780"));
+        assert_eq!(url(r#"{"listen":{"app":"0.0.0.0:7780"}}"#).unwrap(), None, "an address others reach: the public one is theirs to say");
+        assert_eq!(url(r#"{"listen":{"app":"127.0.0.2:7780"}}"#).unwrap(), None);
+        assert!(url(r#"{"listen":{"app":"0.0.0.0:7780"},"app":{"mcp":{"sql":false}}}"#).unwrap_err().contains("publicUrl"));
+        assert_eq!(url(r#"{"listen":{"app":"127.0.0.1:7780"},"app":{"publicUrl":"https://api.example.com"}}"#).unwrap().as_deref(), Some("https://api.example.com"), "one given stays");
     }
     #[test] fn app_tls() {
         let tls = |j: &str| Config::from_json(&format!(r#"{{"listen":{{"app":"0.0.0.0:443"}},"app":{{"tls":{j}}}}}"#));

@@ -1,7 +1,8 @@
 # Push a tag that matches Cargo.toml's version (v0.1.0 for version = "0.1.0") to publish a release with prebuilt
 # binaries and SHA256SUMS; install.sh downloads from it. The same builds make the Node package's engines, published to
-# npm when the repository has an NPM_TOKEN secret. Run it by hand (workflow_dispatch) to build the artifacts without
-# publishing.
+# npm when the repository has an NPM_TOKEN secret. The unit tests run here too, and nothing is published unless they
+# pass, so the tag can be pushed together with its commit. Run it by hand (workflow_dispatch) to build the artifacts
+# without publishing.
 name: release
 
 on:
@@ -13,6 +14,23 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test   # one cache with the ci workflow's unit tests
+      - name: Unit tests
+        run: make test
+
   build:
     name: build ${{ matrix.target }}
     strategy:
@@ -42,7 +60,7 @@ jobs:
             . -> target
             bindings/node -> target
       - name: Build and package
-        run: make dist TARGET=${{ matrix.target }} GLIBC=${{ matrix.glibc }} CARGO_BUILD="${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}"
+        run: make dist WITH_NODE=1 TARGET=${{ matrix.target }} GLIBC=${{ matrix.glibc }} CARGO_BUILD="${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}"
       - name: Smoke test (native targets)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
         run: target/${{ matrix.target }}/dist/sqzdb version
@@ -55,7 +73,7 @@ jobs:
         with:
           node-version: 20
       - name: Node engine
-        run: make node-dist TARGET=${{ matrix.target }} GLIBC=${{ matrix.glibc }} CARGO_BUILD="${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}"
+        run: make node-dist WITH_NODE=1 TARGET=${{ matrix.target }} GLIBC=${{ matrix.glibc }} CARGO_BUILD="${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}"
       - name: Node smoke test (installed from the packed packages, as a user would)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
         run: |
@@ -77,7 +95,7 @@ jobs:
 
   publish:
     name: publish the release
-    needs: build
+    needs: [build, test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

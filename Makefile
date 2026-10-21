@@ -26,8 +26,12 @@ INSTALLED   := $(DESTDIR)$(BINDIR)/$(BIN)
 .PHONY: all build install uninstall test dist node-dist lab bindings node python go clean help version
 all: build
 
+# WITH_NODE=1: the Node addon is compiled in the same invocation as the command, so the crate is compiled once for
+# both (one cargo run resolves features once; two runs don't agree and build it twice). The release workflow uses
+# it; node-dist then only packages. Not for musl, whose addon needs other flags (below).
+NODE_SHARED := $(and $(WITH_NODE),$(if $(findstring musl,$(TRIPLE)),,1))
 build:
-	$(CARGO_BUILD) --profile dist --bin $(BIN) $(if $(TARGET),--target $(TARGET)$(if $(GLIBC),.$(GLIBC)))
+	$(CARGO_BUILD) --profile dist --bin $(BIN) $(if $(NODE_SHARED),-p $(BIN) -p sqzdb_node --lib) $(if $(TARGET),--target $(TARGET)$(if $(GLIBC),.$(GLIBC)))
 	@echo "built $(OUT) ($(BIN) $(VERSION), $(TRIPLE))"
 
 install: build
@@ -52,18 +56,21 @@ dist: build
 	@echo "dist/$(BIN)-$(TRIPLE).tar.gz"; cat "dist/$(BIN)-$(TRIPLE).tar.gz.sha256"
 
 # The npm package with the engine for TARGET (or this machine): dist-npm/<platform>/ (see bindings/node/scripts).
-# musl needs a dynamic libc for a library Node loads, hence -crt-static.
+# The addon is a workspace member built in the dist profile: with WITH_NODE=1 it comes out of `build` (above) and is
+# only packaged here. musl needs a dynamic libc for a library Node loads, hence -crt-static: other flags, so it
+# builds apart (bindings/node/target) rather than invalidate the static build.
 NODE_LIB    := $(if $(findstring apple,$(TRIPLE)),libsqzdb_node.dylib,libsqzdb_node.so)
-node-dist:
-	cd bindings/node && $(if $(findstring musl,$(TRIPLE)),RUSTFLAGS="-C target-feature=-crt-static") $(CARGO_BUILD) --release $(if $(TARGET),--target $(TARGET)$(if $(GLIBC),.$(GLIBC)))
-	node bindings/node/scripts/npm-platform.mjs $(TRIPLE) bindings/node/target/$(if $(TARGET),$(TARGET)/)release/$(NODE_LIB) dist-npm $(VERSION)
+NODE_TARGET := $(if $(findstring musl,$(TRIPLE)),bindings/node/target,target)
+node-dist: $(if $(NODE_SHARED),build)
+	$(if $(NODE_SHARED),,CARGO_TARGET_DIR="$(abspath $(NODE_TARGET))" $(if $(findstring musl,$(TRIPLE)),RUSTFLAGS="-C target-feature=-crt-static") $(CARGO_BUILD) --profile dist -p sqzdb_node $(if $(TARGET),--target $(TARGET)$(if $(GLIBC),.$(GLIBC))))
+	node bindings/node/scripts/npm-platform.mjs $(TRIPLE) $(NODE_TARGET)/$(if $(TARGET),$(TARGET)/)dist/$(NODE_LIB) dist-npm $(VERSION)
 
 lab:
 	$(CARGO) build --release --features lab --bins
 
 bindings: node python go
 node:
-	cd bindings/node && $(CARGO) build --release && cp target/release/libsqzdb_node.so sqzdb.node
+	$(CARGO) build --release -p sqzdb_node && cp target/release/libsqzdb_node.so bindings/node/sqzdb.node
 python:
 	cd bindings/python && $(CARGO) build --release && cp target/release/libsqzdb_py.so sqzdb.so
 go:

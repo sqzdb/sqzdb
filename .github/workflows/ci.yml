@@ -21,15 +21,19 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test   # one cache with the release workflow's unit tests
       - name: Unit tests
         run: make test
+      # the tests compiled the crate already: the command links from that build (the release profile, not dist,
+      # which is built and checked by the release workflow)
       - name: Build the sqzdb command
-        run: make build && target/dist/sqzdb version
+        run: cargo build --release --bin sqzdb && target/release/sqzdb version
       - name: Experiments still compile (Linux; they link the system SQLite)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y libsqlite3-dev && cargo check --release --features lab --bins
       - uses: actions/upload-artifact@v4
         with:
           name: sqzdb-${{ runner.os }}-${{ runner.arch }}
-          path: target/dist/sqzdb
+          path: target/release/sqzdb
           retention-days: 7

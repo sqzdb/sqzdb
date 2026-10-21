@@ -53,6 +53,11 @@ export interface Definition<S extends Record<string, ArgType>, R> {
   roles?: readonly string[];
   /** It only reads: SELECT only, and agents see it as safe to call. */
   readOnly?: boolean;
+  /** How your app reaches it over HTTP: POST /api/fn/<name> with the arguments as JSON (the default, and always), or
+   *  'GET' to answer GET /api/fn/<name>?arg=value too, the arguments read as `args` say; a GET function only reads. */
+  method?: 'GET' | 'POST';
+  /** Whether agents get it as an MCP tool (the default); false keeps it off their list. */
+  mcp?: boolean;
   /** Its result is any JSON value (a Date becomes its ISO text, BYTES 0x-prefixed hex). Throwing rolls the call back;
    *  an Error with a `code` (UPPER_CASE) gives the caller that code. */
   run(ctx: Context, args: ArgsOf<S>): R | Promise<R>;

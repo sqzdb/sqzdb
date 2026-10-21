@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.13.1` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.14.0` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -496,6 +496,11 @@ in with a password, use the next section instead.
 Mark a table you define as the one users sign in to. Its `UNIQUE` text column is the login, and each
 user's role comes from a column or is fixed. A signed-in user acts with their row's columns as
 `SESSION` attributes, so policies such as `USING (owner = SESSION.id)` apply per user.
+
+In the console, **Access → Set up sign-in** does all of the below in one go: it creates the table (or takes
+one of yours), the `member` and `admin` roles, a grant and policy for a member's own row, and the sign-up
+setting, showing the SQL first; then it shows the sign-in page's address, the client snippet, and makes a
+test account. The rest of this section is what it generates.
 
 The table is yours: your columns, visible in the console, queried and joined like any other. Passwords and
 sessions are never in it. They live in sqzdb's own tables (`_auth_secrets`, `_auth_sessions`, and with
@@ -889,7 +894,9 @@ sqzdb deploy ./functions db.internal:7781 --token "$DB_TOKEN"   # to a running s
 
 Or with no folder at all: write, paste or upload files in the [web console](#web-console-and-command-line)'s
 **Functions** tab and deploy them from there. On a standalone server that's the whole backend: tables and
-policies from its SQL editor, the app's rules from its Functions tab.
+policies from its SQL editor, the app's rules from its Functions tab. Its **New** menu starts a function, a REST
+route or a middleware, each field explained; once deployed, every export shows where it is reached (`POST
+/api/fn/hello`, `GET /jobs/:id`, the paths a middleware runs before) and whether agents get it.
 
 - A deploy replaces every function before it. The same files again change nothing.
 - A deploy is stored in the catalog, so it is logged, snapshotted, backed up and copied to followers with
@@ -904,7 +911,9 @@ policies from its SQL editor, the app's rules from its Functions tab.
 - **Node:** `db.call('reportRun', { runId: 7, status: 'failed' })` on any handle: the app itself, `db.as(…)`
   or `db.session(token)`. Python has `session.call(name, args)`, Go `Session.Call` and C `sqzdb_call`.
 - **The browser client:** `await client.call('reportRun', { … })`, over its socket. Over plain HTTP it's
-  `POST /api/fn/reportRun` with the arguments as the JSON body; the answer is `{"result": …}`.
+  `POST /api/fn/reportRun` with the arguments as the JSON body; the answer is `{"result": …}`. A function with
+  `method: 'GET'` answers `GET /api/fn/myJobs?status=review` too, its arguments read from the query string as
+  `args` says; such a function only reads.
 - **Agents over MCP:** each function is a tool. Its `description` and `args` become the tool's
   description and input schema, and `readOnly` its read-only hint.
 
@@ -948,6 +957,8 @@ policies from its SQL editor, the app's rules from its Functions tab.
 - **`roles`** says who may call. Without it, anyone signed in may; the anonymous role
   (`app.anonymousRole`) only when it's listed.
 - **`readOnly: true`** allows `SELECT` only.
+- **`method: 'GET'`** lets it answer GET as well as POST (above), and makes it read-only.
+- **`mcp: false`** keeps it off the agents' tool list. Agents get every other function their user may call.
 
 **Arguments** are checked before the function runs:
 
@@ -1489,9 +1500,9 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.13.1`. The release workflow builds
-Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and publishes them with
-`SHA256SUMS` and `install.sh`.
+Releases are tags that match the version in `Cargo.toml`, such as `v0.14.0`. The release workflow runs the
+unit tests, builds Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and if all of
+that passes publishes them with `SHA256SUMS` and `install.sh`, so a tag is pushed together with its commit.
 
 ## Project status
 

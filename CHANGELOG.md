@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.14.0 — 2026-10-20
+
+### Added
+- **Set up sign-in, in the console.** The Access tab opens with the state of sign-in, and when nothing is set
+  up, a guided step: a new users table (or one of yours, with its login column found), the `member` and `admin`
+  roles, who may create an account (open, or invite only), what a member may do with their own row, and
+  providers, with the SQL and the setting it generates shown before they run. Once set up, the card shows the
+  sign-in page's address, the client snippet to sign up and in, and creates test accounts
+  (`POST /api/auth/sign-up` on the console).
+- **A function says how it is reached.** `method: 'GET'` lets `fn()` answer `GET /api/fn/<name>?arg=value` as well
+  as POST, the arguments read from the query string as `args` says; a GET function is read-only. `mcp: false` keeps
+  a function off the agents' tool list. A function given a `path` is refused with a pointer to `route()`.
+- **The Functions tab says what each export is.** New offers a function, a REST route or a middleware, each template
+  with its fields explained; the Exports list and the bar beside the open file show where each export is reached
+  (`POST /api/fn/hello`, `GET /jobs/:id`, the paths a middleware runs before) and whether agents get it.
+
+### Fixed
+- **MCP on this machine needed `app.publicUrl`.** When the app server listens on 127.0.0.1, localhost or [::1], the
+  public address is now that address, so agents and sign-in links work locally with nothing set. The Settings tab
+  shows, under the Agents (MCP) switch, the address agents will connect at as the form stands, or what is missing
+  for one, before you save; the app server's listen address is a field there too.
+
+### Changed
+- **The Settings tab says what each setting is.** Its sections are named for what they do (the app server, the
+  HTTPS certificate) rather than for their flags, each opens with a plain description, and every field has one.
+  The form gains the fields that explain the app server: your app behind it (the reverse proxy) and a static
+  files folder, and under HTTPS your own certificate and key as the alternative to Let's Encrypt.
+- **The npm engines are built like the command** (thin LTO, one codegen unit), from the same compilation: a
+  release builds the crate once per target, and runs the unit tests before publishing anything.
+
 ## 0.13.1 — 2026-10-20
 
 ### Fixed

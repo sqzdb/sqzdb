@@ -93,7 +93,7 @@ const HELPERS: &str = r#"(print, host) => {
   const dec = (s) => { try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch { return s; } };
   return {
     kind: (v) => v !== null && typeof v === 'object' && typeof v[MARK] === 'string' ? v[MARK] : null,
-    meta: (v) => toJson({ kind: v[MARK], description: v.description, args: v.args, argOrder: v.args !== null && typeof v.args === 'object' ? Object.keys(v.args) : [], roles: v.roles, readOnly: v.readOnly, match: v.match, order: v.order, path: v.path, method: v.method }),
+    meta: (v) => toJson({ kind: v[MARK], description: v.description, args: v.args, argOrder: v.args !== null && typeof v.args === 'object' ? Object.keys(v.args) : [], roles: v.roles, readOnly: v.readOnly, match: v.match, order: v.order, path: v.path, method: v.method, mcp: v.mcp }),
     // a request for middleware or a route: `text` and `bytes` its body (null for middleware, which gets the headers)
     request: (d, text, bytes) => {
       const headers = new Headers(d.headers); const cookies = {}, query = {};
@@ -130,7 +130,10 @@ impl ArgType {
 }
 #[derive(Clone, Debug)] pub struct Arg { pub name: String, pub ty: ArgType, pub optional: bool, pub description: Option<String> }
 /// A function as deployed: what callers see of it.
-#[derive(Clone, Debug)] pub struct Def { pub name: String, pub file: String, pub description: Option<String>, pub args: Vec<Arg>, pub roles: Option<Vec<String>>, pub read_only: bool, pub kind: Kind }
+/// `get`: a function with `method: 'GET'`, which answers `GET /api/fn/<name>?arg=value` too (read-only; the arguments
+/// come as text and are read as `args` says). `mcp`: agents get it as a tool (the default; `mcp: false` keeps it off
+/// their list).
+#[derive(Clone, Debug)] pub struct Def { pub name: String, pub file: String, pub description: Option<String>, pub args: Vec<Arg>, pub roles: Option<Vec<String>>, pub read_only: bool, pub kind: Kind, pub get: bool, pub mcp: bool }
 /// What an export is: a function clients call by name (`fn`), middleware that runs before requests to the paths it
 /// matches go on (in `order`, then by file and name), or a route that answers requests itself (`route`).
 #[derive(Clone, Debug, PartialEq)] pub enum Kind { Function, Middleware { matches: Vec<Pattern>, order: i64 }, Route { methods: Vec<String>, pattern: Pattern } }
@@ -659,6 +662,21 @@ fn def_of(file: &str, name: &str, m: &J) -> Result<Def, String> {
         _ => Kind::Function,
     };
     if kind != Kind::Function && m.get("args").is_some_and(|a| !a.is_null()) { return Err(format!("{at}: middleware and routes take a request, not args")); }
+    // how a function is reached: by name, at POST /api/fn/<name> (and GET too, read-only, with method: 'GET'); as a
+    // tool for agents unless mcp: false. A path of its own is a route.
+    let (mut get, mut mcp) = (false, true);
+    if kind == Kind::Function {
+        if m.get("path").is_some_and(|p| !p.is_null()) || m.get("match").is_some_and(|p| !p.is_null()) { return Err(format!("{at}: a function is called by name, at /api/fn/{name}; for a path of your own, route() (or middleware())")); }
+        get = match m.get("method") {
+            None | Some(J::Null) => false,
+            Some(J::String(x)) if x.eq_ignore_ascii_case("POST") => false,
+            Some(J::String(x)) if x.eq_ignore_ascii_case("GET") => true,
+            _ => return Err(format!("{at}: method is 'GET' or 'POST': a function is called at /api/fn/{name} (for other methods, and a path of your own, route())")),
+        };
+        if get && m.get("readOnly") == Some(&J::Bool(false)) { return Err(format!("{at}: a GET function is read-only (a GET must not change anything)")); }
+        mcp = match m.get("mcp") { None | Some(J::Null) => true, Some(J::Bool(b)) => *b, _ => return Err(format!("{at}: mcp is true or false (whether agents get it as a tool)")) };
+    } else if m.get("mcp").is_some_and(|x| !x.is_null()) { return Err(format!("{at}: middleware and routes aren't tools for agents: mcp is for fn()")); }
+    let read_only = read_only || get;
     let mut args = vec![];
     match m.get("args") {
         None | Some(J::Null) => {}
@@ -684,7 +702,7 @@ fn def_of(file: &str, name: &str, m: &J) -> Result<Def, String> {
     }
     // in the order the source lists them
     if let Some(order) = m.get("argOrder").and_then(|o| o.as_array()) { args.sort_by_key(|a| order.iter().position(|o| o.as_str() == Some(a.name.as_str())).unwrap_or(usize::MAX)); }
-    Ok(Def { name: name.into(), file: file.into(), description, args, roles, read_only, kind })
+    Ok(Def { name: name.into(), file: file.into(), description, args, roles, read_only, kind, get, mcp })
 }
 fn is_uuid(s: &str) -> bool { s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() }) }
 /// The arguments of a call, checked against the function's `args`.
@@ -845,6 +863,24 @@ impl Sql {
         let user = sess.user.is_some().then(|| sess.attrs.clone()); let roles = sess.roles.clone();
         match self.run_call(sess, &b, def, &Input::Args(&args), user, roles)? { Output::Json(j) => Ok(j), Output::Http(_) => unreachable!() }
     }
+    /// A call as `GET /api/fn/<name>?arg=value`, for a function with `method: 'GET'`: the arguments come as text and
+    /// are read as its `args` say (a number, true or false, JSON for `json`; anything else stays text), then checked
+    /// as any call's are. A function without `method: 'GET'` answers METHOD.
+    pub fn call_function_get(&self, sess: &mut Session, name: &str, query: &HashMap<String, String>, anonymous: bool) -> Result<J, FnError> {
+        let b = self.bundle_for(name)?;
+        let Some(def) = b.defs.iter().find(|d| d.name == name && d.kind == Kind::Function) else { return Err(FnError::new("NOT_FOUND", format!("no function {name}"))) };
+        if !def.get { return Err(FnError::new("METHOD", format!("{name} is called with POST and a JSON body (method: 'GET' in its definition would let it answer GET too)"))); }
+        let text = |v: &str| if v.is_empty() { J::Null } else { json!(v) };   // an empty value is left out (or, for text, is the empty text)
+        let args: serde_json::Map<String, J> = query.iter().map(|(k, v)| (k.clone(), match def.args.iter().find(|a| &a.name == k).map(|a| &a.ty) {
+            Some(ArgType::Int) => v.parse::<i64>().map(J::from).unwrap_or_else(|_| text(v)),
+            Some(ArgType::Number) => v.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| json!(f)).unwrap_or_else(|| text(v)),
+            Some(ArgType::Bool) => match v.as_str() { "true" => json!(true), "false" => json!(false), _ => text(v) },
+            Some(ArgType::Json) => serde_json::from_str(v).unwrap_or_else(|_| text(v)),
+            Some(ArgType::Uuid) | Some(ArgType::OneOf(_)) => text(v),
+            Some(ArgType::Text) | None => json!(v),
+        })).collect();
+        self.call_function(sess, name, &J::Object(args), anonymous)
+    }
     fn bundle_for(&self, name: &str) -> Result<Arc<Bundle>, FnError> {
         self.settle_functions();
         self.functions.bundle.read().unwrap().clone().ok_or_else(|| match self.functions.broken.read().unwrap().clone() { Some(e) => FnError::new("FUNCTION", format!("the deployed functions don't load: {e}")), None => FnError::new("NOT_FOUND", format!("no function {name} (none are deployed)")) })
@@ -864,6 +900,7 @@ impl Sql {
         J::Array(self.deployed().iter().map(|d| {
             let (kind, paths, methods) = match &d.kind { Kind::Function => ("function", vec![], vec![]), Kind::Middleware { matches, .. } => ("middleware", matches.iter().map(|p| p.text.clone()).collect(), vec![]), Kind::Route { methods, pattern } => ("route", vec![pattern.text.clone()], methods.clone()) };
             json!({"name": d.name, "file": d.file, "kind": kind, "description": d.description, "readOnly": d.read_only, "roles": d.roles, "paths": paths, "methods": methods,
+                   "method": if d.kind == Kind::Function { json!(if d.get { "GET" } else { "POST" }) } else { J::Null }, "mcp": if d.kind == Kind::Function { json!(d.mcp) } else { J::Null },
                    "args": d.args.iter().map(|a| json!({"name": a.name, "type": a.ty.describe(), "optional": a.optional, "description": a.description})).collect::<Vec<_>>(),
                    "inputSchema": if d.kind == Kind::Function { input_schema(d) } else { J::Null }})
         }).collect())
@@ -1052,6 +1089,30 @@ export const counts = fn({
         }
         let schema = input_schema(&s.function_defs()[0]);
         assert_eq!(schema["required"], json!(["n", "t", "k"])); assert_eq!(schema["properties"]["k"], json!({"type": "string", "enum": ["a", "b"]})); assert_eq!(schema["properties"]["t"]["description"], json!("a name"));
+    }
+    #[test] fn a_get_function_reads_its_arguments_from_the_query_and_only_reads() {
+        let d = tmp("get"); let s = open(&d, "{}"); let app = &mut Session::default();
+        s.exec_s(app, "CREATE TABLE t (id SERIAL PRIMARY KEY, n INT)", &[]).unwrap();
+        deploy(&s, &[("a.js", "import { fn } from 'sqzdb/functions'\nexport const echo = fn({ method: 'GET', args: { n: 'int', x: 'number?', ok: 'bool?', any: 'json?', t: 'text?', k: ['a', 'b'] }, run: (_, a) => a })\nexport const write = fn({ method: 'get', run: ({ db }) => db.run('INSERT INTO t (n) VALUES (1)') })\nexport const post = fn({ mcp: false, run: () => 1 })\n")]).unwrap();
+        let q = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+        assert_eq!(s.call_function_get(app, "echo", &q(&[("n", "5"), ("x", "1.5"), ("ok", "true"), ("any", "{\"a\":[1]}"), ("t", "hi"), ("k", "a")]), false).unwrap(), json!({"n": 5, "x": 1.5, "ok": true, "any": {"a": [1]}, "t": "hi", "k": "a"}));
+        assert_eq!(s.call_function_get(app, "echo", &q(&[("n", "5"), ("k", "b"), ("any", "plain"), ("x", ""), ("t", "")]), false).unwrap(), json!({"n": 5, "k": "b", "any": "plain", "x": null, "t": ""}), "text that isn't JSON stays text; an empty value is left out, or the empty text");
+        for (pairs, says) in [(&[("n", "five"), ("k", "a")][..], "n is a whole number, not \"five\""), (&[("n", "1"), ("k", "c")], "k is one of \"a\", \"b\", not \"c\""), (&[("k", "a")], "n is required"), (&[("n", "1"), ("k", "a"), ("zz", "1")], "no argument zz")] {
+            let e = s.call_function_get(app, "echo", &q(pairs), false).unwrap_err(); assert_eq!(e.code, "ARGUMENTS"); assert!(e.message.contains(says), "{} vs {says}", e.message);
+        }
+        let e = s.call_function_get(app, "write", &q(&[]), false).unwrap_err(); assert_eq!(e.code, "DENIED", "a GET function is read-only: {}", e.message);
+        let e = s.call_function_get(app, "post", &q(&[]), false).unwrap_err(); assert_eq!(e.code, "METHOD"); assert!(e.message.contains("POST"), "{}", e.message);
+        assert_eq!(s.call_function_get(app, "nope", &q(&[]), false).unwrap_err().code, "NOT_FOUND");
+        assert_eq!(s.call_function(app, "echo", &json!({"n": 1, "k": "a"}), false).unwrap(), json!({"n": 1, "k": "a"}), "a GET function still answers a call by name");
+        let defs = s.function_defs(); let by = |n: &str| defs.iter().find(|d| d.name == n).unwrap().clone();
+        assert!(by("echo").get && by("echo").read_only && by("echo").mcp, "GET implies read-only"); assert!(!by("post").get && !by("post").mcp && !by("post").read_only);
+        let ex = s.exports_json(); let ex = |n: &str| ex.as_array().unwrap().iter().find(|d| d["name"] == n).unwrap().clone();
+        assert_eq!((ex("echo")["method"].clone(), ex("echo")["mcp"].clone(), ex("post")["method"].clone(), ex("post")["mcp"].clone()), (json!("GET"), json!(true), json!("POST"), json!(false)));
+        for (src, says) in [("export const f = fn({ method: 'PUT', run: () => 1 })", "method is 'GET' or 'POST'"), ("export const f = fn({ method: 'GET', readOnly: false, run: () => 1 })", "read-only"),
+                            ("export const f = fn({ path: '/x', run: () => 1 })", "route()"), ("export const f = fn({ mcp: 'yes', run: () => 1 })", "mcp is true or false"), ("export const f = route({ path: '/x', mcp: false, run: () => 1 })", "mcp is for fn()")] {
+            let file = format!("import {{ fn, route }} from 'sqzdb/functions'\n{src}\n");
+            let e = deploy(&s, &[("a.js", file.as_str())]).unwrap_err(); assert!(e.contains(says), "{src}: {e}");
+        }
     }
 
     #[test] fn values_cross_into_javascript_and_back() {

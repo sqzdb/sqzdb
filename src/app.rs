@@ -13,7 +13,7 @@
 //!   signs nobody in.
 //! - `POST /api/sql` `{sql, params}`, `POST /api/batch` `{statements: [{sql, params}…]}` (one transaction).
 //! - `POST /api/fn/<name>` with the arguments as a JSON object: one of the app's functions (`functions.rs`), as the
-//!   caller; `{result}`.
+//!   caller; `{result}`. A function with `method: 'GET'` answers `GET /api/fn/<name>?arg=value` too (read-only).
 //! - `GET /api/socket`: a WebSocket carrying JSON messages: `auth`, `sql`, `batch`, `call`, `live` and `unlive`. A live
 //!   query sends its rows at once and again whenever they change; one socket carries any number of them. `auth`
 //!   with `token: null` signs the socket out, back to the anonymous role (if any).
@@ -222,7 +222,7 @@ fn json_resp(status: u16, v: &J, extra: &[(String, String)]) -> Vec<u8> {
     let mut h = extra.to_vec(); h.push(("Cache-Control".into(), "no-store".into()));
     respond(status, "application/json", v.to_string().as_bytes(), &h)
 }
-fn status_of(e: &J) -> u16 { match e.get("code").and_then(|c| c.as_str()) { Some("AUTH") => 401, Some("DENIED") => 403, Some("RATE_LIMITED") => 429, _ => 400 } }
+fn status_of(e: &J) -> u16 { match e.get("code").and_then(|c| c.as_str()) { Some("AUTH") => 401, Some("DENIED") => 403, Some("METHOD") => 405, Some("RATE_LIMITED") => 429, _ => 400 } }
 fn limited() -> J { json!({"error": "too many requests; slow down", "code": "RATE_LIMITED"}) }
 fn fn_json(e: crate::functions::FnError) -> J { json!({"error": e.message, "code": e.code}) }
 /// Call a function as `sess` (`anonymous`: the session is `app.anonymousRole`'s, not a sign-in): `{result}`.
@@ -591,7 +591,7 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
     let body = match read_body(&mut body, max).await { Ok(b) => b, Err(e) => return into_response(json_resp(if e["code"] == "TOO_LARGE" { 413 } else { 400 }, &json!({"error": e["error"], "code": "ARGUMENTS"}), &[])) };
     let req = req_of(&parts, body);
     let Some(sql) = weak.upgrade() else { return into_response(respond(503, "text/plain", b"shutting down", &[])) };
-    into_response(if req.method == "POST" && req.path.starts_with("/api/fn/") {
+    into_response(if (req.method == "POST" || req.method == "GET") && req.path.starts_with("/api/fn/") {
         // a function may run up to functions.timeout: this worker's other tasks move to another while it does, which
         // is cheaper per call than handing the call to the blocking pool and back; its turn first
         let Some(_turn) = turn(st).await else { return busy() };
@@ -618,6 +618,12 @@ fn handle(sql: &Sql, st: &AppState, ip: IpAddr, req: &Req) -> Vec<u8> {
         ("POST", ["api", op @ ("sql" | "batch")]) => reply(body_json(req).and_then(|v| { let mut s = session_for(sql, crate::signin::token_of(sql, req).as_deref())?; if *op == "sql" { run(sql, &st.links, &mut s, &v) } else { run_batch(sql, &st.links, &mut s, &v) } })),
         ("POST", ["api", "fn", name]) => {
             let r = (if req.body.iter().all(|b| b.is_ascii_whitespace()) { Ok(J::Null) } else { body_json(req) }).and_then(|v| { let token = crate::signin::token_of(sql, req); let mut s = session_for(sql, token.as_deref())?; call(sql, &mut s, name, &v, token.is_none()) });
+            match r { Err(e) if e["code"] == "NOT_FOUND" => json_resp(404, &e, &h), r => reply(r) }
+        }
+        // a function with method: 'GET': its arguments from the query string (read as its args say), read-only
+        ("GET", ["api", "fn", name]) => {
+            let token = crate::signin::token_of(sql, req);
+            let r = session_for(sql, token.as_deref()).and_then(|mut s| sql.call_function_get(&mut s, name, &req.query, token.is_none()).map(|r| json!({"result": r})).map_err(fn_json));
             match r { Err(e) if e["code"] == "NOT_FOUND" => json_resp(404, &e, &h), r => reply(r) }
         }
         ("GET", ["api", "me"]) => reply(session_for(sql, crate::signin::token_of(sql, req).as_deref()).map(|s| json!({"user": J::Object(s.attrs.iter().map(|(k, v)| (k.clone(), value_json(v, None))).collect()), "roles": s.roles}))),

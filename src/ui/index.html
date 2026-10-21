@@ -223,6 +223,20 @@ table.data tr.flash td { animation:flash 1.4s ease-out }
 .ab-out .say { color:var(--text-2); font-size:12.5px }
 .ab-out .need { color:var(--warn); font-size:12.5px }
 .ab-out .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+/* sign-in: the guided set-up and its state (Access tab) */
+.si-tag { font-size:11px; color:var(--text-3); background:var(--raised); border-radius:999px; padding:1px 8px } .si-tag.on { color:var(--ok); background:var(--ok-bg) }
+.si-more { color:var(--text-3); font-size:12px } .ab-top #siadd { margin-left:auto }
+.si-p { margin:0; color:var(--text-2); font-size:13px; line-height:1.5; max-width:72ch }
+.si-step { display:flex; flex-direction:column; gap:8px; padding:10px 0 2px; border-top:1px solid var(--line) }
+.si-step h4, .si-next h4 { margin:0; font-size:13px }
+.si-step p, .si-next p { margin:0; color:var(--text-3); font-size:12.5px; line-height:1.45; max-width:84ch }
+.si-step code, .si-kv code, .si-p code { font:12px var(--mono); background:var(--raised); padding:0 4px; border-radius:3px }
+.si-kv { display:grid; grid-template-columns:max-content 1fr; gap:5px 14px; margin:0; font-size:12.5px } .si-kv dt { color:var(--text-3) } .si-kv dd { margin:0 }
+.si-warn { color:var(--warn); font-style:normal }
+.si-next { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:14px; padding-top:12px; border-top:1px solid var(--line) }
+.si-next > div { display:flex; flex-direction:column; gap:6px; min-width:0 } .si-next a { color:var(--info) }
+.si-code { margin:0; font:12px/1.55 var(--mono); white-space:pre-wrap; word-break:break-word; background:var(--bg); border:1px solid var(--line); border-radius:var(--r-sm); padding:8px 10px; color:var(--text-2) }
+.si-hr { border:0; border-top:1px solid var(--line); margin:4px 0 }
 .acl-card header { display:flex; align-items:center; gap:8px; padding:12px 14px 10px; font-weight:600 }
 .acl-card header .count { font-size:11px; font-weight:500; color:var(--text-3); background:var(--raised); border-radius:999px; padding:0 7px }
 .acl-card .grid { max-height:280px; border-top:1px solid var(--line) }
@@ -348,6 +362,12 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 .fn-bar { display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid var(--line); flex-wrap:wrap }
 .fn-bar .input { width:230px; font:12.5px var(--mono) }
 .fn-bar .spacer { flex:1 }
+.fn-reach { display:flex; gap:6px; flex-wrap:wrap; min-width:0; flex:1 }
+.fn-chip { display:inline-flex; gap:6px; align-items:center; font:11px var(--mono); color:var(--text-2); padding:2px 8px; border:1px solid var(--line-2); border-radius:999px; white-space:nowrap }
+.fn-chip b { color:var(--text); font-weight:600 } .fn-chip .mcp { color:var(--ok) }
+.fn-new { position:relative }
+.fn-menu { left:0; top:calc(100% + 4px); width:330px; max-height:none; text-transform:none; letter-spacing:0; font-weight:400; font-size:12.5px }
+.fn-menu .item { flex-direction:column; align-items:flex-start; gap:2px } .fn-menu .item b { color:var(--text); font-weight:600 } .fn-menu .item small { white-space:normal; line-height:1.4 }
 .fn-editor .editor { max-height:none; min-height:320px; height:50vh; border-radius:0 0 var(--r) var(--r) }
 .fn-try { padding:12px 14px; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px }
 .fn-try h3 { grid-column:1/-1; margin:0; font-size:13px }
@@ -378,8 +398,8 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 .st-sec h3 .sw { margin-left:auto; display:flex; align-items:center; gap:6px; font-weight:500; font-size:12px; color:var(--text-2) }
 .st-sec .lead { margin:-4px 0 0; color:var(--text-3); font-size:12px }
 .st-f { display:flex; flex-direction:column; gap:4px; min-width:0 }
-.st-f > span { font-size:12px; color:var(--text-2); display:flex; gap:6px; align-items:baseline }
-.st-f > span small { color:var(--text-3) }
+.st-f > span { font-size:12px; color:var(--text-2); display:flex; flex-wrap:wrap; gap:2px 6px; align-items:baseline }
+.st-f > span small { color:var(--text-3); flex-basis:100%; line-height:1.4 }   /* the hint, on its own line under the label */
 .st-f .input { font:12.5px var(--mono) }
 .st-f .fixed { font:11px var(--mono); color:var(--warn) }
 .st-f .clear { margin-left:auto; border:0; background:none; color:var(--text-3); font-size:11px; cursor:pointer; padding:0 }
@@ -467,7 +487,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
       <div id="fnbroken" class="alert hidden" role="alert"></div>
       <div class="fn-grid">
         <div class="card fn-side">
-          <header><span>Files</span><span class="spacer"></span><button id="fnnew" class="btn btn-sm btn-ghost">New</button><label class="btn btn-sm btn-ghost" id="fnuplabel">Upload<input type="file" id="fnupload" accept=".ts,.js,.mjs,.mts" multiple hidden></label></header>
+          <header><span>Files</span><span class="spacer"></span><div class="fn-new"><button id="fnnew" class="btn btn-sm btn-ghost" aria-haspopup="menu" aria-expanded="false">New ▾</button><div class="pop fn-menu hidden" id="fnmenu" role="menu"><button class="item" role="menuitem" data-new="fn"><b>Function</b><small>Called by name from your app (POST /api/fn/…, client.call), and a tool for agents over MCP</small></button><button class="item" role="menuitem" data-new="route"><b>REST route</b><small>Answers an HTTP method and path of yours, such as GET /jobs/:id</small></button><button class="item" role="menuitem" data-new="middleware"><b>Middleware</b><small>Runs before requests to the paths it matches reach your app</small></button></div></div><label class="btn btn-sm btn-ghost" id="fnuplabel">Upload<input type="file" id="fnupload" accept=".ts,.js,.mjs,.mts" multiple hidden></label></header>
           <ul class="fn-files" id="fnfiles"></ul>
           <header><span>Exports</span><span class="spacer"></span><span class="count" id="fncount"></span></header>
           <ul class="fn-exports" id="fnexports"></ul>
@@ -476,7 +496,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
           <div class="card fn-editor">
             <div class="fn-bar">
               <input id="fnname" class="input" placeholder="jobs.ts" spellcheck="false" autocomplete="off" aria-label="File name">
-              <span class="spacer"></span><span class="meta" id="fnstate"></span>
+              <div id="fnreach" class="fn-reach"></div><span class="meta" id="fnstate"></span>
               <button id="fndelete" class="btn btn-sm btn-ghost">Delete file</button>
               <button id="fnrevert" class="btn btn-sm btn-ghost">Revert</button>
               <button id="fndeploy" class="btn btn-primary">Deploy <kbd>Ctrl S</kbd></button>
@@ -824,15 +844,16 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 
   // ---- access control
   async function acl() {
-    try { const a = await api('/api/acl');
+    try { const [a, st, stg] = await Promise.all([api('/api/acl'), api('/api/status').catch(() => null), api('/api/settings').catch(() => null)]); siStatus = st; siSettings = stg;
+      if (!tablesCache.length) await refresh();   // the sign-in card reads the tables (columns, counts): have them before the first draw
       const card = (w, title, ic, head, rows, none) => `<section class="card acl-card ${w}"><header>${icon(ic)}${title}<span class="count">${rows.length}</span></header>${rows.length ? `<div class="grid"><table class="data"><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c, k) => `<td${k ? '' : ' style="color:var(--text)"'}>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : `<div class="none">${none}</div>`}</section>`;
       abAcl = a;
-      $('acl').innerHTML = `<section class="card w4 ab" id="ab"></section>` + card('w4', 'Row policies', 'table', ['policy', 'table', 'role', 'commands', 'using'], a.policies.map((p) => [p.name, p.table, p.role, p.commands.join(', '), p.using]), 'No row policies: a role with a grant sees every row of that table.')
+      $('acl').innerHTML = `<section class="card w4 ab" id="si"></section><section class="card w4 ab" id="ab"></section>` + card('w4', 'Row policies', 'table', ['policy', 'table', 'role', 'commands', 'using'], a.policies.map((p) => [p.name, p.table, p.role, p.commands.join(', '), p.using]), 'No row policies: a role with a grant sees every row of that table.')
         + card('w2', 'Grants', 'key', ['role', 'table', 'commands'], a.grants.map((g) => [g.role, g.table, g.commands.join(', ')]), 'Nothing granted yet. A role can do nothing until it is granted commands on a table.')
         + card('w1', 'Roles', 'shield', ['role'], a.roles.map((r) => [r]), 'No roles yet.')
         + card('w1', 'Stored users', 'pulse', ['user', 'roles', 'attributes'], a.users.map((u) => [u.name, u.roles.join(', '), Object.entries(u.attrs).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join(', ')]), 'None. Applications usually pass who is asking per request: db.as({ role, ...attributes }).')
         + card('w4', 'Sign-in tables', 'shield', ['table', 'login', 'role', 'only the app sets'], (a.auth || []).map((t) => [t.table, t.login || '', t.role.column ? `from its ${t.role.column} column` : t.role.fixed ? t.role.fixed : 'none', (t.appOnly || []).join(', ') || '—']), 'None. A table people sign in to (an email and a password, or a provider) is marked with ALTER TABLE … ENABLE AUTH.');
-      renderBuilder();
+      renderBuilder(); renderSignin();
 
     } catch (e) { if (!e.auth) $('acl').innerHTML = `<div class="alert"><span class="ecode">${esc(e.code)}</span><span class="msg">${esc(e.message)}</span></div>`; }
   }
@@ -982,6 +1003,129 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     $('abrun').onclick = async () => {
       try { await api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) }); toast('Done: ' + sql.split(' ').slice(0, 2).join(' ').toLowerCase()); ab.name = ''; ab.err = ''; await acl(); refresh(); }
       catch (e) { if (e.auth) return; ab.err = e.message; abShow(); }
+    };
+  }
+
+  // ---- sign-in: who signs in (the table, roles, sign-up) set up as one guided step, with the SQL and the setting it
+  // generates shown first; once set up, its state, the sign-in page, the client snippet and a test account
+  let siSettings = null, siStatus = null;
+  const si = { open: false, mode: 'new', table: 'users', login: 'email', extra: 'name', existing: '', roleCol: '', fields: '', admin: true, signup: 'open', own: true, manage: true, err: '', busy: false };
+  const isText = (c) => /^(TEXT|VARCHAR|CHAR)/i.test(c.type || '');
+  const siList = (s) => s.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+  function siPlan() {
+    const A = abAcl, out = { stmts: [], need: '', t: '', login: '', signUp: null };
+    const t = si.mode === 'new' ? si.table.trim() : si.existing; out.t = t;
+    if (!t) { out.need = si.mode === 'new' ? 'Name the table.' : 'Choose the table.'; return out; }
+    if (!ident(t)) { out.need = 'A table name is letters, digits and _ only.'; return out; }
+    let roleFrom = '', pk = 'id', fields = [];
+    if (si.mode === 'new') {
+      if (tablesCache.some((x) => x.name.toLowerCase() === t.toLowerCase())) { out.need = `${t} exists already: pick “a table I have” to sign in to it.`; return out; }
+      out.login = si.login.trim(); if (!ident(out.login) || ['id', 'role', 'created_at'].includes(out.login)) { out.need = 'The login column is letters, digits and _ only (not id, role or created_at).'; return out; }
+      fields = siList(si.extra); const bad = fields.find((f) => !ident(f) || ['id', 'role', 'created_at', out.login].includes(f)); if (bad) { out.need = `${bad}: not a column to add here.`; return out; }
+      roleFrom = 'role';
+      out.stmts.push(`CREATE TABLE ${t} (id SERIAL PRIMARY KEY, ${out.login} TEXT UNIQUE NOT NULL, ${fields.map((f) => `${f} TEXT, `).join('')}role TEXT NOT NULL DEFAULT 'member', created_at TIMESTAMP DEFAULT now())`);
+    } else {
+      const tb = tablesCache.find((x) => x.name === t); if (!tb) { out.need = 'Choose the table.'; return out; }
+      const lc = tb.columns.find((c) => c.unique && isText(c));
+      if (!lc) { out.need = `${t} has no UNIQUE text column to sign in with. Add one (ALTER TABLE ${t} ADD COLUMN email TEXT UNIQUE), or create a new table.`; return out; }
+      out.login = lc.name; roleFrom = si.roleCol; pk = (tb.columns.find((c) => c.pk) || { name: 'id' }).name;
+      fields = siList(si.fields); const bad = fields.find((f) => !tb.columns.some((c) => c.name === f) || f === out.login || f === roleFrom || f === pk); if (bad) { out.need = `${bad}: not a column of ${t} a sign-up may fill in.`; return out; }
+    }
+    if (!A.roles.includes('member')) out.stmts.push('CREATE ROLE member');
+    if (si.admin && !A.roles.includes('admin')) out.stmts.push('CREATE ROLE admin');
+    out.stmts.push(`ALTER TABLE ${t} ENABLE AUTH (${roleFrom ? `ROLE FROM ${roleFrom}` : 'ROLE member'})`);
+    if (si.own) { out.stmts.push(`GRANT SELECT, UPDATE ON ${t} TO member`); out.stmts.push(`CREATE POLICY own_account ON ${t} FOR ALL TO member USING (${pk} = SESSION.${pk})`); }
+    if (si.admin && si.manage) out.stmts.push(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${t} TO admin`);
+    if (si.signup === 'open') out.signUp = fields;
+    return out;
+  }
+  const siOutHtml = (p) => p.need ? `<div class="need">${esc(p.need)}</div>`
+    : `<code>${highlight(p.stmts.join(';\n') + ';')}</code><div class="say">${p.signUp ? `Then the setting app.signUp.${esc(p.t)} = [${p.signUp.map((f) => JSON.stringify(f)).join(', ')}] is saved: sign-up open to anyone, applied when the server restarts.` : 'Sign-up stays closed: accounts are made by the app (or here, once set up).'}</div>${si.err ? `<div class="need">${esc(si.err)}</div>` : ''}<div class="row"><button class="btn btn-primary btn-sm" id="siapply"${si.busy ? ' disabled' : ''}>${si.busy ? 'Applying…' : 'Apply'}</button></div>`;
+  function siOut() { if ($('siout')) { $('siout').innerHTML = siOutHtml(siPlan()); if ($('siapply')) $('siapply').onclick = siApply; } }
+  async function siApply() {
+    const p = siPlan(); if (p.need) { si.err = p.need; siOut(); return; }
+    si.busy = true; si.err = ''; siOut();
+    try {
+      for (const sql of p.stmts) { try { await api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) }); } catch (e) { if (e.auth) return; throw new Error(`${sql}\n${e.message}`); } }
+      if (p.signUp && siSettings && siSettings.editable) await api('/api/settings', { method: 'POST', body: JSON.stringify({ set: { [`app.signUp.${p.t}`]: p.signUp } }) });
+      toast('Sign-in is set up'); si.open = false; si.busy = false; await refresh(); await acl();
+    } catch (e) { if (e.auth) return; si.err = e.message; si.busy = false; siOut(); }
+  }
+  function renderSignin() {
+    if (!$('si') || !abAcl) return;
+    const A = abAcl, auth = A.auth || [];
+    if (auth.length && !si.open) { $('si').innerHTML = siStatusView(A); siWire(); return; }
+    if (!si.open) {
+      $('si').innerHTML = `<div class="ab-top"><h3>Sign-in</h3><span class="si-tag">not set up</span></div>
+        <p class="si-p">Nobody can sign in yet. Sign-in needs a table that holds the people (the users table), roles that say what they may do, and a choice of who may create an account. <b>Set up sign-in</b> makes those choices with you, shows the SQL and the setting it generates, and runs them.</p>
+        <div class="row"><button class="btn btn-primary btn-sm" id="siopen">Set up sign-in</button></div>`;
+      $('siopen').onclick = () => { si.open = true; si.err = ''; renderSignin(); }; return;
+    }
+    const tb = si.mode === 'existing' ? tablesCache.find((x) => x.name === si.existing) : null;
+    const textCols = tb ? tb.columns.filter(isText) : [];
+    const others = tableNames().filter((n) => !auth.some((x) => x.table === n));
+    const p = siPlan();
+    $('si').innerHTML = `<div class="ab-top"><h3>Set up sign-in</h3><button class="btn btn-ghost btn-sm" id="siclose">Cancel</button></div>
+      <div class="si-step"><h4>1. Who signs in</h4><p>A table of your own holds the people. One UNIQUE text column is their login (an email, a username); the other columns are whatever your app needs, and a signed-in user carries them as <code>SESSION.column</code> for policies.</p>
+        <div class="ab-checks"><label><input type="radio" name="simode" value="new"${si.mode === 'new' ? ' checked' : ''}> a new table</label><label><input type="radio" name="simode" value="existing"${si.mode === 'existing' ? ' checked' : ''}> a table I have</label></div>
+        ${si.mode === 'new'
+          ? `<div class="ab-fields"><label class="ab-f">table<input class="input" data-si="table" value="${esc(si.table)}" spellcheck="false"></label><label class="ab-f">login column<input class="input" data-si="login" value="${esc(si.login)}" spellcheck="false"></label><label class="ab-f">other text columns<input class="input" data-si="extra" value="${esc(si.extra)}" placeholder="name, phone" spellcheck="false"></label></div><p>It also gets an automatic <code>id</code>, a <code>role</code> column and <code>created_at</code>.</p>`
+          : `<div class="ab-fields"><label class="ab-f">table<select class="input" data-si="existing">${abOpt('', 'choose…', !si.existing)}${others.map((n) => abOpt(n, n, si.existing === n)).join('')}</select></label>${tb ? `<label class="ab-f">login column<input class="input" value="${esc(p.login || 'none yet')}" disabled></label><label class="ab-f">role<select class="input" data-si="roleCol">${abOpt('', 'everyone is a member', !si.roleCol)}${textCols.map((c) => abOpt(c.name, `from the ${c.name} column`, si.roleCol === c.name)).join('')}</select></label>` : ''}</div>`}
+      </div>
+      <div class="si-step"><h4>2. Roles</h4><p>Everyone who signs up is a <code>member</code>; grants and policies then say what a member may do. An <code>admin</code> role is for the people you promote by setting their role column${si.mode === 'existing' && tb && !si.roleCol ? ' (this table has none, so everyone stays a member)' : ''}.</p>
+        <div class="ab-checks"><label><input type="checkbox" data-sicheck="admin"${si.admin ? ' checked' : ''}> also create an admin role</label></div></div>
+      <div class="si-step"><h4>3. Who may create an account</h4><p>Open: anyone may make an account from the sign-in page or your app. Invite only: your app creates accounts (or you do, here, once this is set up).</p>
+        <div class="ab-checks"><label><input type="radio" name="sisignup" value="open"${si.signup === 'open' ? ' checked' : ''}> anyone</label><label><input type="radio" name="sisignup" value="invite"${si.signup === 'invite' ? ' checked' : ''}> invite only</label></div>
+        ${si.signup === 'open' && si.mode === 'existing' && tb ? `<div class="ab-fields"><label class="ab-f">columns a sign-up may fill in<input class="input" data-si="fields" value="${esc(si.fields)}" spellcheck="false"></label></div>` : ''}</div>
+      <div class="si-step"><h4>4. Their own account</h4><p>What a signed-in member may do with their own row. The role and the id are the application's alone either way.</p>
+        <div class="ab-checks"><label><input type="checkbox" data-sicheck="own"${si.own ? ' checked' : ''}> members may read and edit their own row</label>${si.admin ? `<label><input type="checkbox" data-sicheck="manage"${si.manage ? ' checked' : ''}> admins may see and edit every account</label>` : ''}</div></div>
+      <div class="si-step"><h4>5. Sign in with Google or GitHub</h4><p>Optional, and later is fine: a client id and secret under Settings → Sign-in, which needs the public address set.</p></div>
+      <div class="ab-out" id="siout">${siOutHtml(p)}</div>`;
+    $('siclose').onclick = () => { si.open = false; si.err = ''; renderSignin(); };
+    for (const el of $('si').querySelectorAll('[data-si]')) el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', () => {
+      si[el.dataset.si] = el.value;
+      if (el.dataset.si === 'existing') { const t2 = tablesCache.find((x) => x.name === el.value); si.roleCol = t2 && t2.columns.some((c) => c.name === 'role' && isText(c)) ? 'role' : ''; si.fields = t2 ? t2.columns.filter((c) => isText(c) && !c.unique && c.name !== si.roleCol).map((c) => c.name).join(', ') : ''; }
+      if (el.tagName === 'SELECT') renderSignin(); else siOut();
+    });
+    for (const el of $('si').querySelectorAll('[data-sicheck]')) el.onchange = () => { si[el.dataset.sicheck] = el.checked; renderSignin(); };
+    for (const el of $('si').querySelectorAll('input[name="simode"]')) el.onchange = () => { si.mode = el.value; si.err = ''; renderSignin(); };
+    for (const el of $('si').querySelectorAll('input[name="sisignup"]')) el.onchange = () => { si.signup = el.value; renderSignin(); };
+    if ($('siapply')) $('siapply').onclick = siApply;
+  }
+  function siStatusView(A) {
+    const s = (siSettings && siSettings.values) || {}, flags = (siSettings && siSettings.flags) || {};
+    const pub = (s.app && s.app.publicUrl) || (flags.app && flags.app.publicUrl) || '';
+    const appAddr = siStatus && siStatus.listen && siStatus.listen.app;
+    const base = pub || (appAddr ? 'http://' + appAddr.replace(/^(0\.0\.0\.0|\[::\])(?=:)/, '127.0.0.1') : '');
+    const providers = Object.keys((s.auth && s.auth.oauth) || {});
+    const cap = (x) => x[0].toUpperCase() + x.slice(1);
+    const blocks = A.auth.map((t) => {
+      const su = s.app && s.app.signUp && s.app.signUp[t.table];
+      const tb = tablesCache.find((x) => x.name === t.table), nameCol = tb && tb.columns.some((c) => c.name === 'name');
+      const origin = base || 'https://your-app.example';
+      const snippet = `import { connect } from '${origin}/api/client.js'\nconst db = connect('${origin}')\nawait db.auth.signUp({ ${t.login}${nameCol ? ', name' : ''} }, password)\n// or: signIn(${t.login}, password)${providers.length ? `, signInWith('${providers[0]}')` : ''}\nawait db.sql('SELECT …')   // as that user`;
+      return `<dl class="si-kv"><dt>table</dt><dd><code>${esc(t.table)}</code>${tb ? ` · ${fmtN(tb.rows)} account${tb.rows === 1 ? '' : 's'}` : ''}</dd>
+        <dt>login</dt><dd><code>${esc(t.login || '')}</code> and a password${providers.length ? `, or ${providers.map(cap).join(' / ')}` : ''}</dd>
+        <dt>role</dt><dd>${t.role.column ? `from the <code>${esc(t.role.column)}</code> column` : `everyone is <code>${esc(t.role.fixed || '')}</code>`}${A.roles.length ? ` · roles: ${A.roles.map((r) => `<code>${esc(r)}</code>`).join(', ')}` : ''}</dd>
+        <dt>sign-up</dt><dd>${su ? `open to anyone${su.length ? ` (a sign-up may fill in ${su.map((f) => `<code>${esc(f)}</code>`).join(', ')})` : ''}` : 'invite only: the app creates accounts'}${siSettings && siSettings.saved ? ' <em class="si-warn">(saved; applies at the next restart)</em> <button class="btn btn-ghost btn-sm" id="sirestart">Restart now</button>' : ''}</dd>
+        <dt>only the app sets</dt><dd>${(t.appOnly || []).map((c) => `<code>${esc(c)}</code>`).join(', ') || '—'}</dd></dl>
+        <div class="si-next">
+          <div><h4>The sign-in page</h4><p>${base ? `<a href="${esc(base)}/_sqz/sign-in" target="_blank" rel="noopener">${esc(base)}/_sqz/sign-in</a>: sign in${su ? ', create an account' : ''}${providers.length ? ', or use a provider' : ''}; it sets the session and returns to your app. Your app can also do all of it itself, right.` : 'The app API isn’t listening: start with --app, or set it under Settings → App server. Then the page is at &lt;app address&gt;/_sqz/sign-in.'}</p></div>
+          <div><h4>From your app</h4><pre class="si-code">${esc(snippet)}</pre></div>
+          <div><h4>Create a test account</h4><p>Made here as the application, whether sign-up is open or not.</p><form class="ab-fields" data-sitest="${esc(t.table)}"><label class="ab-f">${esc(t.login || 'login')}<input class="input" name="login" autocomplete="off" spellcheck="false" required></label>${nameCol ? '<label class="ab-f">name<input class="input" name="name" autocomplete="off"></label>' : ''}<label class="ab-f">password<input class="input" name="password" type="password" autocomplete="new-password" required></label><button class="btn btn-sm" type="submit">Create</button></form><div class="need hidden" data-sierr="${esc(t.table)}"></div></div>
+        </div>`;
+    }).join('<hr class="si-hr">');
+    return `<div class="ab-top"><h3>Sign-in</h3><span class="si-tag on">set up</span><span class="si-more">What members may do with your other tables: Change access, below.</span><button class="btn btn-ghost btn-sm" id="siadd" title="Another table people sign in to">Set up another table</button></div>${blocks}`;
+  }
+  function siWire() {
+    if ($('siadd')) $('siadd').onclick = () => { si.open = true; si.mode = 'existing'; si.existing = ''; si.err = ''; renderSignin(); };
+    if ($('sirestart')) $('sirestart').onclick = () => { showTab('settings'); stRestart(); };
+    for (const f of $('si').querySelectorAll('form[data-sitest]')) f.onsubmit = async (e) => {
+      e.preventDefault(); const t = f.dataset.sitest, err = $('si').querySelector(`[data-sierr="${t}"]`); err.classList.add('hidden');
+      const login = f.elements.login.value.trim(), password = f.elements.password.value;
+      const fields = { [abAcl.auth.find((x) => x.table === t).login]: login }; if (f.elements.name && f.elements.name.value.trim()) fields.name = f.elements.name.value.trim();
+      try { await api('/api/auth/sign-up', { method: 'POST', body: JSON.stringify({ table: t, fields, password }) }); toast(`${login} can sign in now`); f.reset(); await refresh(); await acl(); }
+      catch (e2) { if (e2.auth) return; err.textContent = e2.message; err.classList.remove('hidden'); }
     };
   }
 
@@ -1233,7 +1377,47 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     }
     return out;
   }
-  const FN_NEW = "import { fn } from 'sqzdb/functions'\n\nexport const hello = fn({\n  description: 'Say hello to someone',\n  args: { name: 'text' },\n  roles: ['member'],\n  run: ({ user }, { name }) => `Hello, ${name}!`,\n})\n";
+  const FN_NEW = {
+    fn: { file: 'functions.ts', text: `import { fn } from 'sqzdb/functions'
+
+// A function: your app's server code, called by name. Your app calls it at POST /api/fn/hello
+// (client.call('hello', { name }) in the browser, db.call in Node), and agents get it as an MCP tool.
+export const hello = fn({
+  description: 'Say hello to someone',   // what it does, for people and agents
+  args: { name: 'text' },                // checked before it runs: int, number, text, bool, uuid, json; ? when optional
+  roles: ['member'],                     // who may call it; leave out for anyone signed in
+  method: 'POST',                        // or 'GET': answers GET /api/fn/hello?name=Ann too, and only reads
+  mcp: true,                             // false keeps it off the agents' tool list
+  run: ({ db, admin, user }, { name }) => \`Hello, \${name}!\`,   // db: SQL as the caller; admin: as the app; one transaction
+})
+` },
+    route: { file: 'routes.ts', text: `import { route } from 'sqzdb/functions'
+
+// A REST route: answers HTTP requests to a method and path of yours, in front of your app.
+export const job = route({
+  method: 'GET',                         // or 'POST', 'PUT', 'PATCH', 'DELETE', or a list of them
+  path: '/jobs/:id',                     // :id is req.params.id; a final * takes the rest of the path
+  roles: ['member'],                     // who may call it; leave out for anyone
+  run({ db }, req) {
+    const job = db.get('SELECT * FROM jobs WHERE id = ?', [req.params.id])   // as the caller, under their policies
+    return job ?? new Response('Not found', { status: 404 })                 // a value is sent as JSON; or a Response
+  },
+})
+` },
+    middleware: { file: 'middleware.ts', text: `import { middleware, signIn } from 'sqzdb/functions'
+
+// Middleware: runs before every request to the paths it matches reaches your app.
+export const guard = middleware({
+  match: ['/dashboard/*', '/admin/*'],   // the paths it runs for
+  order: 0,                              // lower runs first
+  run({ user, roles }, req) {
+    if (!user) return signIn(req)        // to the sign-in page, and back here after
+    if (req.path.startsWith('/admin') && !roles.includes('admin')) return new Response('Forbidden', { status: 403 })
+    req.headers.set('x-plan', 'pro')     // your app sees it; returning nothing lets the request go on
+  },
+})
+` },
+  };
   const fnNames = () => [...new Set([...Object.keys(fnFiles), ...Object.keys(fnEdits)])].filter((f) => !fnRemoved.has(f)).sort();
   const fnText = (f) => (f in fnEdits ? fnEdits[f] : fnFiles[f] ?? '');
   const fnChanged = (f) => !(f in fnFiles) || (f in fnEdits && fnEdits[f] !== fnFiles[f]);
@@ -1253,10 +1437,11 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
   function renderFunctions() {
     if (!fnData) return;
     const ro = fnReadOnly();
-    $('fnsrc').innerHTML = ro ? `Deployed from <code>${esc(fnData.folder)}</code>${fnData.watch ? ' as its files change' : ' when the server starts'}. Edit the files there; here they are read-only.`
-      : 'Kept in the database: they go with its backups and to its followers. Write, paste or upload files, then Deploy: they replace what is deployed, or nothing changes.';
+    const kinds = 'A <b>function</b> is called by name (POST /api/fn/…, client.call) and is an MCP tool for agents; a <b>REST route</b> answers a method and path of yours; <b>middleware</b> runs before requests reach your app. ';
+    $('fnsrc').innerHTML = kinds + (ro ? `Deployed from <code>${esc(fnData.folder)}</code>${fnData.watch ? ' as its files change' : ' when the server starts'}. Edit the files there; here they are read-only.`
+      : 'Kept in the database: they go with its backups and to its followers. Write, paste or upload files, then Deploy: they replace what is deployed, or nothing changes.');
     const m = fnData.mcp;
-    $('fnmcp').innerHTML = !m ? 'MCP is off. With <code>[app.mcp]</code> set, agents get each function they may call as a tool.'
+    $('fnmcp').innerHTML = !m ? 'MCP is off: turn on <b>Agents (MCP)</b> in Settings, and agents get each function they may call as a tool.'
       : m.url ? `Agents connect to <code>${esc(m.url)}</code>, sign in, and get the functions their user may call as tools${m.sql ? ', with the SQL tools' : ''}. A deploy tells connected agents to list them again. <button class="btn btn-sm" id="fncopy">Copy for Claude Code</button>`
       : 'MCP is on: set <code>app.publicUrl</code>, the address agents reach this server at.';
     if ($('fncopy')) $('fncopy').onclick = () => navigator.clipboard?.writeText(`claude mcp add --transport http --scope user sqzdb ${m.url}`).then(() => toast('Copied'));
@@ -1268,12 +1453,17 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     for (const b of $('fnfiles').querySelectorAll('button')) b.onclick = () => { fnCur = b.dataset.f; renderFunctions(); };
     const ex = fnData.exports || [];
     $('fncount').textContent = ex.length;
+    // where an export is reached: a function by name (and over GET when it says so), a route at its method and path,
+    // middleware before the paths it matches
+    const reach = (d) => d.kind === 'function' ? `${d.method || 'POST'} /api/fn/${esc(d.name)}${d.method === 'GET' && d.args.length ? '?' + esc(d.args.filter((a) => !a.optional).map((a) => a.name + '=…').join('&')) : ''}`
+      : d.kind === 'route' ? `${esc(d.methods.join(' '))} ${esc(d.paths.join(' '))}` : `before ${esc(d.paths.join(', '))}`;
+    const mcpChip = (d, cls) => d.kind === 'function' && d.mcp ? `<span class="${cls}" title="${m ? 'Agents get it as an MCP tool' : 'An MCP tool once Agents (MCP) is on in Settings'}">MCP${m ? '' : ' (off)'}</span>` : '';
     $('fnexports').innerHTML = ex.length ? ex.map((d) => {
       const args = d.args.map((a) => `${a.name}${a.optional ? '?' : ''}`).join(', ');
-      const what = d.kind === 'function' ? `(${esc(args)})` : `${esc(d.methods.join(' '))} ${esc(d.paths.join(' '))}`;
       const who = d.kind === 'middleware' ? '' : d.roles ? `for ${esc(d.roles.join(', '))}` : d.kind === 'route' ? 'anyone' : 'anyone signed in';
-      return `<li><div class="n">${esc(d.name)}<span class="fn-kind${d.kind === 'function' ? ' tool' : ''}">${d.kind === 'function' ? (m ? 'tool' : 'fn') : d.kind}</span></div><div class="d">${what}${who ? ` · ${who}` : ''}${d.readOnly ? ' · read-only' : ''} · ${esc(d.file)}</div></li>`;
+      return `<li><div class="n">${esc(d.name)}<span class="fn-kind">${d.kind === 'function' ? 'function' : d.kind === 'route' ? 'REST' : 'middleware'}</span>${mcpChip(d, 'fn-kind tool')}</div><div class="d">${reach(d)}${d.kind === 'function' ? ` (${esc(args)})` : ''}${who ? ` · ${who}` : ''}${d.readOnly ? ' · read-only' : ''} · ${esc(d.file)}</div></li>`;
     }).join('') : '<li class="none">Nothing deployed.</li>';
+    $('fnreach').innerHTML = ex.filter((d) => d.file === fnCur).map((d) => `<span class="fn-chip"><b>${esc(d.name)}</b>${reach(d)}${mcpChip(d, 'mcp')}</span>`).join('');
     // the editor
     const v = fnCur == null ? '' : fnText(fnCur);
     if (fnEl.value !== v || document.activeElement !== fnEl) fnEl.value = v;
@@ -1305,7 +1495,15 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     if (fnNames().includes(to)) { toast(`${to} is there already`, true); $('fnname').value = fnCur; return; }
     fnEdits[to] = fnText(fnCur); if (fnCur in fnFiles) fnRemoved.add(fnCur); delete fnEdits[fnCur]; fnRemoved.delete(to); fnCur = to; renderFunctions();
   });
-  $('fnnew').onclick = () => { let k = 1, f = 'functions.ts'; while (fnNames().includes(f)) f = `functions${++k}.ts`; fnEdits[f] = FN_NEW; fnRemoved.delete(f); fnCur = f; renderFunctions(); fnEl.focus(); };
+  const fnMenu = (open) => { $('fnmenu').classList.toggle('hidden', !open); $('fnnew').setAttribute('aria-expanded', String(open)); };
+  $('fnnew').onclick = (e) => { e.stopPropagation(); fnMenu($('fnmenu').classList.contains('hidden')); };
+  document.addEventListener('click', (e) => { if (!e.target.closest('.fn-new')) fnMenu(false); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') fnMenu(false); });
+  for (const b of $('fnmenu').querySelectorAll('[data-new]')) b.onclick = () => {
+    fnMenu(false); const t = FN_NEW[b.dataset.new]; const stem = t.file.replace(/\.ts$/, '');
+    let k = 1, f = t.file; while (fnNames().includes(f)) f = `${stem}${++k}.ts`;
+    fnEdits[f] = t.text; fnRemoved.delete(f); fnCur = f; renderFunctions(); fnEl.focus();
+  };
   $('fnupload').addEventListener('change', async (e) => {
     for (const file of e.target.files) { const f = file.name.replace(/[^\w.-]/g, '_'); fnEdits[f] = await file.text(); fnRemoved.delete(f); fnCur = f; }
     e.target.value = ''; renderFunctions();
@@ -1347,48 +1545,53 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 
   // ---- settings: the server's settings file, as a form and as text; saved, then applied by a restart
   const ST = [
-    { id: 'app', title: 'The app API', lead: 'What browsers, apps and agents reach (--app).', fields: [
-      ['app.publicUrl', 'Public address', 'text', 'https://api.example.com', 'where browsers and agents reach it: needed for MCP and provider sign-in'],
-      ['app.signUp', 'Sign-up tables', 'tables', 'users', 'tables people may make accounts in, from the sign-in page and the client'],
-      ['app.origins', 'Other origins', 'list', 'https://app.example.com', 'sites whose pages may call the API ("*": any)'],
-      ['app.anonymousRole', 'Anonymous role', 'text', 'none: sign in first', 'the role of requests without a sign-in'],
-      ['app.maxRows', 'Rows per result', 'int', '10000', ''],
-      ['app.maxRequest', 'Largest request', 'text', '8MB', ''],
-      ['app.trustProxy', 'Proxies in front', 'list', '127.0.0.1, 10.0.0.0/8', 'from these, the client is taken from X-Forwarded-For'] ] },
-    { id: 'https', title: 'HTTPS', lead: 'A certificate from Let’s Encrypt, renewed by itself (--domain). The names must point here, with port 443 open.', fields: [
-      ['app.tls.domains', 'Domains', 'list', 'api.example.com', ''],
-      ['app.tls.email', 'Email for notices', 'text', 'ops@example.com', ''],
-      ['app.tls.redirect', 'Plain HTTP from', 'text', '0.0.0.0:80', 'sent on to https'] ] },
-    { id: 'signin', title: 'Sign-in', lead: 'Sessions, passwords, and providers (each needs the public address).', fields: [
-      ['auth.sessionTtl', 'A session lasts', 'text', '30d', ''],
-      ['auth.passwordMin', 'Shortest password', 'int', '8', ''],
-      ['auth.oauth.google.clientId', 'Google client id', 'text', '…apps.googleusercontent.com', 'callback: <public address>/api/auth/<table>/oauth/google/callback'],
-      ['auth.oauth.google.clientSecret', 'Google client secret', 'secret', '', ''],
-      ['auth.oauth.github.clientId', 'GitHub client id', 'text', '', ''],
-      ['auth.oauth.github.clientSecret', 'GitHub client secret', 'secret', '', ''] ] },
-    { id: 'mcp', title: 'Agents over MCP', nav: 'Agents (MCP)', toggle: 'app.mcp', lead: 'Claude, ChatGPT, Claude Code and others at <public address>/mcp, signed in as their user.', fields: [
-      ['app.mcp.users', 'Sign-in table', 'text', 'the only one there is', 'the table people sign in to when they connect an agent'],
-      ['app.mcp.sql', 'SQL tools', 'bool', '', 'describe, query and execute, besides the functions'],
-      ['app.mcp.tokenTtl', 'Access token lasts', 'text', '1h', ''],
-      ['app.mcp.grantTtl', 'Unused sign-in lapses after', 'text', '30d', ''] ] },
-    { id: 'backup', title: 'Backup', toggle: 'backup', lead: 'Continuous, to any S3-compatible bucket. A ${VAR} already in the file takes its value from the server\u2019s environment (new ones are added in the file on the server).', fields: [
-      ['backup.endpoint', 'Endpoint', 'text', 'https://s3.us-east-1.amazonaws.com', ''],
-      ['backup.bucket', 'Bucket', 'text', '', ''],
-      ['backup.prefix', 'Prefix', 'text', 'the database’s name', ''],
-      ['backup.region', 'Region', 'text', 'us-east-1', ''],
-      ['backup.accessKey', 'Access key', 'text', '', ''],
-      ['backup.secretKey', 'Secret key', 'secret', '', ''],
-      ['backup.passphrase', 'Encryption passphrase', 'secret', '', 'without one, objects are compressed, not encrypted'],
-      ['backup.interval', 'Upload every', 'text', '1s', ''],
-      ['durable', 'A commit is confirmed', 'choice', '', 'once it is in the bucket: slower, and nothing is lost with this machine', [['', 'when visible (default; the disk follows within a millisecond)'], ['fsync', 'once on this disk'], ['cloud', 'once in the bucket']]] ] },
-    { id: 'functions', title: 'Functions', lead: 'Limits for the app’s code (the Functions tab).', fields: [
-      ['functions.timeout', 'A call may take', 'text', '1s', ''],
-      ['functions.memory', 'Memory per instance', 'text', '64MB', ''],
-      ['functions.instances', 'Calls at once', 'int', 'the CPU count', ''] ] },
+    { id: 'app', title: 'App server', lead: 'The HTTP server for your application and its users (--app). It answers the API that your app, the browser client and mobile apps call (SQL, sign-in, files, your functions), serves the built-in sign-in pages and the MCP endpoint for agents, and can stand in front of your own app as a reverse proxy, so one address and one certificate serve both.', fields: [
+      ['listen.app', 'Address', 'text', '0.0.0.0:443', 'where the app server listens (--app): 0.0.0.0:443 for everyone, with HTTPS below; 127.0.0.1:7780 for this machine only. Empty: no app server'],
+      ['app.publicUrl', 'Public address', 'text', 'https://api.example.com', 'the URL the outside world reaches this server at (your domain, through any load balancer); sign-in with Google or GitHub and agents over MCP build their links with it. Derived from the first HTTPS domain, and on this machine (127.0.0.1 or localhost) from the address above'],
+      ['app.proxy', 'Your app behind it', 'text', 'http://127.0.0.1:3000', 'a reverse proxy: every request that isn’t sqzdb’s own (the API, sign-in, MCP) is passed on to your app at this address, such as a Next.js server on this machine'],
+      ['app.staticDir', 'Static files folder', 'text', './dist', 'a built site (HTML, JS, CSS) served beside the API as the app itself, instead of an app behind it (one or the other); a path without a file gets its index.html'],
+      ['app.signUp', 'Sign-up tables', 'tables', 'users', 'the sign-in tables people may create their own account in, from the sign-in page and the client; any other is invite-only'],
+      ['app.origins', 'Other origins', 'list', 'https://app.example.com', 'other websites whose pages may call this API from the browser (CORS); the public address itself is always allowed, and "*" means any'],
+      ['app.anonymousRole', 'Anonymous role', 'text', 'none: sign in first', 'what a request without a sign-in may do: a role you created, or nothing at all'],
+      ['app.maxRows', 'Rows per result', 'int', '10000', 'the most rows one query returns to a client'],
+      ['app.maxRequest', 'Largest request', 'text', '8MB', 'the biggest request body accepted, file uploads included'],
+      ['app.trustProxy', 'Load balancers in front', 'list', '127.0.0.1, 10.0.0.0/8', 'the addresses of a proxy or load balancer in front of this server: requests from them carry the real client address in X-Forwarded-For (sign-in limits are per client)'] ] },
+    { id: 'https', title: 'HTTPS certificate', nav: 'HTTPS', lead: 'Serve the app server over HTTPS (SSL). Give it your domain names and it gets a free certificate from Let’s Encrypt and renews it by itself (--domain): the names must point at this machine, and port 443 must be reachable from the internet. Or use a certificate you already have.', fields: [
+      ['app.tls.domains', 'Domains', 'list', 'api.example.com', 'the names the certificate is for; the app server should listen on port 443'],
+      ['app.tls.email', 'Email for notices', 'text', 'ops@example.com', 'Let’s Encrypt sends expiry notices here'],
+      ['app.tls.redirect', 'Plain HTTP from', 'text', '0.0.0.0:80', 'also listen here, and send http:// visitors on to https://'],
+      ['app.tls.cert', 'Own certificate', 'text', '/etc/ssl/fullchain.pem', 'instead of Let’s Encrypt: the path on the server of a PEM certificate chain'],
+      ['app.tls.key', 'Its private key', 'text', '/etc/ssl/privkey.pem', 'the path of the matching PEM key'] ] },
+    { id: 'signin', title: 'Sign-in', lead: 'How people sign in to your app: with an email and password (the built-in sign-in page and the client), or with their Google or GitHub account. Providers call back to the public address, so set that first. Who signs in at all (the users table, roles, open or invite-only sign-up) is set up under Access → Set up sign-in.', fields: [
+      ['auth.sessionTtl', 'A session lasts', 'text', '30d', 'how long a sign-in stays valid before the user must sign in again'],
+      ['auth.passwordMin', 'Shortest password', 'int', '8', 'the fewest characters a password may have'],
+      ['auth.oauth.google.clientId', 'Google client id', 'text', '…apps.googleusercontent.com', 'from Google Cloud → APIs & Services → Credentials (an OAuth client for a web app); its redirect URI is <public address>/api/auth/<table>/oauth/google/callback'],
+      ['auth.oauth.google.clientSecret', 'Google client secret', 'secret', '', 'from the same page'],
+      ['auth.oauth.github.clientId', 'GitHub client id', 'text', '', 'from GitHub → Settings → Developer settings → OAuth Apps; its callback URL is <public address>/api/auth/<table>/oauth/github/callback'],
+      ['auth.oauth.github.clientSecret', 'GitHub client secret', 'secret', '', 'from the same page'] ] },
+    { id: 'mcp', title: 'Agents over MCP', nav: 'Agents (MCP)', toggle: 'app.mcp', lead: 'Let AI agents (Claude, ChatGPT, Claude Code, Cursor and others) connect to this database as a tool server at <public address>/mcp. An agent signs in as one of your users through the standard OAuth flow, and gets the functions you deploy as its tools, under that user’s role and policies.', fields: [
+      ['app.mcp.users', 'Sign-in table', 'text', 'the only one there is', 'with more than one sign-in table (ALTER TABLE … ENABLE AUTH), the one an agent’s user signs in against when connecting; with one, that one'],
+      ['app.mcp.sql', 'SQL tools', 'bool', '', 'also give agents describe, query and execute tools for direct SQL (the user’s role and policies still apply)'],
+      ['app.mcp.tokenTtl', 'Access token lasts', 'text', '1h', 'how long an agent’s access token is valid before it refreshes it'],
+      ['app.mcp.grantTtl', 'Unused sign-in lapses after', 'text', '30d', 'an agent that hasn’t connected for this long must have its user sign in again'] ] },
+    { id: 'backup', title: 'Backup', toggle: 'backup', lead: 'Continuous backup of the whole database to an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO and others). Every change is uploaded within the interval below, and a new server can restore from the bucket. A ${VAR} already in the file takes its value from the server’s environment (new ones are added in the file on the server).', fields: [
+      ['backup.endpoint', 'Endpoint', 'text', 'https://s3.us-east-1.amazonaws.com', 'the S3 API address of your storage provider'],
+      ['backup.bucket', 'Bucket', 'text', '', 'its name; the bucket must exist already'],
+      ['backup.prefix', 'Prefix', 'text', 'the database’s name', 'the folder inside the bucket for this database'],
+      ['backup.region', 'Region', 'text', 'us-east-1', 'as your provider names it'],
+      ['backup.accessKey', 'Access key', 'text', '', 'credentials allowed to read and write the bucket'],
+      ['backup.secretKey', 'Secret key', 'secret', '', 'kept on the server, never shown here again'],
+      ['backup.passphrase', 'Encryption passphrase', 'secret', '', 'objects are encrypted with it before upload (without one they are only compressed); restoring needs it, so keep it somewhere safe'],
+      ['backup.interval', 'Upload every', 'text', '1s', 'how often new changes are sent to the bucket'],
+      ['durable', 'A commit is confirmed', 'choice', '', 'when a write is reported done to the app: the later choices lose less if this machine dies, and are slower', [['', 'when visible (default; the disk follows within a millisecond)'], ['fsync', 'once on this disk'], ['cloud', 'once in the bucket']]] ] },
+    { id: 'functions', title: 'Functions', lead: 'Limits for the JavaScript functions deployed from the Functions tab (your HTTP endpoints and MCP tools).', fields: [
+      ['functions.timeout', 'A call may take', 'text', '1s', 'a call running longer is stopped with an error'],
+      ['functions.memory', 'Memory per instance', 'text', '64MB', 'the most memory one JavaScript instance may use'],
+      ['functions.instances', 'Calls at once', 'int', 'the CPU count', 'how many calls may run at the same time; the rest wait'] ] },
   ];
   let stData = null, stText = '', stSec = store.get('sqzdb.stsec', 'app');
   const dig = (o, key) => key.split('.').reduce((v, k) => (v && typeof v === 'object' ? v[k] : undefined), o);
-  const shown = (type, v) => v === undefined || v === null ? '' : type === 'list' ? (Array.isArray(v) ? v.join(', ') : String(v)) : type === 'tables' ? (v && typeof v === 'object' ? Object.keys(v).join(', ') : '') : String(v);
+  const shown = (type, v) => v === undefined || v === null ? '' : type === 'list' ? (Array.isArray(v) ? v.join(', ') : String(v)) : type === 'tables' ? (v && typeof v === 'object' ? Object.keys(v).join(', ') : '') : type === 'text' && typeof v === 'object' ? String(v.to ?? '') : String(v);   // an app behind it may be a table: its address is .to
   const flagOf = (key) => dig(stData.flags, key);
   function stRender() {
     const d = stData;
@@ -1400,7 +1603,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     if ($('strestart')) $('strestart').onclick = stRestart;
     $('stgrid').innerHTML = ST.map((sec, si) => {
       const on = !sec.toggle || dig(d.values, sec.toggle) !== undefined || flagOf(sec.toggle) !== undefined;
-      return `<section class="card st-sec${on ? '' : ' st-off'}${sec.id === stSec ? '' : ' hidden'}" data-sec="${si}" data-id="${sec.id}"><h3>${esc(sec.title)}${sec.toggle ? `<label class="sw"><input type="checkbox" data-toggle="${esc(sec.toggle)}"${on ? ' checked' : ''}${flagOf(sec.toggle) !== undefined ? ' disabled' : ''}>On</label>` : ''}</h3><p class="lead">${esc(sec.lead)}</p>`
+      return `<section class="card st-sec${on ? '' : ' st-off'}${sec.id === stSec ? '' : ' hidden'}" data-sec="${si}" data-id="${sec.id}"><h3>${esc(sec.title)}${sec.toggle ? `<label class="sw"><input type="checkbox" data-toggle="${esc(sec.toggle)}"${on ? ' checked' : ''}${flagOf(sec.toggle) !== undefined ? ' disabled' : ''}>On</label>` : ''}</h3><p class="lead">${esc(sec.lead)}</p>${sec.id === 'mcp' ? '<p class="lead st-note" id="stmcp"></p>' : ''}`
         + sec.fields.map(([key, label, type, ph, hint, opts]) => {
           const fixed = flagOf(key); const v = dig(d.values, key); const sec2 = d.secrets[key];
           const id = 'st-' + key.replace(/\./g, '-');
@@ -1411,7 +1614,7 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
           else if (type === 'secret') input = `<input class="input" type="password" id="${id}" data-key="${esc(key)}" data-type="secret" autocomplete="new-password" placeholder="${sec2 === undefined ? 'not set' : sec2 ? esc(sec2) : 'set: type to change'}"${fixed !== undefined || !on ? ' disabled' : ''}>`;
           else input = `<input class="input" id="${id}" data-key="${esc(key)}" data-type="${type}" value="${esc(shown(type, fixed !== undefined ? fixed : v))}" placeholder="${esc(ph)}" spellcheck="false" autocomplete="off"${fixed !== undefined || !on ? ' disabled' : ''}>`;
           const clear = type === 'secret' && sec2 !== undefined && fixed === undefined ? `<button class="clear" data-unset="${esc(key)}">remove</button>` : '';
-          return `<label class="st-f"><span>${esc(label)}${hint ? ` <small>${esc(hint)}</small>` : ''}${fixed !== undefined ? '<em class="fixed">from the command line</em>' : ''}${clear}</span>${input}</label>`;
+          return `<label class="st-f"><span>${esc(label)}${fixed !== undefined ? '<em class="fixed">from the command line</em>' : ''}${clear}${hint ? `<small>${esc(hint)}</small>` : ''}</span>${input}</label>`;
         }).join('') + '</section>';
     }).join('');
     for (const el of $('stgrid').querySelectorAll('[data-key], [data-toggle]')) el.addEventListener(el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'input', stDirty);
@@ -1420,6 +1623,22 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     if (d.broken) { $('sterr').innerHTML = `<span class="ecode">CONFIG</span><span class="msg">${esc(d.broken + '\nIt isn\u2019t shown here: its secrets can\u2019t be told apart from the rest.')}</span>`; $('sterr').classList.remove('hidden'); }
     stText = d.text; $('sttext').value = d.text; $('sttext').readOnly = false; $('stnav').classList.remove('hidden'); stSync();
     stShow(stSec === 'file' || ST.some((x) => x.id === stSec) ? stSec : 'app'); stDirty();
+  }
+  // a setting as the form has it now: fixed from the command line, typed, or saved
+  function stCur(key) { const fx = flagOf(key); if (fx !== undefined) return fx; const f = $('st-' + key.replace(/\./g, '-')); return f && !f.disabled ? f.value.trim() : dig(stData.values, key); }
+  // under the MCP switch: the address agents connect at, as the form stands, or what is missing for one
+  function stNotes() {
+    const el = $('stmcp'); if (!el || !stData) return;
+    const listen = String(stCur('listen.app') ?? ''); const pub = String(stCur('app.publicUrl') ?? '');
+    const doms = stCur('app.tls.domains'); const dom = (Array.isArray(doms) ? doms : String(doms ?? '').split(/[,\n]/)).map((x) => String(x).trim()).filter(Boolean)[0];
+    const local = /^(127\.0\.0\.1|localhost|\[::1\]):\d+$/.test(listen);
+    const addr = pub || (dom ? 'https://' + dom : '') || (local ? 'http://' + listen : '');
+    const go = (key, text) => `<a href="#" data-gofield="${esc(key)}">${text}</a>`;
+    if (!listen) el.innerHTML = `<b>Needs the app server:</b> agents connect through it. Set its ${go('listen.app', 'Address')} under App server (or start with --app).`;
+    else if (!addr) el.innerHTML = `<b>Needs the address agents reach this server at.</b> Set ${go('app.publicUrl', 'Public address')} under App server to your https URL, or ${go('app.tls.domains', 'Domains')} under HTTPS certificate. For this machine only, an Address of <code>127.0.0.1:${esc(listen.split(':').pop() || '7780')}</code> is enough.`;
+    else if (/^http:\/\//.test(addr) && !/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(addr)) el.innerHTML = `<b>Agents elsewhere need https.</b> <code>${esc(addr)}</code> works on this machine only: set ${go('app.publicUrl', 'Public address')} to an https URL, or ${go('app.tls.domains', 'Domains')} under HTTPS certificate.`;
+    else el.innerHTML = `Agents connect at <code>${esc(addr)}/mcp</code>${pub ? '' : dom ? ', from the first HTTPS domain' : `, this machine only (the app server listens on ${esc(listen)})`}.`;
+    for (const a of el.querySelectorAll('[data-gofield]')) a.onclick = (e) => { e.preventDefault(); const sec = ST.find((x) => x.fields.some(([k]) => k === a.dataset.gofield)); stShow(sec ? sec.id : 'app'); const f = $('st-' + a.dataset.gofield.replace(/\./g, '-')); if (f) { f.focus(); f.scrollIntoView({ block: 'center' }); } };
   }
   // the menu: each section, on or off, and whether it has changes not saved; then the file
   function stNav() {
@@ -1454,14 +1673,15 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
         const raw = f.value.trim();
         let v = raw === '' ? null : type === 'choice' ? raw : type === 'int' ? Number(raw) : type === 'bool' ? raw === 'true' : type === 'list' ? raw.split(/[,\n]/).map((x) => x.trim()).filter(Boolean)
           : type === 'tables' ? Object.fromEntries(raw.split(/[,\n]/).map((x) => x.trim()).filter(Boolean).map((t) => [t, Array.isArray(old?.[t]) ? old[t] : []])) : raw;
-        if (JSON.stringify(v ?? null) !== JSON.stringify(old ?? null)) set[key] = v;
+        const table = type === 'text' && old && typeof old === 'object';   // [app.proxy] with timeout and connections: change its address, keep the rest
+        if (JSON.stringify(v ?? null) !== JSON.stringify((table ? old.to : old) ?? null)) set[table && v !== null ? key + '.to' : key] = v;
       }
     }
     // a section turned on goes in as one table with its fields
     for (const sec of ST) if (sec.toggle && set[sec.toggle] && typeof set[sec.toggle] === 'object') for (const k of Object.keys(set)) if (k.startsWith(sec.toggle + '.')) { set[sec.toggle][k.slice(sec.toggle.length + 1)] = set[k]; delete set[k]; }
     return set;
   }
-  function stDirty() { const n = Object.keys(stChanges()).length; $('stsave').disabled = !n; $('streset').disabled = !n; $('stmeta').textContent = n ? `${n} change${n === 1 ? '' : 's'} not saved, in any section` : ''; if ($('stnav').childElementCount) stNav(); }
+  function stDirty() { stNotes(); const n = Object.keys(stChanges()).length; $('stsave').disabled = !n; $('streset').disabled = !n; $('stmeta').textContent = n ? `${n} change${n === 1 ? '' : 's'} not saved, in any section` : ''; if ($('stnav').childElementCount) stNav(); }
   function stSync() { if ($('stnav').childElementCount) stNav(); const v = $('sttext').value; $('sthl').textContent = v + '\n'; let g = ''; for (let k = 1, m = v.split('\n').length; k <= m; k++) g += k + '\n'; $('stgutter').textContent = g; $('stfilesave').disabled = !stData?.editable || v === stText; }
   $('sttext').addEventListener('input', stSync);
   $('sttext').addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); if (!$('stfilesave').disabled) stSave({ text: $('sttext').value }); } });
