@@ -476,7 +476,7 @@ async fn handlers(sql: &Arc<Sql>, st: &AppState, ip: IpAddr, mut req: hyper::Req
                 Some(b.body(full(body)).unwrap_or_else(|_| into_response(respond(500, "text/plain", b"a response header that HTTP can't carry", &[]))))
             }
             Err(e) => {
-                let status = match e.code.as_str() { "AUTH" => 401, "DENIED" => 403, "NOT_FOUND" => 404, "LIMIT" => 503, "CONFLICT" => 409, "FUNCTION" => 500, _ => 400 };
+                let status = crate::functions::http_status(&e);
                 Some(into_response(json_resp(status, &json!({"error": e.message, "code": e.code}), &[])))
             }
         }
@@ -515,8 +515,16 @@ fn as_left(came: &hyper::HeaderMap, given: &[(String, String)], left: &[(String,
 /// else no one, with no grants at all (`admin` is still the handler's to use). The user's row: only for a sign-in.
 fn handler_session(sql: &Sql, headers: &hyper::HeaderMap, host: Option<&str>) -> (Session, Option<HashMap<String, Value>>, Vec<String>) {
     if let Some(t) = token_in(sql, headers, host) { let mut s = Session::default(); if sql.session_from_token(&mut s, &t).is_ok() { let (u, r) = (s.attrs.clone(), s.roles.clone()); return (s, Some(u), r); } }
-    if let Some(r) = &sql.cfg.app.anonymous_role { let mut s = Session::default(); if sql.assume(&mut s, &[r.clone()], HashMap::new()).is_ok() { return (s, None, vec![r.clone()]); } }
-    (Session { user: Some("(no one)".into()), ..Session::default() }, None, vec![])
+    let (s, roles) = visitor_session(sql);
+    (s, None, roles)
+}
+/// Whether the app's middleware runs for a request to `path` (as sent): every path but the ones agents' clients drive
+/// by their protocols, `/mcp`, `/oauth/…` and `/.well-known/…`, which a middleware's answer would only break.
+pub(crate) fn guarded(path: &str) -> bool { !(path == "/mcp" || path.starts_with("/oauth/") || path.starts_with("/.well-known/")) }
+/// Who a request with no sign-in acts for: `app.anonymousRole`, or no one, with no grants at all.
+pub(crate) fn visitor_session(sql: &Sql) -> (Session, Vec<String>) {
+    if let Some(r) = &sql.cfg.app.anonymous_role { let mut s = Session::default(); if sql.assume(&mut s, &[r.clone()], HashMap::new()).is_ok() { return (s, vec![r.clone()]); } }
+    (Session { user: Some("(no one)".into()), ..Session::default() }, vec![])
 }
 /// The session token a request carries: `Authorization: Bearer …`, or the session cookie (from the API's own site;
 /// read as bytes, so a cookie of the app's with other bytes in it doesn't hide it).
@@ -567,14 +575,20 @@ async fn route(weak: &Weak<Sql>, st: &Arc<AppState>, peer: IpAddr, mut req: hype
         let trusted = sql.cfg.app.trust_proxy.iter().any(|n| n.contains(peer));
         (sql.cfg.app.max_request, crate::proxy::client_ip(&sql.cfg.app.trust_proxy, peer, req.headers()), trusted, crate::proxy::ours(&sql, &path))
     };
-    // a request for the app, not the API: a client's X-Sqz-… are dropped (only the API sets them), then the app's
-    // middleware runs, and a route of the app's answers it, or it goes on (to the app behind, or a file)
+    // a request for the app, not the API: a client's X-Sqz-… are dropped (only the API sets them)
     if !ours {
         let theirs: Vec<hyper::header::HeaderName> = req.headers().keys().filter(|k| k.as_str().starts_with("x-sqz-")).cloned().collect();
         for k in theirs { req.headers_mut().remove(k); }
+    }
+    // the app's middleware runs, for the API's own endpoints as for the app's pages (the agent sign-in paths apart),
+    // then a route of the app's answers it, or it goes on: to the API's endpoint, the app behind, or a file
+    if guarded(&path) {
         if let Some(sql) = weak.upgrade() {
-            // the app's guards can't run: nothing of the app is served unguarded meanwhile
-            if sql.functions_broken() { return into_response(respond(503, "text/html; charset=utf-8", b"<!doctype html><meta charset=utf-8><title>Unavailable</title><p>This site is unavailable: its server code (the deployed functions) doesn't load. The server's log says why.", &[("Cache-Control".into(), "no-store".into())])); }
+            // the app's guards can't run: nothing is served unguarded meanwhile
+            if sql.functions_broken() {
+                return into_response(if ours { json_resp(503, &json!({"error": "the deployed functions don't load, so nothing is served until they do; the server's log says why", "code": "FUNCTION"}), &[]) }
+                    else { respond(503, "text/html; charset=utf-8", b"<!doctype html><meta charset=utf-8><title>Unavailable</title><p>This site is unavailable: its server code (the deployed functions) doesn't load. The server's log says why.", &[("Cache-Control".into(), "no-store".into())]) });
+            }
             if sql.has_http() { req = match handlers(&sql, st, ip, req, max).await { Ok(r) => r, Err(answer) => return answer }; }
         }
     }

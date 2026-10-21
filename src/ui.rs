@@ -284,6 +284,7 @@ fn serve(weak: std::sync::Weak<Sql>, stream: TcpStream, token: &str) -> std::io:
                         ("GET", "/api/functions") => json_resp(&mut w, 200, &api_functions(&sql))?,
                         ("POST", "/api/functions") => { let (st, v) = api_deploy(&sql, &req.body); json_resp(&mut w, st, &v)? }
                         ("POST", "/api/functions/call") => { let (st, v) = api_call(&sql, &req.body); json_resp(&mut w, st, &v)? }
+                        ("POST", "/api/functions/request") => { let (st, v) = api_request(&sql, &req.body); json_resp(&mut w, st, &v)? }
                         ("POST", "/api/backup/test") => json_resp(&mut w, 200, &api_backup_test(&sql))?,
                         ("POST", "/api/snapshot") => { let st = sql.snapshot(); json_resp(&mut w, 200, &json!({"rows": st.rows, "bytes": st.bytes, "secs": st.secs, "deletedSegments": st.deleted_segments}))? }
                         ("GET", "/api/live") => { drop(sql); return stream_events(&weak, &sess, &req, w, false) }
@@ -479,6 +480,36 @@ fn api_call(sql: &Sql, body: &[u8]) -> (u16, J) {
         Ok(r) => (200, json!({"result": r, "ms": t.elapsed().as_secs_f64() * 1000.0})),
         Err(e) => (400, json!({"error": e.message, "code": e.code})),
     }
+}
+
+/// A request tried through the deployed middleware and routes, as the app server would run it: `{"method", "path"
+/// (with its query), "headers": {name: value}, "body", "as"}`. `as` null: no one signed in (what `app.anonymousRole`
+/// allows, if set); `{"roles", "attrs"}`: a signed-in user of those roles whose row is `attrs`. Back: the handlers that
+/// ran, and the response as a client would get it (`status` null: no route for it, the request would go on to the app).
+fn api_request(sql: &Sql, body: &[u8]) -> (u16, J) {
+    let Ok(v) = serde_json::from_slice::<J>(body) else { return (400, json!({"error": "send {\"method\", \"path\", \"headers\", \"body\", \"as\"}", "code": "ARGUMENTS"})) };
+    let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("GET").trim().to_ascii_uppercase();
+    if !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].contains(&method.as_str()) { return (400, json!({"error": format!("method: {method} is not one a route answers"), "code": "ARGUMENTS"})); }
+    let target = v.get("path").and_then(|p| p.as_str()).unwrap_or("/").trim();
+    let (raw_path, query) = target.split_once('?').map(|(p, q)| (p.to_string(), q.to_string())).unwrap_or((target.to_string(), String::new()));
+    let raw_path = if raw_path.starts_with('/') { raw_path } else { format!("/{raw_path}") };
+    let Some(path) = crate::functions::match_path(&raw_path) else { return (400, json!({"error": "path: one with . or .. segments, or an encoded slash, is refused before any handler", "code": "ARGUMENTS"})) };
+    let headers: Vec<(String, String)> = v.get("headers").and_then(|h| h.as_object()).map(|m| m.iter().filter_map(|(k, x)| x.as_str().map(|s| (k.trim().to_ascii_lowercase(), s.to_string()))).filter(|(k, _)| !k.is_empty()).collect()).unwrap_or_default();
+    let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").as_bytes().to_vec();
+    let (mut sess, user, roles) = match v.get("as").filter(|w| !w.is_null()) {
+        Some(who) => { let mut s = Session::default(); if let Err(e) = sql.assume_json(&mut s, &who.to_string()) { return (400, json!({"error": e, "code": "ARGUMENTS"})); } let (u, r) = (s.attrs.clone(), s.roles.clone()); (s, Some(u), r) }
+        None => { let (s, r) = crate::app::visitor_session(sql); (s, None, r) }
+    };
+    let guarded = crate::app::guarded(&raw_path);
+    let ours = crate::proxy::ours(sql, &raw_path);
+    let mut req = crate::functions::HttpReq { method, path, raw_path, query, headers, ip: "127.0.0.1".into(), params: vec![], body: None };
+    let t = Instant::now();
+    // the agent sign-in paths: no middleware runs, the request is sqzdb's as sent
+    let tried = if guarded { sql.try_request(&mut sess, &mut req, body, user, roles) } else { crate::functions::Tried { handlers: vec![], status: None, headers: req.headers.clone(), body: vec![], error: None } };
+    let text = String::from_utf8(tried.body.clone()).ok();
+    // `onTo`: where a request no route answered goes on to, sqzdb's own endpoint or the app
+    (200, json!({ "handlers": tried.handlers, "status": tried.status, "headers": tried.headers, "body": text, "bytes": tried.body.len(), "error": tried.error.map(|e| json!({"error": e.message, "code": e.code})),
+                  "guarded": guarded, "onTo": if tried.status.is_none() { json!(if ours { "api" } else { "app" }) } else { J::Null }, "ms": t.elapsed().as_secs_f64() * 1000.0 }))
 }
 
 fn cmds_str(m: u8) -> Vec<&'static str> { let mut v = vec![]; if m & P_SELECT != 0 { v.push("SELECT"); } if m & P_INSERT != 0 { v.push("INSERT"); } if m & P_UPDATE != 0 { v.push("UPDATE"); } if m & P_DELETE != 0 { v.push("DELETE"); } v }

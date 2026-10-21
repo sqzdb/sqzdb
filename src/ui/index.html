@@ -338,43 +338,58 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 @keyframes toastin { from { transform:translateY(6px); opacity:0 } to { transform:none; opacity:1 } }
 
 /* functions */
-.fn-head { display:flex; align-items:flex-start; gap:16px; padding:12px 14px; flex-wrap:wrap }
-.fn-head > div { flex:1 1 320px; min-width:0 }
-.fn-head h3 { margin:0 0 2px; font-size:14px }
-.fn-head p { margin:0; color:var(--text-3); font-size:12.5px }
-.fn-head code, .fn-try code, .fn-exports code { font:12px var(--mono); color:var(--text-2) }
-.fn-grid { display:grid; grid-template-columns:250px minmax(0,1fr); gap:12px; align-items:start }
-.fn-side { display:flex; flex-direction:column; min-width:0 }
-.fn-side header { display:flex; align-items:center; gap:6px; padding:9px 12px; border-bottom:1px solid var(--line); color:var(--text-3); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em }
-.fn-side header + * { border-bottom:1px solid var(--line) }
+.fn-top { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:0 2px 10px; color:var(--text-3); font-size:12.5px }
+.fn-top p { margin:0; flex:1 1 420px; min-width:0 } .fn-top b { color:var(--text-2); font-weight:600 }
+.fn-mcp { display:inline-flex; align-items:center; gap:8px; height:28px; padding:0 4px 0 11px; border:1px solid var(--line); border-radius:999px; background:var(--panel); color:var(--text-2); font-size:12px; white-space:nowrap }
+.fn-mcp .dot { width:7px; height:7px; border-radius:50%; background:var(--text-3); flex:none } .fn-mcp .dot.on { background:var(--ok) }
+.fn-mcp code { font:12px var(--mono); color:var(--text-2) } .fn-mcp .sep { color:var(--text-3) }
+.fn-mcp .btn { height:22px; padding:0 8px; font-size:11.5px }
+.fn-grid { display:grid; grid-template-columns:300px minmax(0,1fr); gap:12px; align-items:stretch }
+.fn-side { display:flex; flex-direction:column; min-width:0; overflow:hidden }
+.fn-side header { display:flex; align-items:center; gap:6px; flex:none; height:42px; padding:0 14px; border-bottom:1px solid var(--line); color:var(--text-3); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em }
 .fn-side header .spacer { flex:1 }
-.fn-side header .btn { text-transform:none; letter-spacing:0; font-weight:500 }
-.fn-files { list-style:none; margin:0; padding:6px }
-.fn-files button { width:100%; display:flex; align-items:center; gap:8px; padding:5px 8px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--text-2); font:12.5px var(--mono); cursor:pointer; text-align:left }
-.fn-files button:hover { background:var(--hover) } .fn-files button.on { background:var(--active); color:var(--text) }
-.fn-files .mark { margin-left:auto; width:6px; height:6px; border-radius:50%; background:var(--warn) }
-.fn-files .none, .fn-exports .none { padding:6px 8px; color:var(--text-3); font-size:12px }
-.fn-exports { list-style:none; margin:0; padding:8px 12px 12px; display:flex; flex-direction:column; gap:9px }
-.fn-exports .n { display:flex; align-items:center; gap:6px; font:12.5px var(--mono); color:var(--text) }
-.fn-exports .d { color:var(--text-3); font-size:11.5px; margin-top:1px; overflow-wrap:anywhere }
-.fn-kind { font:10px var(--mono); padding:0 5px; border-radius:4px; border:1px solid var(--line-2); color:var(--text-3) }
-.fn-kind.tool { color:var(--ok); border-color:rgba(92,201,143,.35) }
+.fn-groups { flex:1; min-height:0; overflow:auto; padding:4px 0 8px; scrollbar-width:thin; scrollbar-color:var(--line-2) transparent }
+.fn-group h4 { margin:0; padding:12px 14px 4px; font:600 10px/1.4 var(--sans); letter-spacing:.1em; text-transform:uppercase; color:var(--cmt) }
+.fn-group ul { list-style:none; margin:0; padding:0 6px }
+.fn-group button { width:100%; display:flex; align-items:flex-start; gap:9px; padding:6px 8px; border:0; border-radius:var(--r-sm); background:transparent; text-align:left; cursor:pointer; color:var(--text); font:inherit }
+.fn-group button:hover { background:var(--hover) }
+.fn-group .k { flex:none; margin-top:2px; min-width:18px; height:18px; padding:0 5px; box-sizing:border-box; border-radius:999px; border:1px solid var(--line-2); display:inline-grid; place-items:center; font:10.5px var(--mono); color:var(--text-3) }
+.fn-group .k.m { border-radius:4px; border-color:transparent; background:var(--raised); color:var(--text-2); letter-spacing:.02em }
+.fn-group .t { flex:1; min-width:0; display:flex; flex-direction:column; gap:1px }
+.fn-group .n { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font:12.5px var(--mono); color:var(--text); overflow-wrap:anywhere }
+.fn-group .d { color:var(--text-3); font-size:11.5px; overflow-wrap:anywhere }
+.fn-group .f { flex:none; margin-top:3px; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:11px var(--mono); color:var(--text-3) }
+.fn-group .none { margin:0; padding:2px 14px 6px; color:var(--text-3); font-size:12px }
+.fn-chip { display:inline-flex; align-items:center; height:16px; padding:0 5px; border-radius:4px; border:1px solid var(--line-2); font:10px var(--mono); color:var(--text-3) }
+.fn-chip.on { color:var(--ok); border-color:rgba(92,201,143,.35) }
+.fn-editor { display:flex; flex-direction:column; min-width:0 }
 .fn-bar { display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid var(--line); flex-wrap:wrap }
-.fn-bar .input { width:230px; font:12.5px var(--mono) }
-.fn-bar .spacer { flex:1 }
-.fn-reach { display:flex; gap:6px; flex-wrap:wrap; min-width:0; flex:1 }
-.fn-chip { display:inline-flex; gap:6px; align-items:center; font:11px var(--mono); color:var(--text-2); padding:2px 8px; border:1px solid var(--line-2); border-radius:999px; white-space:nowrap }
-.fn-chip b { color:var(--text); font-weight:600 } .fn-chip .mcp { color:var(--ok) }
+.fn-bar .input { width:230px; font:12.5px var(--mono) } .fn-bar .spacer { flex:1 }
+.fn-tabs { display:flex; align-items:center; gap:4px; flex:none; height:42px; padding:0 8px 0 6px; border-bottom:1px solid var(--line) }
+.fn-tablist { display:flex; align-items:center; gap:2px; height:100%; min-width:0; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin }
+.fn-tab { position:relative; flex:none; display:inline-flex; align-items:center; gap:7px; height:100%; padding:0 10px; border:0; background:transparent; color:var(--text-3); font:12.5px var(--mono); cursor:pointer; white-space:nowrap }
+.fn-tab:hover, .fn-tab[aria-selected="true"] { color:var(--text) }
+.fn-tab[aria-selected="true"]::after { content:""; position:absolute; left:8px; right:8px; bottom:0; height:2px; border-radius:2px; background:var(--text) }
+.fn-tab .mark { width:6px; height:6px; border-radius:50%; background:var(--warn) }
+.fn-rename { height:26px; width:170px; margin:0 4px; font:12.5px var(--mono) }
+.fn-tablist .none { color:var(--text-3); font-size:12px; padding:0 6px; white-space:nowrap }
+.fn-tools { display:flex; align-items:center; gap:2px; flex:none; padding-left:2px }
+.fn-tabs .spacer { flex:1 }
+.fn-tabs .meta { flex:none; margin-right:6px }
+.fn-actions { display:flex; align-items:center; gap:4px; flex:none }
 .fn-new { position:relative }
 .fn-menu { left:0; top:calc(100% + 4px); width:330px; max-height:none; text-transform:none; letter-spacing:0; font-weight:400; font-size:12.5px }
 .fn-menu .item { flex-direction:column; align-items:flex-start; gap:2px } .fn-menu .item b { color:var(--text); font-weight:600 } .fn-menu .item small { white-space:normal; line-height:1.4 }
-.fn-editor .editor { max-height:none; min-height:320px; height:50vh; border-radius:0 0 var(--r) var(--r) }
-.fn-try { padding:12px 14px; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px }
-.fn-try h3 { grid-column:1/-1; margin:0; font-size:13px }
+.fn-editor .editor { flex:1; max-height:none; min-height:300px; height:46vh; border-radius:0 0 var(--r) var(--r); scrollbar-width:thin; scrollbar-color:var(--line-2) transparent }
+.fn-try { padding:12px 14px 14px; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px 12px }
+.fn-try h3 { grid-column:1/-1; margin:0 0 2px; font-size:13px }
+.fn-try h3 small { margin-left:8px; font-weight:400; font-size:12px; color:var(--text-3) }
 .fn-try label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-3); min-width:0 }
-.fn-try textarea.input { min-height:84px; font:12px/1.5 var(--mono); resize:vertical }
-.fn-try .row { grid-column:1/-1; display:flex; gap:8px; align-items:center; flex-wrap:wrap }
-.fn-out { grid-column:1/-1; margin:0; padding:10px 12px; border-radius:var(--r); background:var(--bg); border:1px solid var(--line); font:12px/1.55 var(--mono); white-space:pre-wrap; word-break:break-word; max-height:320px; overflow:auto; color:var(--text-2) }
+.fn-try code { font:12px var(--mono); color:var(--text-2) }
+.fn-try textarea.input { min-height:72px; padding:7px 10px; font:12px/1.5 var(--mono); resize:vertical }
+.fn-try .row { grid-column:1/-1; display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+.fn-try .fn-req { display:contents } .fn-try .fn-req .fn-line { display:grid; grid-template-columns:minmax(6em,auto) minmax(0,1fr); gap:8px } .fn-try .fn-req textarea.input { min-height:56px }
+.fn-out { grid-column:1/-1; margin:0; padding:10px 12px; border-radius:var(--r); background:var(--bg); border:1px solid var(--line); font:12px/1.55 var(--mono); white-space:pre-wrap; word-break:break-word; max-height:320px; overflow:auto; color:var(--text-2); scrollbar-width:thin }
 .fn-out.bad { color:#ffd0d0; border-color:rgba(255,112,112,.3); background:var(--bad-bg) }
 
 /* settings */
@@ -480,26 +495,24 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
     </section>
 
     <section id="tab-functions" class="view hidden" role="tabpanel" aria-labelledby="t-functions">
-      <div class="card fn-head">
-        <div><h3>Functions</h3><p id="fnsrc"></p></div>
-        <div><h3>Agents</h3><p id="fnmcp"></p></div>
+      <div class="fn-top">
+        <p id="fnsrc">Your app's server code: <b>functions</b> called by name (and tools for agents), <b>routes</b> that answer a path of yours, and <b>middleware</b> that runs before a request is answered. Deploy replaces what runs.</p>
+        <div class="fn-mcp" id="fnmcp"></div>
       </div>
       <div id="fnbroken" class="alert hidden" role="alert"></div>
       <div class="fn-grid">
         <div class="card fn-side">
-          <header><span>Files</span><span class="spacer"></span><div class="fn-new"><button id="fnnew" class="btn btn-sm btn-ghost" aria-haspopup="menu" aria-expanded="false">New ▾</button><div class="pop fn-menu hidden" id="fnmenu" role="menu"><button class="item" role="menuitem" data-new="fn"><b>Function</b><small>Called by name from your app (POST /api/fn/…, client.call), and a tool for agents over MCP</small></button><button class="item" role="menuitem" data-new="route"><b>REST route</b><small>Answers an HTTP method and path of yours, such as GET /jobs/:id</small></button><button class="item" role="menuitem" data-new="middleware"><b>Middleware</b><small>Runs before requests to the paths it matches reach your app</small></button></div></div><label class="btn btn-sm btn-ghost" id="fnuplabel">Upload<input type="file" id="fnupload" accept=".ts,.js,.mjs,.mts" multiple hidden></label></header>
-          <ul class="fn-files" id="fnfiles"></ul>
-          <header><span>Exports</span><span class="spacer"></span><span class="count" id="fncount"></span></header>
-          <ul class="fn-exports" id="fnexports"></ul>
+          <header><span>Deployed</span><span class="spacer"></span><span class="count" id="fncount"></span></header>
+          <div class="fn-groups" id="fnexports"></div>
         </div>
         <div style="display:flex; flex-direction:column; gap:12px; min-width:0">
           <div class="card fn-editor">
-            <div class="fn-bar">
-              <input id="fnname" class="input" placeholder="jobs.ts" spellcheck="false" autocomplete="off" aria-label="File name">
-              <div id="fnreach" class="fn-reach"></div><span class="meta" id="fnstate"></span>
-              <button id="fndelete" class="btn btn-sm btn-ghost">Delete file</button>
-              <button id="fnrevert" class="btn btn-sm btn-ghost">Revert</button>
-              <button id="fndeploy" class="btn btn-primary">Deploy <kbd>Ctrl S</kbd></button>
+            <div class="fn-tabs">
+              <div class="fn-tablist" id="fntabs" role="tablist" aria-label="Files"></div>
+              <div class="fn-tools" id="fntools"><div class="fn-new"><button id="fnnew" class="btn btn-sm btn-ghost" aria-haspopup="menu" aria-expanded="false">New ▾</button><div class="pop fn-menu hidden" id="fnmenu" role="menu"><button class="item" role="menuitem" data-new="fn"><b>Function</b><small>Called by name from your app (POST /api/fn/…, client.call), and a tool for agents over MCP</small></button><button class="item" role="menuitem" data-new="route"><b>REST route</b><small>Answers an HTTP method and path of yours, such as GET /jobs/:id</small></button><button class="item" role="menuitem" data-new="middleware"><b>Middleware</b><small>Runs before requests to the paths it matches are answered, by your app or by the API</small></button></div></div><label class="btn btn-sm btn-ghost" id="fnuplabel">Upload<input type="file" id="fnupload" accept=".ts,.js,.mjs,.mts" multiple hidden></label></div>
+              <span class="spacer"></span>
+              <span class="meta" id="fnstate"></span>
+              <div class="fn-actions" id="fnactions"><button id="fndelete" class="btn btn-sm btn-ghost">Delete file</button><button id="fnrevert" class="btn btn-sm btn-ghost">Revert</button><button id="fndeploy" class="btn btn-sm btn-primary">Deploy <kbd>Ctrl S</kbd></button></div>
             </div>
             <div class="editor" id="fneditor">
               <div class="gutter" id="fngutter" aria-hidden="true">1</div>
@@ -508,10 +521,15 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
           </div>
           <div id="fnerr" class="alert hidden" role="alert"></div>
           <div class="card fn-try">
-            <h3>Try a function</h3>
-            <label>Function<select id="fntry" class="input"></select></label>
+            <h3>Try it<small>runs for real, under the rules, as the identity you pick</small></h3>
+            <label>Export<select id="fntry" class="input"></select></label>
             <label>As<select id="fnas" class="input"><option value="app">The app (no user: rules see no one)</option><option value="role">An identity: a role, and attributes</option></select></label>
-            <label>Arguments (JSON)<textarea id="fnargs" class="input" spellcheck="false">{}</textarea></label>
+            <label id="fnargsl">Arguments (JSON)<textarea id="fnargs" class="input" spellcheck="false">{}</textarea></label>
+            <div class="fn-req hidden" id="fnreq">
+              <div class="fn-line"><label>Method<select id="fnmethod" class="input"></select></label><label>Path, with its query<input id="fnpath" class="input" spellcheck="false" autocomplete="off" placeholder="/jobs/1?q=x"></label></div>
+              <label id="fnbodyl">Body (JSON or text)<textarea id="fnbody" class="input" spellcheck="false" placeholder='{"title": "x"}'></textarea></label>
+              <label>Headers, one per line<textarea id="fnheaders" class="input" spellcheck="false" placeholder="cookie: k=v&#10;x-plan: pro"></textarea></label>
+            </div>
             <label id="fnwho" class="hidden">Role, and attributes (JSON) row policies read as SESSION.…<input id="fnrole" class="input" placeholder="member" spellcheck="false" autocomplete="off"><textarea id="fnattrs" class="input" spellcheck="false" placeholder='{"id": 1}'>{"id": 1}</textarea></label>
             <div class="row"><button id="fnrun" class="btn btn-primary">Call <kbd>Ctrl ↵</kbd></button><span class="meta" id="fnmeta"></span></div>
             <pre class="fn-out hidden" id="fnout"></pre>
@@ -1384,11 +1402,11 @@ pre.sql { margin:16px 0 0; padding:12px 14px; max-height:24vh; overflow:auto; ba
 // (client.call('hello', { name }) in the browser, db.call in Node), and agents get it as an MCP tool.
 export const hello = fn({
   description: 'Say hello to someone',   // what it does, for people and agents
-  args: { name: 'text' },                // checked before it runs: int, number, text, bool, uuid, json; ? when optional
+  args: { name: 'text' },                // checked before it runs: int, number, text, bool, uuid, json; ? = optional
   roles: ['member'],                     // who may call it; leave out for anyone signed in
-  method: 'POST',                        // or 'GET': answers GET /api/fn/hello?name=Ann too, and only reads
+  method: 'POST',                        // 'GET' answers GET /api/fn/hello?name=Ann too, and only reads
   mcp: true,                             // false keeps it off the agents' tool list
-  run: ({ db, admin, user }, { name }) => \`Hello, \${name}!\`,   // db: SQL as the caller; admin: as the app; one transaction
+  run: ({ db, admin, user }, { name }) => \`Hello, \${name}!\`,   // db: SQL as the caller; admin: as the app
 })
 ` },
     route: { file: 'routes.ts', text: `import { route } from 'sqzdb/functions'
@@ -1406,7 +1424,7 @@ export const job = route({
 ` },
     middleware: { file: 'middleware.ts', text: `import { middleware, signIn } from 'sqzdb/functions'
 
-// Middleware: runs before every request to the paths it matches reaches your app.
+// Middleware: runs before every request to the paths it matches is answered, by your app or by the API.
 export const guard = middleware({
   match: ['/dashboard/*', '/admin/*'],   // the paths it runs for
   order: 0,                              // lower runs first
@@ -1437,63 +1455,113 @@ export const guard = middleware({
   function renderFunctions() {
     if (!fnData) return;
     const ro = fnReadOnly();
-    const kinds = 'A <b>function</b> is called by name (POST /api/fn/…, client.call) and is an MCP tool for agents; a <b>REST route</b> answers a method and path of yours; <b>middleware</b> runs before requests reach your app. ';
-    $('fnsrc').innerHTML = kinds + (ro ? `Deployed from <code>${esc(fnData.folder)}</code>${fnData.watch ? ' as its files change' : ' when the server starts'}. Edit the files there; here they are read-only.`
-      : 'Kept in the database: they go with its backups and to its followers. Write, paste or upload files, then Deploy: they replace what is deployed, or nothing changes.');
+    // agents: where they connect, or what is missing for them
     const m = fnData.mcp;
-    $('fnmcp').innerHTML = !m ? 'MCP is off: turn on <b>Agents (MCP)</b> in Settings, and agents get each function they may call as a tool.'
-      : m.url ? `Agents connect to <code>${esc(m.url)}</code>, sign in, and get the functions their user may call as tools${m.sql ? ', with the SQL tools' : ''}. A deploy tells connected agents to list them again. <button class="btn btn-sm" id="fncopy">Copy for Claude Code</button>`
-      : 'MCP is on: set <code>app.publicUrl</code>, the address agents reach this server at.';
+    $('fnmcp').innerHTML = !m ? '<span class="dot"></span>MCP off<button class="btn btn-ghost" data-go="settings">Turn on in Settings</button>'
+      : m.url ? `<span class="dot on"></span>MCP<code>${esc(m.url)}</code>${m.sql ? '<span class="sep">+ SQL tools</span>' : ''}<button class="btn btn-ghost" id="fncopy">Copy for Claude Code</button>`
+      : '<span class="dot"></span>MCP on, no address yet<button class="btn btn-ghost" data-go="settings">Set app.publicUrl</button>';
+    $('fnmcp').title = !m ? 'Once Agents (MCP) is on, agents get each function they may call as a tool' : m.url ? 'Agents connect here, sign in, and get the functions their user may call as tools; a deploy tells them to list again' : 'Agents need the address they reach this server at';
     if ($('fncopy')) $('fncopy').onclick = () => navigator.clipboard?.writeText(`claude mcp add --transport http --scope user sqzdb ${m.url}`).then(() => toast('Copied'));
+    for (const b of $('fnmcp').querySelectorAll('[data-go]')) b.onclick = () => $('t-' + b.dataset.go).click();
     $('fnbroken').classList.toggle('hidden', !fnData.broken);
     if (fnData.broken) $('fnbroken').innerHTML = `<span class="ecode">FUNCTION</span><span class="msg">${esc("The deployed functions don't load, so they can't be called (and a site behind this server answers 503):\n" + fnData.broken)}</span>`;
+    // files, as tabs; double-click renames
     const names = fnNames();
-    $('fnfiles').innerHTML = names.length ? names.map((f) => `<li><button class="${f === fnCur ? 'on' : ''}" data-f="${esc(f)}">${esc(f)}${fnChanged(f) ? '<span class="mark" title="Not deployed"></span>' : ''}</button></li>`).join('')
-      : `<li class="none">${ro ? 'No files in the folder.' : 'None yet: New, or Upload.'}</li>`;
-    for (const b of $('fnfiles').querySelectorAll('button')) b.onclick = () => { fnCur = b.dataset.f; renderFunctions(); };
+    $('fntabs').innerHTML = names.length ? names.map((f) => `<button class="fn-tab" role="tab" aria-selected="${f === fnCur}" data-f="${esc(f)}"${ro ? '' : ' title="Double-click to rename"'}>${esc(f)}${fnChanged(f) ? '<span class="mark" title="Not deployed"></span>' : ''}</button>`).join('')
+      : `<span class="none">${ro ? 'No files in the folder' : 'No files yet'}</span>`;
+    for (const b of $('fntabs').querySelectorAll('button')) { b.onclick = () => { if (fnCur !== b.dataset.f) { fnCur = b.dataset.f; renderFunctions(); } }; if (!ro) b.ondblclick = () => fnRename(b); }
+    // what is deployed, as a request meets it: middleware in the order the server runs it, routes by path, functions by name
     const ex = fnData.exports || [];
     $('fncount').textContent = ex.length;
-    // where an export is reached: a function by name (and over GET when it says so), a route at its method and path,
-    // middleware before the paths it matches
     const reach = (d) => d.kind === 'function' ? `${d.method || 'POST'} /api/fn/${esc(d.name)}${d.method === 'GET' && d.args.length ? '?' + esc(d.args.filter((a) => !a.optional).map((a) => a.name + '=…').join('&')) : ''}`
       : d.kind === 'route' ? `${esc(d.methods.join(' '))} ${esc(d.paths.join(' '))}` : `before ${esc(d.paths.join(', '))}`;
-    const mcpChip = (d, cls) => d.kind === 'function' && d.mcp ? `<span class="${cls}" title="${m ? 'Agents get it as an MCP tool' : 'An MCP tool once Agents (MCP) is on in Settings'}">MCP${m ? '' : ' (off)'}</span>` : '';
-    $('fnexports').innerHTML = ex.length ? ex.map((d) => {
-      const args = d.args.map((a) => `${a.name}${a.optional ? '?' : ''}`).join(', ');
-      const who = d.kind === 'middleware' ? '' : d.roles ? `for ${esc(d.roles.join(', '))}` : d.kind === 'route' ? 'anyone' : 'anyone signed in';
-      return `<li><div class="n">${esc(d.name)}<span class="fn-kind">${d.kind === 'function' ? 'function' : d.kind === 'route' ? 'REST' : 'middleware'}</span>${mcpChip(d, 'fn-kind tool')}</div><div class="d">${reach(d)}${d.kind === 'function' ? ` (${esc(args)})` : ''}${who ? ` · ${who}` : ''}${d.readOnly ? ' · read-only' : ''} · ${esc(d.file)}</div></li>`;
-    }).join('') : '<li class="none">Nothing deployed.</li>';
-    $('fnreach').innerHTML = ex.filter((d) => d.file === fnCur).map((d) => `<span class="fn-chip"><b>${esc(d.name)}</b>${reach(d)}${mcpChip(d, 'mcp')}</span>`).join('');
+    const mcpChip = (d) => d.kind === 'function' && d.mcp ? `<span class="fn-chip${m ? ' on' : ''}" title="${m ? 'Agents get it as an MCP tool' : 'An MCP tool once Agents (MCP) is on in Settings'}">MCP${m ? '' : ' off'}</span>` : '';
+    const who = (d) => d.roles ? `for ${esc(d.roles.join(', '))}` : d.kind === 'route' ? 'anyone' : 'anyone signed in';
+    const args = (d) => d.args.map((a) => `${a.name}${a.optional ? '?' : ''}`).join(', ');
+    const by = (...keys) => (a, b) => { for (const k of keys) { const [x, y] = [k(a), k(b)]; if (x !== y) return x < y ? -1 : 1; } return 0; };
+    const mws = ex.filter((d) => d.kind === 'middleware').sort(by((d) => d.order ?? 0, (d) => d.file, (d) => d.name));
+    const routes = ex.filter((d) => d.kind === 'route').sort(by((d) => d.paths[0], (d) => d.name));
+    const fns = ex.filter((d) => d.kind === 'function').sort(by((d) => d.name));
+    const orders = mws.some((d) => d.order);   // the order values are shown once any is set
+    const row = (d, main, detail, lead = '') => `<li><button data-file="${esc(d.file)}" data-name="${esc(d.name)}" title="Open ${esc(d.file)} at ${esc(d.name)}">${lead}<span class="t"><span class="n">${main}</span><span class="d">${detail}</span></span><span class="f">${esc(d.file)}</span></button></li>`;
+    const group = (title, about, items, none) => `<section class="fn-group"><h4 title="${about}">${title}</h4>${items.length ? `<ul>${items.join('')}</ul>` : `<p class="none">${none}</p>`}</section>`;
+    $('fnexports').innerHTML =
+      group('Middleware', 'Runs in this order, before a request is answered', mws.map((d, i) => row(d, esc(d.name), `before ${esc(d.paths.join(', '))}${orders ? ` · order ${d.order ?? 0}` : ''}`, `<span class="k">${i + 1}</span>`)), 'None: requests go straight on')
+      + group('Routes', 'Answer a method and path of yours', routes.map((d) => row(d, esc(d.paths.join(' ')), `${esc(d.name)} · ${who(d)}`, `<span class="k m">${esc(d.methods.join(' '))}</span>`)), 'None')
+      + group('Functions', 'Called by name from your app; tools for agents', fns.map((d) => row(d, `${esc(d.name)}${mcpChip(d)}`, `${reach(d)} (${esc(args(d))}) · ${who(d)}${d.readOnly ? ' · read-only' : ''}`)), 'None');
+    for (const b of $('fnexports').querySelectorAll('button')) b.onclick = () => fnJump(b.dataset.file, b.dataset.name);
     // the editor
     const v = fnCur == null ? '' : fnText(fnCur);
     if (fnEl.value !== v || document.activeElement !== fnEl) fnEl.value = v;
-    fnEl.readOnly = ro || fnCur == null; $('fnname').value = fnCur ?? ''; $('fnname').disabled = ro || fnCur == null;
-    for (const id of ['fnnew', 'fndelete', 'fnrevert', 'fndeploy']) $(id).disabled = ro;
-    $('fnuplabel').classList.toggle('hidden', ro);
-    $('fndelete').disabled = ro || fnCur == null; $('fnrevert').disabled = ro || !fnDirty(); $('fndeploy').disabled = ro || !fnDirty();
-    $('fnstate').innerHTML = ro ? 'read-only' : fnDirty() ? '<b>Not deployed</b>' : names.length ? 'Deployed' : '';
+    fnEl.readOnly = ro || fnCur == null;
+    $('fntools').classList.toggle('hidden', ro); $('fnactions').classList.toggle('hidden', ro);
+    $('fndelete').disabled = fnCur == null; $('fnrevert').disabled = !fnDirty(); $('fndeploy').disabled = !fnDirty();
+    $('fnstate').innerHTML = ro ? `Read-only: deployed from <code>${esc(fnData.folder)}</code>${fnData.watch ? ' as its files change' : ' when the server starts'}` : fnDirty() ? '<b>Not deployed</b>' : names.length ? 'Deployed' : '';
     fnSync();
-    // try it
-    const fns = ex.filter((d) => d.kind === 'function'); const was = $('fntry').value;
-    $('fntry').innerHTML = fns.length ? fns.map((d) => `<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('') : '<option value="">No functions deployed</option>';
-    if (fns.some((d) => d.name === was)) $('fntry').value = was; else fnArgsFor();
-    $('fnrun').disabled = !fns.length;
+    // try it: a function by name, or a request through the middleware and routes
+    const was = $('fntry').value;
+    const label = (d) => d.kind === 'function' ? `${d.name} — function` : d.kind === 'route' ? `${d.methods.join(' ')} ${d.paths[0]} — ${d.name}` : `${d.name} — middleware, before ${d.paths.join(', ')}`;
+    $('fntry').innerHTML = ex.length ? ex.map((d) => `<option value="${esc(fnKey(d))}">${esc(label(d))}</option>`).join('') : '<option value="">Nothing deployed</option>';
+    const same = ex.some((d) => fnKey(d) === was); if (same) $('fntry').value = was;
+    fnTryFor(!same);
+    $('fnrun').disabled = !ex.length;
   }
-  function fnArgsFor() {
-    const d = (fnData?.exports || []).find((x) => x.name === $('fntry').value); if (!d) return;
-    const ex = { 'a whole number': 1, 'a number': 1.5, 'text': '', 'true or false': false, 'a UUID': '00000000-0000-0000-0000-000000000000' };
-    $('fnargs').value = JSON.stringify(Object.fromEntries(d.args.filter((a) => !a.optional).map((a) => [a.name, a.type in ex ? ex[a.type] : /^one of "([^"]*)"/.test(a.type) ? a.type.match(/^one of "([^"]*)"/)[1] : null])), null, 2);
+  // rename a file in place of its tab: Enter or leaving the field renames, Escape keeps the name
+  function fnRename(tab) {
+    const from = tab.dataset.f, inp = document.createElement('input');
+    inp.className = 'input fn-rename'; inp.value = from; inp.spellcheck = false; inp.setAttribute('aria-label', 'File name');
+    tab.replaceWith(inp); inp.focus(); inp.select();
+    let done = false;
+    const finish = (apply) => {
+      if (done) return; done = true;
+      const to = inp.value.trim();
+      if (!apply || !to || to === from) { renderFunctions(); return; }
+      if (fnNames().includes(to)) { toast(`${to} is there already`, true); renderFunctions(); return; }
+      fnEdits[to] = fnText(from); if (from in fnFiles) fnRemoved.add(from); delete fnEdits[from]; fnRemoved.delete(to); if (fnCur === from) fnCur = to;
+      renderFunctions();
+    };
+    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); finish(true); } else if (e.key === 'Escape') { e.preventDefault(); finish(false); } };
+    inp.onblur = () => finish(true);
+  }
+  const fnKey = (d) => `${d.kind}:${d.name}`;
+  const fnTried = () => (fnData?.exports || []).find((d) => fnKey(d) === $('fntry').value);
+  // the fields for the export chosen: arguments for a function; method, path, body and headers for a request.
+  // `fresh`: the choice changed, so the fields start over (a re-render keeps what was typed)
+  function fnTryFor(fresh = true) {
+    const d = fnTried(); const http = !!d && d.kind !== 'function';
+    $('fnreq').classList.toggle('hidden', !http); $('fnargsl').classList.toggle('hidden', !d || http);
+    $('fnrun').firstChild.textContent = http ? 'Send ' : 'Call ';
+    const [asApp, asRole] = $('fnas').options;
+    asApp.textContent = http ? 'No one signed in (a visitor)' : 'The app (no user: rules see no one)';
+    asRole.textContent = http ? 'A signed-in user: a role, and attributes' : 'An identity: a role, and attributes';
+    if (!d) return;
     if (d.roles && d.roles.length && !$('fnrole').value) $('fnrole').value = d.roles[0];
+    if (!fresh) return;
+    if (http) {
+      const methods = d.kind === 'route' ? d.methods : ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+      $('fnmethod').innerHTML = methods.map((m) => `<option>${esc(m)}</option>`).join('');
+      $('fnpath').value = (d.paths[0] || '/').replace(/:[A-Za-z_][A-Za-z0-9_]*/g, '1').replace(/\*/g, 'x');
+      $('fnbody').value = ''; $('fnheaders').value = ''; fnBodyFor();
+    } else {
+      const ex = { 'a whole number': 1, 'a number': 1.5, 'text': '', 'true or false': false, 'a UUID': '00000000-0000-0000-0000-000000000000' };
+      $('fnargs').value = JSON.stringify(Object.fromEntries(d.args.filter((a) => !a.optional).map((a) => [a.name, a.type in ex ? ex[a.type] : /^one of "([^"]*)"/.test(a.type) ? a.type.match(/^one of "([^"]*)"/)[1] : null])), null, 2);
+    }
   }
-  fnEl.addEventListener('input', () => { if (fnCur == null) return; fnEdits[fnCur] = fnEl.value; fnSync(); $('fnstate').innerHTML = fnDirty() ? '<b>Not deployed</b>' : 'Deployed'; $('fndeploy').disabled = !fnDirty(); $('fnrevert').disabled = !fnDirty(); const b = $('fnfiles').querySelector('button.on'); if (b && !b.querySelector('.mark') && fnChanged(fnCur)) b.insertAdjacentHTML('beforeend', '<span class="mark" title="Not deployed"></span>'); });
+  const fnBodyFor = () => $('fnbodyl').classList.toggle('hidden', ['GET', 'HEAD'].includes($('fnmethod').value));
+  // open the file an export is in, with the editor at the export
+  function fnJump(file, name) {
+    if (!fnNames().includes(file)) { toast(`${file} is not among the files here`, true); return; }
+    fnCur = file; renderFunctions();
+    const text = fnEl.value, m = new RegExp(`export\\s+(?:const|let|var|async\\s+function|function)\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).exec(text);
+    fnEl.focus(); if (!m) return;
+    fnEl.setSelectionRange(m.index, m.index + m[0].length);
+    const line = text.slice(0, m.index).split('\n').length - 1, lh = parseFloat(getComputedStyle($('fngutter')).lineHeight) || 21;
+    $('fneditor').scrollTop = Math.max(0, line * lh - $('fneditor').clientHeight / 3);
+  }
+  fnEl.addEventListener('input', () => { if (fnCur == null) return; fnEdits[fnCur] = fnEl.value; fnSync(); $('fnstate').innerHTML = fnDirty() ? '<b>Not deployed</b>' : 'Deployed'; $('fndeploy').disabled = !fnDirty(); $('fnrevert').disabled = !fnDirty(); const b = $('fntabs').querySelector('button[aria-selected="true"]'); if (b && !b.querySelector('.mark') && fnChanged(fnCur)) b.insertAdjacentHTML('beforeend', '<span class="mark" title="Not deployed"></span>'); });
   fnEl.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'Enter')) { e.preventDefault(); if (!$('fndeploy').disabled) fnDeploy(); return; }
     if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !fnEl.readOnly) { e.preventDefault(); document.execCommand('insertText', false, '  '); }
-  });
-  $('fnname').addEventListener('change', () => {
-    const to = $('fnname').value.trim(); if (!to || to === fnCur || fnCur == null) { $('fnname').value = fnCur ?? ''; return; }
-    if (fnNames().includes(to)) { toast(`${to} is there already`, true); $('fnname').value = fnCur; return; }
-    fnEdits[to] = fnText(fnCur); if (fnCur in fnFiles) fnRemoved.add(fnCur); delete fnEdits[fnCur]; fnRemoved.delete(to); fnCur = to; renderFunctions();
   });
   const fnMenu = (open) => { $('fnmenu').classList.toggle('hidden', !open); $('fnnew').setAttribute('aria-expanded', String(open)); };
   $('fnnew').onclick = (e) => { e.stopPropagation(); fnMenu($('fnmenu').classList.contains('hidden')); };
@@ -1525,7 +1593,7 @@ export const guard = middleware({
     }
   }
   $('fndeploy').onclick = fnDeploy;
-  $('fntry').onchange = fnArgsFor;
+  $('fntry').onchange = () => fnTryFor(true); $('fnmethod').onchange = fnBodyFor;
   $('fnas').onchange = () => $('fnwho').classList.toggle('hidden', $('fnas').value !== 'role');
   async function fnCall() {
     const out = $('fnout'); out.classList.remove('hidden', 'bad');
@@ -1535,12 +1603,38 @@ export const guard = middleware({
       let attrs; try { attrs = JSON.parse($('fnattrs').value || '{}'); } catch (_) { out.classList.add('bad'); out.textContent = 'The attributes are not JSON.'; return; }
       who = { roles: [$('fnrole').value.trim()].filter(Boolean), attrs };
     }
+    const d = fnTried(); if (!d) return;
+    if (d.kind !== 'function') return fnSend(d, who);
     $('fnmeta').textContent = 'calling…';
-    try { const r = await api('/api/functions/call', { method: 'POST', body: JSON.stringify({ name: $('fntry').value, args, as: who }) }); out.textContent = JSON.stringify(r.result, null, 2); $('fnmeta').textContent = `${r.ms.toFixed(2)} ms`; }
+    try { const r = await api('/api/functions/call', { method: 'POST', body: JSON.stringify({ name: d.name, args, as: who }) }); out.textContent = JSON.stringify(r.result, null, 2); $('fnmeta').textContent = `${r.ms.toFixed(2)} ms`; }
     catch (e) { if (e.auth) return; out.classList.add('bad'); out.textContent = `${e.code}: ${e.message}`; $('fnmeta').textContent = ''; }
   }
+  const REASON = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 303: 'See Other', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 500: 'Internal Server Error', 503: 'Service Unavailable' };
+  async function fnSend(d, who) {
+    const out = $('fnout');
+    const headers = {};
+    for (const line of $('fnheaders').value.split('\n')) {
+      if (!line.trim()) continue;
+      const m = line.match(/^\s*([^:\s]+)\s*:\s*(.*)$/); if (!m) { out.classList.add('bad'); out.textContent = `Not a header (Name: value): ${line}`; return; }
+      headers[m[1].toLowerCase()] = m[2];
+    }
+    const method = $('fnmethod').value, path = $('fnpath').value.trim() || '/';
+    const body = $('fnbodyl').classList.contains('hidden') ? '' : $('fnbody').value;
+    if (body && !headers['content-type']) headers['content-type'] = /^\s*[\[{"]/.test(body) ? 'application/json' : 'text/plain';
+    $('fnmeta').textContent = 'sending…';
+    try {
+      const r = await api('/api/functions/request', { method: 'POST', body: JSON.stringify({ method, path, headers, body, as: who }) });
+      $('fnmeta').textContent = `${r.ms.toFixed(2)} ms · ${!r.guarded ? 'middleware does not run for the agent sign-in paths (/mcp, /oauth/…, /.well-known/…)' : r.handlers.length ? r.handlers.join(' → ') : 'no middleware or route for it'}`;
+      const lines = (h) => h.map(([k, v]) => `${k}: ${v}`).join('\n');
+      if (r.status == null) { out.textContent = `No route answers ${method} ${path}: ${r.onTo === 'api' ? "sqzdb's own endpoint answers it" : 'the request would go on to your app'}${r.headers.length ? ', with these headers:\n' + lines(r.headers) : '.'}`; return; }
+      if (r.status >= 400) out.classList.add('bad');
+      let text = r.body == null ? `(${r.bytes} bytes)` : r.body;
+      if (r.headers.some(([k, v]) => k === 'content-type' && /json/.test(v))) { try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {} }
+      out.textContent = `${r.status} ${REASON[r.status] || ''}`.trim() + (r.headers.length ? '\n' + lines(r.headers) : '') + (text ? '\n\n' + text : '');
+    } catch (e) { if (e.auth) return; out.classList.add('bad'); out.textContent = `${e.code}: ${e.message}`; $('fnmeta').textContent = ''; }
+  }
   $('fnrun').onclick = fnCall;
-  for (const id of ['fnargs', 'fnattrs', 'fnrole']) $(id).addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); fnCall(); } });
+  for (const id of ['fnargs', 'fnattrs', 'fnrole', 'fnpath', 'fnbody', 'fnheaders']) $(id).addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); fnCall(); } });
   addEventListener('beforeunload', (e) => { if (fnDirty()) { e.preventDefault(); e.returnValue = ''; } });
 
   // ---- settings: the server's settings file, as a form and as text; saved, then applied by a restart

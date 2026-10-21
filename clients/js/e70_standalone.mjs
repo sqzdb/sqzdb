@@ -89,6 +89,38 @@ try {
   pr('called from the console, as the app and as a member');
   reader.cancel();
 
+  // a request tried from the console: through the middleware, to the route, as a visitor and as a member
+  const routes = "import { route, middleware } from 'sqzdb/functions'\n\nexport const guard = middleware({ match: '/admin/*', run({ user }, req) { if (!user) return new Response('who?', { status: 401 }); req.headers.set('x-seen', 'guard') } })\n\nexport const job = route({ method: ['GET', 'POST'], path: '/jobs/:id', roles: ['member'],\n  run: ({ admin }, req) => admin.get('SELECT id, title FROM jobs WHERE id = ?', [Number(req.params.id)]) ?? new Response('no such job', { status: 404 }) })\n\nexport const hello = route({ path: '/hello', run: (_, req) => ({ hi: req.query.name ?? 'you' }) })\n\nexport const apiGuard = middleware({ match: '/api/*', run(_, req) { if (req.headers.get('x-block')) return Response.json({ error: 'blocked by middleware' }, { status: 429 }) } })\n";
+  r = await con('/api/functions', { files: { 'jobs.ts': v2, 'routes.ts': routes } }); assert.equal(r.status, 200, r.error);
+  r = await con('/api/functions');
+  assert.deepEqual(r.exports.filter((e) => e.kind !== 'function').map((e) => [e.name, e.kind, e.methods, e.paths]).sort(), [['apiGuard', 'middleware', [], ['/api/*']], ['guard', 'middleware', [], ['/admin/*']], ['hello', 'route', ['GET'], ['/hello']], ['job', 'route', ['GET', 'POST'], ['/jobs/:id']]]);
+  // (the console's answer is 200 with the tried response inside; con() spreads it, so r.status is the tried status)
+  const tried = (body) => con('/api/functions/request', body);
+  r = await tried({ method: 'GET', path: '/hello?name=Ann' });
+  assert.deepEqual([r.status, r.handlers, r.body, r.headers], [200, ['hello (route)'], '{"hi":"Ann"}', [['content-type', 'application/json']]], 'a value as JSON');
+  r = await tried({ method: 'GET', path: '/jobs/1' });
+  assert.equal(r.status, 401); assert.equal(r.error.code, 'AUTH'); assert.match(r.error.error, /job is for signed-in users: sign in first/); assert.match(r.body, /"code":"AUTH"/);
+  const made = await con('/api/sql', { sql: "INSERT INTO jobs (owner, title) VALUES (1, 'tried')" });
+  r = await tried({ method: 'GET', path: `/jobs/${made.lastInsertId}`, as: { roles: ['member'], attrs: { id: 1 } } });
+  assert.equal(r.status, 200); assert.equal(JSON.parse(r.body).title, 'tried');
+  r = await tried({ method: 'GET', path: '/jobs/999999', as: { roles: ['member'], attrs: { id: 1 } } });
+  assert.deepEqual([r.status, r.body, r.headers], [404, 'no such job', [['content-type', 'text/plain; charset=utf-8']]], 'text gets its type');
+  r = await tried({ method: 'GET', path: '/admin/x' });
+  assert.deepEqual([r.status, r.handlers, r.body], [401, ['guard (middleware)'], 'who?'], 'middleware answered');
+  r = await tried({ method: 'GET', path: '/admin/x', headers: { Accept: 'text/html' }, as: { roles: ['member'], attrs: { id: 1 } } });
+  assert.equal(r.status, null, 'no route: on to the app'); assert.deepEqual([r.handlers, r.headers], [['guard (middleware)'], [['accept', 'text/html'], ['x-seen', 'guard']]], 'with the headers the middleware left');
+  // middleware stands in front of the API's own endpoints too, the agent sign-in paths apart
+  r = await tried({ method: 'POST', path: '/api/fn/open_jobs', headers: { 'x-block': '1' } }); assert.deepEqual([r.status, r.handlers], [429, ['apiGuard (middleware)']]);
+  r = await tried({ method: 'POST', path: '/api/fn/open_jobs' }); assert.deepEqual([r.status, r.handlers, r.onTo], [null, ['apiGuard (middleware)'], 'api'], "let through: sqzdb's own endpoint answers");
+  r = await tried({ method: 'POST', path: '/oauth/token', headers: { 'x-block': '1' } }); assert.deepEqual([r.status, r.handlers, r.guarded], [null, [], false]);
+  let h = await json('/api/fn/open_jobs', {}, { 'x-block': '1' }); assert.equal(h.status, 429); assert.deepEqual(await h.json(), { error: 'blocked by middleware' });
+  h = await json('/api/fn/open_jobs', {}); assert.equal(h.status, 401, 'without the header, the API answers as always');
+  h = await json('/api/auth/users/sign-up', { fields: { email: 'bob@x.test' }, password: 'the password 2' }, { 'x-block': '1' }); assert.equal(h.status, 429, 'a sign-up too');
+  h = await json('/oauth/register', { client_name: 'another agent', redirect_uris: [redirect] }, { 'x-block': '1' }); assert.ok(h.status < 300, `the agent sign-in paths are not middleware's: ${h.status}`);
+  r = await tried({ method: 'GET', path: '/a/../b' }); assert.equal(r.status, 400); assert.equal(r.code, 'ARGUMENTS');
+  r = await tried({ method: 'BREW', path: '/hello' }); assert.equal(r.status, 400);
+  pr('a request tried from the console; middleware in front of the API too');
+
   // a server whose functions come from a folder: the console shows them, and refuses to deploy over them
   server.kill(); await new Promise((ok) => server.once('exit', ok));
   const fns = `${dir}-functions`; fs.rmSync(fns, { recursive: true, force: true }); fs.mkdirSync(fns); fs.writeFileSync(`${fns}/ping.ts`, "import { fn } from 'sqzdb/functions'\nexport const ping = fn({ roles: ['member'], run: () => 'pong' })\n");

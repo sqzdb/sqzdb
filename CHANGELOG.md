@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.15.0 — 2026-10-20
+
+### Added
+- **Try a route from the console.** The Functions tab's Try panel takes any export: a function by name as before, or
+  a request to your middleware and routes (method, path with its query, body, headers) sent as the app server
+  runs one, as no one signed in or as a user of a role you name. It shows the response a client would get, the
+  handlers it went through, or that no route answers and the request would go on to your app with the headers
+  the middleware left (`POST /api/functions/request` on the console).
+
+### Changed
+- **The Functions tab lists what runs, not files.** Files are tabs over the editor (double-click one to rename
+  it), with New, Upload, the deploy state and the actions in the same bar. The panel beside it lists the
+  deployed exports as a request meets them: middleware numbered in the order it runs, then routes by path,
+  then functions, each with where it is reached, who may call it and its file; click one and the editor opens
+  that file at the export. The explanations that headed the tab are one line, with the agents' MCP state as a
+  pill beside it.
+- **Middleware stands in front of the API's own endpoints too.** A middleware whose `match` covers `/api/fn/…`,
+  `/api/sql`, `/api/files` or `/api/auth/…` now runs before sqzdb answers them, as it does before your app's
+  pages: one place for rate limits, invite codes checked before sign-up, or a maintenance switch. The agent
+  sign-in paths (`/mcp`, `/oauth/…`, `/.well-known/…`) run none. When the deployed functions can't load, those
+  endpoints answer 503 like the site, so nothing is served unguarded; the console still works to fix the deploy.
+- **A route's 401 names the route.** A request with no sign-in to a route that has `roles` now gets
+  `session: <name> is for signed-in users: sign in first`, not a bare `session: sign in first`.
+
 ## 0.14.0 — 2026-10-20
 
 ### Added

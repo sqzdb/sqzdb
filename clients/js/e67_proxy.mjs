@@ -321,15 +321,17 @@ try {
   assert.deepEqual(both.map((x) => x.status), [200, 503]); assert.match(await both[1].text(), /busy/); await both[0].text();
   assert.equal((await fetch(`${base}/stream`)).status, 200, 'and the slot is free again once the first is through');
   pr('app.proxy.connections = 1: the second request at once waits its turn, then a 503', 'ok');
-  // app.mcp makes /oauth/… the API's own: the deployed route there can't be, so the functions don't load. Nothing of
-  // the site is served unguarded: a 503 for all but the API's own
+  // app.mcp makes /oauth/… the API's own: the deployed route there can't be, so the functions don't load. Nothing
+  // middleware stands in front of is served unguarded: a 503 for the site and the API's endpoints alike, as a page or
+  // as JSON; only the agent sign-in paths, which middleware never guards, answer
   await restart(`[app]\npublicUrl = "${base}"\nproxy = "${direct}"\n\n[app.mcp]\nusers = "users"\n`);
   for (const p of ['/', '/dashboard/x', '/staff/x', '/hello']) { r = await fetch(base + p, { redirect: 'manual' }); assert.equal(r.status, 503, p); assert.match(await r.text(), /doesn't load/); }
-  assert.equal((await (await fetch(`${base}/api/me`)).json()).code, 'AUTH', 'the API carries on');
-  assert.equal((await (await fetch(`${base}/api/fn/anything`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies() }, body: '{}' })).json()).code, 'FUNCTION', 'as Ann: no function can be called either');
+  r = await fetch(`${base}/api/me`); assert.equal(r.status, 503, 'the API is guarded too'); assert.deepEqual(await r.json(), { error: "the deployed functions don't load, so nothing is served until they do; the server's log says why", code: 'FUNCTION' });
+  assert.equal((await fetch(`${base}/api/fn/anything`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies() }, body: '{}' })).status, 503, 'as Ann: no function can be called either');
+  r = await fetch(`${base}/.well-known/oauth-authorization-server`); assert.equal(r.status, 200, 'the agent sign-in paths answer: no middleware is theirs');
   // the configuration as it was: they load again, and the site is back
-  await restart(toml0); assert.equal((await fetch(`${base}/`)).status, 200); assert.equal((await fetch(`${base}/staff/x`)).status, 403);
-  pr("functions that don't load: the site a 503, the API answering; back once they do", 'ok');
+  await restart(toml0); assert.equal((await fetch(`${base}/`)).status, 200); assert.equal((await fetch(`${base}/staff/x`)).status, 403); assert.equal((await (await fetch(`${base}/api/me`)).json()).code, 'AUTH');
+  pr("functions that don't load: the site and the API a 503, agents' sign-in paths answering; back once they do", 'ok');
 
   // the app down
   app.close(); app.closeAllConnections();

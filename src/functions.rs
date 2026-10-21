@@ -199,6 +199,13 @@ enum Output { Json(J), Http(HttpOut) }
 #[derive(Clone, Debug, PartialEq)] pub struct FnError { pub code: String, pub message: String }
 impl FnError { pub fn new(code: &str, message: impl Into<String>) -> FnError { FnError { code: code.into(), message: message.into() } } }
 impl std::fmt::Display for FnError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) } }
+/// The HTTP status a handler's failure gets: no one signed in 401, denied 403, a handler no longer there 404, no room
+/// for it 503, a transaction that kept losing 409, a function that threw 500, anything else (the arguments) 400.
+pub fn http_status(e: &FnError) -> u16 { match e.code.as_str() { "AUTH" => 401, "DENIED" => 403, "NOT_FOUND" => 404, "LIMIT" => 503, "CONFLICT" => 409, "FUNCTION" => 500, _ => 400 } }
+/// What a request tried through the deployed middleware and routes got: the handlers that ran, in order, and the
+/// response (`status` set; `error`: the failure it reports, if one), or no answer (`status` None: no route for it, the
+/// request would go on to the app with `headers` as the middleware left them).
+#[derive(Clone, Debug)] pub struct Tried { pub handlers: Vec<String>, pub status: Option<u16>, pub headers: Vec<(String, String)>, pub body: Vec<u8>, pub error: Option<FnError> }
 /// What a deploy left: the functions now deployed, and whether anything changed.
 #[derive(Clone, Debug)] pub struct Deployed { pub functions: Vec<String>, pub changed: bool }
 
@@ -901,6 +908,7 @@ impl Sql {
             let (kind, paths, methods) = match &d.kind { Kind::Function => ("function", vec![], vec![]), Kind::Middleware { matches, .. } => ("middleware", matches.iter().map(|p| p.text.clone()).collect(), vec![]), Kind::Route { methods, pattern } => ("route", vec![pattern.text.clone()], methods.clone()) };
             json!({"name": d.name, "file": d.file, "kind": kind, "description": d.description, "readOnly": d.read_only, "roles": d.roles, "paths": paths, "methods": methods,
                    "method": if d.kind == Kind::Function { json!(if d.get { "GET" } else { "POST" }) } else { J::Null }, "mcp": if d.kind == Kind::Function { json!(d.mcp) } else { J::Null },
+                   "order": match &d.kind { Kind::Middleware { order, .. } => json!(order), _ => J::Null },
                    "args": d.args.iter().map(|a| json!({"name": a.name, "type": a.ty.describe(), "optional": a.optional, "description": a.description})).collect::<Vec<_>>(),
                    "inputSchema": if d.kind == Kind::Function { input_schema(d) } else { J::Null }})
         }).collect())
@@ -927,11 +935,37 @@ impl Sql {
         let b = self.bundle_for(&def.name)?;
         let Some(def) = b.defs.iter().find(|d| d.name == def.name && d.kind == def.kind) else { return Err(FnError::new("NOT_FOUND", format!("{} is no longer deployed", def.name))) };
         if let Some(r) = &def.roles {
-            if user.is_none() { return Err(FnError::new("AUTH", "session: sign in first")); }
+            if user.is_none() { return Err(FnError::new("AUTH", format!("session: {} is for signed-in users: sign in first", def.name))); }
             if !roles.iter().any(|x| r.contains(x)) { return Err(FnError::new("DENIED", format!("permission denied: {} is for the roles {}", def.name, r.join(", ")))); }
         }
         let kind = if matches!(def.kind, Kind::Middleware { .. }) { "middleware" } else { "route" };
         match self.run_call(sess, &b, def, &Input::Http(req, kind), user, roles)? { Output::Http(h) => Ok(h), Output::Json(_) => unreachable!() }
+    }
+    /// `req` run through the middleware for its path and the route for its method and path, as the app server runs a
+    /// request, as `sess` (`user`, `roles`: as the handlers see them); `body` reaches the route, as it does there.
+    /// For the console's Try panel: a response as a client would get it, or no answer when no route is there for it.
+    pub fn try_request(&self, sess: &mut Session, req: &mut HttpReq, body: Vec<u8>, user: Option<HashMap<String, Value>>, roles: Vec<String>) -> Tried {
+        let mut handlers = vec![];
+        let answered = |handlers: Vec<String>, status: u16, mut headers: Vec<(String, String)>, body: Vec<u8>| {
+            if !body.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { headers.push(("content-type".into(), "text/plain; charset=utf-8".into())); }
+            Tried { handlers, status: Some(status), headers, body, error: None }
+        };
+        let failed = |handlers: Vec<String>, e: FnError| Tried { handlers, status: Some(http_status(&e)), headers: vec![("content-type".into(), "application/json".into())], body: serde_json::to_vec(&json!({"error": e.message, "code": e.code})).unwrap_or_default(), error: Some(e) };
+        for (def, params) in self.middleware_for(&req.path) {
+            req.params = params; handlers.push(format!("{} (middleware)", def.name));
+            match self.run_http(sess, &def, req, user.clone(), roles.clone()) {
+                Ok(HttpOut::Next(h)) => req.headers = h,
+                Ok(HttpOut::Respond { status, headers, body }) => return answered(handlers, status, headers, body),
+                Err(e) => return failed(handlers, e),
+            }
+        }
+        let Some((def, params)) = self.route_for(&req.method, &req.path) else { return Tried { handlers, status: None, headers: req.headers.clone(), body: vec![], error: None } };
+        req.params = params; req.body = Some(body); handlers.push(format!("{} (route)", def.name));
+        match self.run_http(sess, &def, req, user, roles) {
+            Ok(HttpOut::Respond { status, headers, body }) => answered(handlers, status, headers, body),
+            Ok(HttpOut::Next(_)) => answered(handlers, 204, vec![], vec![]),
+            Err(e) => failed(handlers, e),
+        }
     }
     /// One call, in its own transaction (or the one `sess` has open), run again when another writer got there first.
     fn run_call(&self, sess: &mut Session, b: &Arc<Bundle>, def: &Def, input: &Input, user: Option<HashMap<String, Value>>, roles: Vec<String>) -> Result<Output, FnError> {
@@ -1325,6 +1359,23 @@ export const bad = middleware({ match: '/oops', run: () => 'not a response' })
         let (admin, _) = s.route_for("GET", "/admin").unwrap();
         assert_eq!(run(&mut Session::default(), &admin, &req("GET", "/admin", "", &[], Some("")), None, vec![]).unwrap_err().code, "AUTH");
         assert_eq!(run(&mut Session::default(), &admin, &req("GET", "/admin", "", &[], Some("")), Some(HashMap::new()), vec!["guest".into()]).unwrap_err().code, "DENIED");
+        // a request tried as the console does: through the middleware, to the route, the body to the route only
+        let mut r = req("POST", "/jobs/9", "", &[("x-drop", "1")], None);
+        let t = s.try_request(&mut a, &mut r, br#"{"y":2}"#.to_vec(), Some(HashMap::from([("uid".to_string(), Value::Int(1))])), vec!["agent".into()]);
+        assert_eq!(t.handlers, vec!["first (middleware)", "job (route)"]); assert_eq!(t.status, Some(201)); assert_eq!(String::from_utf8(t.body).unwrap(), r#"{"id":"9","got":{"y":2},"by":1}"#);
+        let mut r = req("GET", "/dashboard", "", &[], None);
+        let t = s.try_request(&mut Session::default(), &mut r, vec![], None, vec![]);
+        assert_eq!((t.handlers, t.status), (vec!["first (middleware)".to_string(), "guard (middleware)".to_string()], Some(302)), "middleware answered: the route is not reached");
+        let mut r = req("GET", "/dashboard/x", "", &[("x-drop", "1"), ("accept", "*/*")], None);
+        let t = s.try_request(&mut a, &mut r, vec![], Some(HashMap::from([("uid".to_string(), Value::Int(1))])), vec!["agent".into()]);
+        assert_eq!(t.status, None, "no route: on to the app"); assert_eq!(t.headers, vec![("accept".to_string(), "*/*".to_string()), ("x-plan".to_string(), "busy".to_string())], "with the headers as the middleware left them");
+        let mut r = req("GET", "/admin", "", &[], None);
+        let t = s.try_request(&mut Session::default(), &mut r, vec![], None, vec![]);
+        assert_eq!(t.status, Some(401)); assert_eq!(t.error.as_ref().unwrap().code, "AUTH"); assert!(t.error.unwrap().message.contains("admin is for signed-in users"), "the route's name is in the 401");
+        assert_eq!(t.headers, vec![("content-type".to_string(), "application/json".to_string())]); assert!(String::from_utf8(t.body).unwrap().contains(r#""code":"AUTH""#));
+        let mut r = req("GET", "/jobs/7/runs", "", &[], None);
+        let t = s.try_request(&mut Session::default(), &mut r, vec![], None, vec![]);
+        assert_eq!((t.status, t.headers), (Some(200), vec![("content-type".to_string(), "text/plain; charset=utf-8".to_string())]), "text gets the type the app server gives it");
         // middleware that returns something else is a bug, said as one
         let bad = s.middleware_for("/oops").into_iter().find(|(d, _)| d.name == "bad").unwrap().0;
         assert!(run(&mut Session::default(), &bad, &req("GET", "/oops", "", &[], None), None, vec![]).unwrap_err().message.contains("returns a Response"));

@@ -135,7 +135,7 @@ and switches to the static musl build on Alpine.
 
 | Variable | Effect |
 |---|---|
-| `SQZDB_VERSION=v0.14.0` | Install a specific release instead of the latest. |
+| `SQZDB_VERSION=v0.15.0` | Install a specific release instead of the latest. |
 | `SQZDB_INSTALL_DIR=/opt/bin` | Install somewhere else. |
 | `SQZDB_LIBC=musl` | Force the static musl build on Linux. |
 
@@ -895,8 +895,13 @@ sqzdb deploy ./functions db.internal:7781 --token "$DB_TOKEN"   # to a running s
 Or with no folder at all: write, paste or upload files in the [web console](#web-console-and-command-line)'s
 **Functions** tab and deploy them from there. On a standalone server that's the whole backend: tables and
 policies from its SQL editor, the app's rules from its Functions tab. Its **New** menu starts a function, a REST
-route or a middleware, each field explained; once deployed, every export shows where it is reached (`POST
-/api/fn/hello`, `GET /jobs/:id`, the paths a middleware runs before) and whether agents get it.
+route or a middleware, each field explained. Beside the editor, what is deployed is listed as a request meets
+it: middleware in the order it runs, then routes by path, then functions, each with where it is reached (`POST
+/api/fn/hello`, `GET /jobs/:id`) and whether agents get it; click one and the editor opens its file at that
+export. **Try it** calls
+a function by name, or sends a request through your middleware and routes as the app server runs one, as no
+one signed in or as a user of a role you name, and shows the response a client would get and the handlers it
+went through.
 
 - A deploy replaces every function before it. The same files again change nothing.
 - A deploy is stored in the catalog, so it is logged, snapshotted, backed up and copied to followers with
@@ -1027,10 +1032,11 @@ Open it when the server starts (Next.js's `instrumentation.js`), so the front do
 anyone asks.
 
 **What goes where:**
-- **sqzdb's own paths** are answered as always:
+- **sqzdb's own paths** are answered by sqzdb, after your middleware (below) has let the request through:
   - `/api/…`, matched endpoint by endpoint, so your app's own `/api` routes still reach it;
-  - `/mcp`, `/oauth/…` and `/.well-known/oauth-…`;
-  - its sign-in pages under `/_sqz/`.
+  - its sign-in pages under `/_sqz/`;
+  - `/mcp`, `/oauth/…` and `/.well-known/oauth-…`, the paths agents' clients drive by their protocols:
+    these alone run no middleware.
 - **Everything else goes to the app**, after middleware and routes (below):
   - bodies stream both ways, and a page that renders in pieces arrives in pieces;
   - WebSocket upgrades are passed through, and no other kind: a client can't turn a connection into a
@@ -1092,7 +1098,10 @@ export const hooks = route({
 ```
 
 - **Middleware:**
-  - it runs for the paths it `match`es, never sqzdb's own, in `order` and then by file and name;
+  - it runs for the paths it `match`es, in `order` and then by file and name, sqzdb's own endpoints
+    included: a `match` of `/api/*` stands in front of every function call, SQL request, upload and
+    sign-up (not `/mcp`, `/oauth/…` or `/.well-known/…`). A route can't take sqzdb's own paths;
+    middleware can guard them;
   - it returns a `Response` to answer, or nothing to let the request go on, with any headers it set or
     removed;
   - it gets the headers, not the body, which streams on untouched.
@@ -1109,8 +1118,9 @@ export const hooks = route({
     `headers`, `cookies` and `ip`;
   - each request is one transaction, with the functions' limits. At most `functions.instances` run at
     once; the rest wait their turn, and get a 503 if none comes in time.
-- **If the deployed functions can't load** (say, after a change of configuration), everything that isn't
-  sqzdb's own gets a 503 until they can: the site is never served without its guards.
+- **If the deployed functions can't load** (say, after a change of configuration), everything middleware
+  stands in front of, the API's own endpoints included, gets a 503 until they can: nothing is served
+  without its guards. The console (its own listener) still works, to fix the deploy.
 - **Path matching** follows how the app will resolve the path:
   - each segment is decoded (`/adm%69n` is `/admin`);
   - Next.js's data route for a page (`/_next/data/<build>/admin.json`) counts as that page;
@@ -1500,7 +1510,7 @@ Turso on the same machine, one question each; their outputs are in `results/`. T
 feature and a system `libsqlite3` with headers: `cargo lab e40_tcp` runs one, and `make lab` builds
 them all.
 
-Releases are tags that match the version in `Cargo.toml`, such as `v0.14.0`. The release workflow runs the
+Releases are tags that match the version in `Cargo.toml`, such as `v0.15.0`. The release workflow runs the
 unit tests, builds Linux binaries for glibc and musl on x86_64 and arm64 plus macOS binaries, and if all of
 that passes publishes them with `SHA256SUMS` and `install.sh`, so a tag is pushed together with its commit.
 
