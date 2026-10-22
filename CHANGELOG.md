@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.1 — 2026-10-21
+
+### Fixed
+- **Foreign keys inside a transaction.** A function (one transaction per call) could not delete a parent row at all:
+  with `ON DELETE CASCADE` or `SET NULL` the delete was refused as "only supported outside transactions", and with a
+  plain key a function that deleted the children and then the parent failed at commit with "blocked: N row(s) …",
+  because the commit counted the children as they were before the transaction. A `DELETE` inside a transaction now
+  settles its children as the transaction sees them: a plain key refuses the statement while any remain, with that
+  count, and leaves the transaction as it was; `CASCADE` and `SET NULL` become the transaction's own writes,
+  grandchildren included, rolled back or committed with it. An `INSERT` or `UPDATE` whose parent the transaction
+  deleted, or that never existed, is refused at the statement instead of at `COMMIT`. The commit reads the children
+  again: a child someone else committed meanwhile fails it with `FOREIGN_KEY` (plain key) or `CONFLICT` (cascade: a
+  function call runs again and cascades it). A statement outside a transaction that deletes a parent with a cascade
+  is one transaction too, so a `RESTRICT` met further down leaves nothing of it, where it used to leave the parent
+  deleted and the child in place.
+
 ## 0.16.0 — 2026-10-21
 
 ### Added

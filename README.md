@@ -53,7 +53,7 @@ with certificates from Let's Encrypt is built in. See [the app API](#the-app-api
 | **Vectors and search by meaning** | A `VECTOR(n)` column, searched with `cosine_distance` under the same policies as everything else. A column can be the embedding of other columns, filled in the background by OpenAI, Ollama or any OpenAI-compatible model, and `embed(?)` embeds the search text. |
 | **Live queries** | Subscribe to the changes a query would see, or watch a query and receive its new result whenever it changes. |
 | **Online schema changes** | `ALTER TABLE` adds, drops, renames or retypes a column while reads and writes continue. |
-| **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`. |
+| **Foreign keys** | Always enforced, with `RESTRICT`, `CASCADE` and `SET NULL`, inside a transaction as outside one. |
 | **Backup and replication** | Continuous backup to S3-compatible storage, compressed and encrypted; point-in-time restore; read-only followers. |
 | **Fast restart** | The snapshot is the table image and is memory-mapped, not loaded. After a snapshot, a million-row table reopens in under a millisecond; each secondary index adds about 30 ms per million rows. |
 | **Tooling** | A `sqzdb` command with a server, a SQL shell and a web console, plus bindings for Node, Python, Go, C and Rust. |
@@ -365,6 +365,14 @@ Every read is checked again at `COMMIT`. A row read by its key must be unchanged
 (a scan, an index, a range, a `UNIQUE` value) must have had no other write become visible since, nor have
 one on its way. This check is per table, so it's coarse: a transaction that counts a table's rows conflicts
 with any concurrent write to that table, and retrying gives it the new count.
+
+Foreign keys hold inside a transaction as outside one. A `DELETE` settles its children as the transaction
+sees them: a parent can go after its children in the same transaction (a function's call is one), a plain
+key refuses the statement while any remain, and `ON DELETE CASCADE` and `SET NULL` become the transaction's
+own writes, rolled back or committed with it. An `INSERT` or `UPDATE` whose parent the transaction has
+deleted, or that never existed, is refused at the statement. The children are read again at `COMMIT`: a
+child row someone else committed meanwhile fails it with `FOREIGN_KEY` for a plain key, or `CONFLICT` for
+a cascade, which a retry then applies. Each child table checked counts as a table read other than by key.
 
 | `durable` | A commit returns when | A crash can lose |
 |---|---|---|
@@ -1408,7 +1416,9 @@ token = "${DB_TOKEN}"
   doesn't exist.
 - `BEGIN`, `COMMIT`, `ROLLBACK`. Inside a transaction, a lookup by primary key sees the transaction's own
   writes. Any other read of a table the transaction has already written is refused with `TRANSACTION`,
-  because reads see committed data only: read before writing, or commit first.
+  because reads see committed data only: read before writing, or commit first. A `DELETE` applies
+  `ON DELETE CASCADE` and `SET NULL` as the transaction's own writes, and checks a plain key against the
+  rows as the transaction leaves them (see [transactions](#transactions-and-durability)).
 
 **Access control**
 
@@ -1444,7 +1454,7 @@ Every binding reports errors with a stable code. In Node it is `err.code` on a `
 | `FOREIGN_KEY` | A referenced row is missing, or a delete is blocked by children. |
 | `DENIED` | The session lacks a grant, or a row falls outside its policy. |
 | `AUTH` | A wrong login or password, too many failed sign-ins, or a session token that is unknown, signed out, ended or expired. |
-| `CONFLICT` | A concurrent transaction changed the same rows; retry. |
+| `CONFLICT` | A concurrent transaction changed the same rows, or added a child under a row this one deletes with a cascade; retry. |
 | `NOT_FOUND` | An `UPDATE` by primary key found no row, or there is no function by that name. |
 | `TRANSACTION` | `BEGIN` inside a transaction, `COMMIT` outside one, or a join, subquery or `INSERT … SELECT` over a table the transaction has written. |
 | `ARGUMENTS` | Too few parameters for the statement, or a request the app API can't take: bad JSON, too large, or a result over `app.maxRows`. |

@@ -1421,6 +1421,22 @@ export const bad = middleware({ match: '/oops', run: () => 'not a response' })
         assert_eq!(q(&s, "SELECT count(*) FROM t"), vec![vec![Value::Int(0)]]);
     }
 
+    /// A function deletes a parent row in its one transaction: after its children (the commit sees those deletes), or
+    /// through ON DELETE CASCADE; while children under a plain key remain, the call fails and nothing of it stays.
+    #[test] fn a_function_deletes_a_parent_with_its_children() {
+        let d = tmp("parent"); let s = open(&d, "{}");
+        for st in ["CREATE TABLE jobs (id SERIAL PRIMARY KEY, title TEXT)", "CREATE TABLE notes (id SERIAL PRIMARY KEY, job_id INT NOT NULL REFERENCES jobs(id), body TEXT)", "CREATE TABLE runs (id SERIAL PRIMARY KEY, job_id INT REFERENCES jobs(id) ON DELETE CASCADE)",
+                   "INSERT INTO jobs (title) VALUES ('a'), ('b')", "INSERT INTO notes (job_id, body) VALUES (1, 'x'), (1, 'y'), (2, 'z')", "INSERT INTO runs (job_id) VALUES (1), (2)"] { q(&s, st); }
+        deploy(&s, &[("jobs.js", "import { fn } from 'sqzdb/functions'\nexport const deleteJob = fn({ args: { id: 'int', notes: 'bool' }, run({ db }, { id, notes }) { const n = notes ? db.run('DELETE FROM notes WHERE job_id = ?', [id]).changes : 0; db.run('DELETE FROM jobs WHERE id = ?', [id]); return { notes: n } } })\n")]).unwrap();
+        let mut app = Session::default();
+        let e = s.call_function(&mut app, "deleteJob", &json!({"id": 1, "notes": false}), false).unwrap_err();
+        assert_eq!(e.code, "FOREIGN_KEY", "{e}"); assert!(e.message.contains("delete from jobs blocked: 2 row(s) in notes.job_id"), "{e}");
+        assert_eq!(q(&s, "SELECT count(*) FROM jobs"), vec![vec![Value::Int(2)]]); assert_eq!(q(&s, "SELECT count(*) FROM runs"), vec![vec![Value::Int(2)]], "the cascade into runs did not stay");
+        assert_eq!(s.call_function(&mut app, "deleteJob", &json!({"id": 1, "notes": true}), false).unwrap(), json!({"notes": 2}));
+        assert_eq!(q(&s, "SELECT count(*) FROM jobs"), vec![vec![Value::Int(1)]]); assert_eq!(q(&s, "SELECT count(*) FROM notes"), vec![vec![Value::Int(1)]]);
+        assert_eq!(q(&s, "SELECT job_id FROM runs"), vec![vec![Value::Int(2)]], "the runs of job 1 went with it");
+    }
+
     #[test] fn a_watched_folder_deploys_when_it_changes() {
         let d = tmp("watch"); let f = tmp("watch-src"); std::fs::create_dir_all(f.join("lib")).unwrap();
         std::fs::write(f.join("a.ts"), "import { fn } from 'sqzdb/functions'\nimport { two } from './lib/two'\nexport const one = fn({ run: () => two() - 1 })\n").unwrap();

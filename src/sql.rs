@@ -2503,7 +2503,8 @@ impl Sql {
                 let n = pks.len();
                 match &mut sess.txn {
                     Some(t) => { for pk in pks { table.txn_delete(t, pk).map_err(|a| a.to_string())?; } }
-                    None => if n == 1 { sess.last_seq = table.delete_by_pk(pks[0]).map_err(|a| a.to_string())?; } else if n > 1 { let mut t = Txn::new(); for pk in pks { table.txn_delete(&mut t, pk).map_err(|a| a.to_string())?; } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; }
+                    // one row with nothing to cascade: the short path; otherwise one transaction, so a cascade lands whole or not at all
+                    None => if n == 1 && !table.cascades() { sess.last_seq = table.delete_by_pk(pks[0]).map_err(|a| a.to_string())?; } else if n >= 1 { let mut t = Txn::new(); for pk in pks { table.txn_delete(&mut t, pk).map_err(|a| a.to_string())?; } sess.last_seq = self.db.commit(t).map_err(|a| a.to_string())?; }
                 }
                 Ok(vec![vec![Value::Int(n as i64)]])
             }
@@ -3643,6 +3644,112 @@ mod unsupported_tests {
         q(&mut se, "COMMIT");
         let rows = q(&mut Session::default(), "SELECT id, age, grp FROM users ORDER BY id");
         assert_eq!(rows, vec![vec![Value::Int(1), Value::Int(30), Value::Int(3)], vec![Value::Int(2), Value::Int(26), Value::Int(3)], vec![Value::Int(3), Value::Int(35), Value::Int(2)]]);
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+}
+#[cfg(test)]
+mod foreign_key_tests {
+    use super::*;
+    use crate::config::Config;
+    /// jobs with notes (the action given), tags that lose their job (SET NULL) and comments under notes (CASCADE).
+    fn db(name: &str, notes: &str) -> (Arc<Sql>, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("sqzdb-fk-{}-{name}", std::process::id())); let _ = std::fs::remove_dir_all(&d);
+        let s = Sql::open_with(&d, Config::default()).unwrap();
+        for q in ["CREATE TABLE jobs (id SERIAL PRIMARY KEY, title TEXT)".to_string(), format!("CREATE TABLE notes (id SERIAL PRIMARY KEY, job_id INT NOT NULL REFERENCES jobs(id){notes}, body TEXT)"),
+                  "CREATE TABLE tags (id SERIAL PRIMARY KEY, job_id INT REFERENCES jobs(id) ON DELETE SET NULL, name TEXT)".into(), "CREATE TABLE comments (id SERIAL PRIMARY KEY, note_id INT REFERENCES notes(id) ON DELETE CASCADE, body TEXT)".into(),
+                  "INSERT INTO jobs (title) VALUES ('one'), ('two'), ('three')".into(), "INSERT INTO notes (job_id, body) VALUES (1, 'n1'), (3, 'n3a'), (3, 'n3b')".into(), "INSERT INTO tags (job_id, name) VALUES (3, 'urgent'), (2, 'later')".into(), "INSERT INTO comments (note_id, body) VALUES (2, 'c')".into()] {
+            s.exec_s(&mut Session::default(), &q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        (s, d)
+    }
+    fn n(s: &Sql, se: &mut Session, q: &str) -> i64 { match s.exec_s(se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"))[0][0] { Value::Int(n) => n, ref v => panic!("{q}: not a count: {v:?}") } }
+    fn err(s: &Sql, se: &mut Session, q: &str) -> String { s.exec_s(se, q, &[]).err().unwrap_or_else(|| panic!("accepted: {q}")) }
+    /// A plain key (RESTRICT) inside a transaction: the parent may go after its children, the refusal counts the
+    /// children as the transaction sees them and leaves it as it was, the transaction's own rows count, a parent it
+    /// deleted is missing to its inserts and updates, and a child committed by someone else meanwhile refuses the commit.
+    #[test] fn a_transaction_deletes_a_parent_after_its_children() {
+        let (s, d) = db("restrict", "");
+        let q = |se: &mut Session, q: &str| s.exec_s(se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let mut se = Session::default();
+        q(&mut se, "BEGIN");
+        assert_eq!(n(&s, &mut se, "DELETE FROM notes WHERE job_id = 3"), 2);
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id = 3"), 1);
+        q(&mut se, "COMMIT");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM jobs"), 2); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes"), 1);
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM comments"), 0, "the comment under a deleted note went with it");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM tags WHERE job_id IS NULL"), 1, "the tag lost its job");
+        // the parent while a child remains: refused at the statement, with the count as the transaction sees it
+        q(&mut se, "INSERT INTO notes (job_id, body) VALUES (1, 'n1b')");
+        q(&mut se, "BEGIN");
+        assert_eq!(n(&s, &mut se, "DELETE FROM notes WHERE body = 'n1b'"), 1);
+        let e = err(&s, &mut se, "DELETE FROM jobs WHERE id = 1"); assert_eq!(error_code(&e), "FOREIGN_KEY", "{e}"); assert!(e.contains("delete from jobs blocked: 1 row(s) in notes.job_id reference id = 1"), "{e}");
+        q(&mut se, "COMMIT");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM jobs"), 2); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes"), 1, "the note's delete committed; the refused delete left nothing behind");
+        // a child the transaction added counts; a parent the transaction deleted is missing to a child it then writes
+        q(&mut se, "BEGIN");
+        q(&mut se, "INSERT INTO notes (job_id, body) VALUES (2, 'n2')");
+        let e = err(&s, &mut se, "DELETE FROM jobs WHERE id = 2"); assert!(e.contains("blocked: 1 row(s) in notes.job_id reference id = 2"), "{e}");
+        q(&mut se, "ROLLBACK");
+        q(&mut se, "BEGIN");
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id = 2"), 1);
+        let e = err(&s, &mut se, "INSERT INTO notes (job_id, body) VALUES (2, 'n2')"); assert_eq!(error_code(&e), "FOREIGN_KEY", "{e}"); assert!(e.contains("notes.job_id = 2 has no row in jobs.id"), "{e}");
+        let e = err(&s, &mut se, "UPDATE notes SET job_id = 2 WHERE id = 1"); assert!(e.contains("notes.job_id = 2 has no row in jobs.id"), "{e}");
+        let e = err(&s, &mut se, "INSERT INTO notes (job_id, body) VALUES (9, 'nowhere')"); assert_eq!(error_code(&e), "FOREIGN_KEY", "a parent that never was is refused at the statement, not at COMMIT: {e}");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM tags WHERE job_id IS NULL"), 2, "the tag of job 2 lost it");
+        q(&mut se, "ROLLBACK");
+        // a child someone else commits between the delete and the commit: the commit is refused, both rows stay
+        q(&mut se, "BEGIN");
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id = 2"), 1);
+        q(&mut Session::default(), "INSERT INTO notes (job_id, body) VALUES (2, 'meanwhile')");
+        let e = err(&s, &mut se, "COMMIT"); assert_eq!(error_code(&e), "FOREIGN_KEY", "{e}");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM jobs WHERE id = 2"), 1); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes WHERE job_id = 2"), 1);
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM tags WHERE job_id = 2"), 1, "the SET NULL did not commit either");
+        drop(s); let _ = std::fs::remove_dir_all(&d);
+    }
+    /// ON DELETE CASCADE and SET NULL inside a transaction are its own writes: seen by its reads, gone with a rollback,
+    /// committed with it, applied to rows it added or moved itself, down to grandchildren; a statement outside a
+    /// transaction that deletes several parents is one transaction and cascades too; a RESTRICT met below a cascade
+    /// refuses the statement, and the transaction cannot commit over it.
+    #[test] fn cascade_and_set_null_work_inside_a_transaction() {
+        let (s, d) = db("cascade", " ON DELETE CASCADE");
+        let q = |se: &mut Session, q: &str| s.exec_s(se, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let tags = |se: &mut Session| q(se, "SELECT job_id, name FROM tags ORDER BY id");
+        let (t, nul) = (|x: &str| Value::Text(x.into()), Value::Null);
+        let mut se = Session::default();
+        q(&mut se, "BEGIN");
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id = 3"), 1);
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes WHERE job_id = 3"), 0, "the transaction sees its cascade");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM comments"), 0, "down to the grandchildren");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM tags WHERE job_id IS NULL"), 1);
+        q(&mut se, "ROLLBACK");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes"), 3); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM comments"), 1); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM tags WHERE job_id IS NULL"), 0);
+        q(&mut se, "BEGIN");
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id = 3"), 1);
+        q(&mut se, "COMMIT");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM jobs"), 2); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes"), 1); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM comments"), 0);
+        assert_eq!(tags(&mut se), vec![vec![nul.clone(), t("urgent")], vec![Value::Int(2), t("later")]]);
+        // rows the transaction added or moved under the parent itself: cascaded away before they land, or kept without it
+        q(&mut se, "BEGIN");
+        q(&mut se, "INSERT INTO notes (job_id, body) VALUES (2, 'n2')"); q(&mut se, "INSERT INTO tags (job_id, name) VALUES (2, 'new')");
+        q(&mut se, "UPDATE notes SET job_id = 2 WHERE id = 1");
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id = 2"), 1);
+        q(&mut se, "COMMIT");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes"), 0, "n1, moved under job 2, went with it; n2 never landed");
+        assert_eq!(tags(&mut se), vec![vec![nul.clone(), t("urgent")], vec![nul.clone(), t("later")], vec![nul.clone(), t("new")]]);
+        // several parents in one statement outside a transaction: one transaction, cascading
+        q(&mut se, "INSERT INTO jobs (title) VALUES ('four'), ('five')"); q(&mut se, "INSERT INTO notes (job_id, body) VALUES (4, 'n4'), (5, 'n5'), (1, 'n1')");
+        assert_eq!(n(&s, &mut se, "DELETE FROM jobs WHERE id > 1"), 2);
+        assert_eq!(q(&mut se, "SELECT body FROM notes"), vec![vec![t("n1")]]);
+        // a RESTRICT below the cascade
+        q(&mut se, "CREATE TABLE pins (id SERIAL PRIMARY KEY, note_id INT REFERENCES notes(id))");
+        let n1 = n(&s, &mut se, "SELECT id FROM notes WHERE body = 'n1'");
+        q(&mut se, &format!("INSERT INTO pins (note_id) VALUES ({n1})"));
+        q(&mut se, "BEGIN");
+        let e = err(&s, &mut se, "DELETE FROM jobs WHERE id = 1"); assert_eq!(error_code(&e), "FOREIGN_KEY", "{e}"); assert!(e.contains("delete from notes blocked: 1 row(s) in pins.note_id"), "{e}");
+        assert!(s.exec_s(&mut se, "COMMIT", &[]).is_err(), "the job's delete was recorded before its cascade was refused: it cannot commit over the note");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM jobs"), 1); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM notes"), 1); assert_eq!(n(&s, &mut se, "SELECT count(*) FROM pins"), 1);
+        assert_eq!(err(&s, &mut se, "DELETE FROM jobs WHERE id = 1"), e, "outside a transaction too");
+        assert_eq!(n(&s, &mut se, "SELECT count(*) FROM jobs"), 1, "and nothing of it stays: the cascade is one transaction");
         drop(s); let _ = std::fs::remove_dir_all(&d);
     }
 }

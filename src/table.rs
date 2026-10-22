@@ -806,6 +806,10 @@ impl Table {
     #[inline] fn free_slot(&self, slot: u32) { if slot as usize >= self.mapped_rows() { self.free.lock().unwrap().push(slot); } }
     pub fn free_slots(&self) -> usize { self.free.lock().unwrap().len() }
     // ---- foreign keys ----
+    /// The error for a foreign key of this table whose parent row is missing.
+    fn fk_missing(&self, l: &FkLink, v: Key) -> Abort { Abort::Fk(format!("foreign key violation: {}.{} = {} has no row in {}.{}", self.schema.name, self.schema.columns[l.col].name, l.parent.schema.key_text(v), l.parent.schema.name, l.parent.schema.columns[l.parent.schema.pk].name)) }
+    /// The error for a delete of this table's row `pk` that `n` rows of child table `ct` (its column `col`) block.
+    fn fk_blocked(&self, ct: &Table, col: usize, n: usize, pk: Key) -> Abort { Abort::Fk(format!("delete from {} blocked: {n} row(s) in {}.{} reference {} = {}", self.schema.name, ct.schema.name, ct.schema.columns[col].name, self.schema.columns[self.schema.pk].name, self.schema.key_text(pk))) }
     /// Verify every non-NULL foreign key of `row` has a live parent, and return read guards on the parents' key shards so
     /// the parents cannot be deleted until the caller's write is published (parent deletes take those shards for writing).
     pub fn fk_guards<'a>(&self, links: &'a [FkLink], row: &[u8]) -> Result<Vec<RwLockReadGuard<'a, PkMap>>, Abort> {
@@ -815,9 +819,9 @@ impl Table {
         let mut guards = vec![]; let mut held: Vec<(usize, usize)> = vec![];
         for (pid, shard, v, i) in want {
             let l = &links[i];
-            if held.last() == Some(&(pid, shard)) { if l.parent.pk_slot(v).is_none() { return Err(Abort::Fk(format!("foreign key violation: {}.{} = {} has no row in {}.{}", self.schema.name, self.schema.columns[l.col].name, l.parent.schema.key_text(v), l.parent.schema.name, l.parent.schema.columns[l.parent.schema.pk].name))); } continue; }
+            if held.last() == Some(&(pid, shard)) { if l.parent.pk_slot(v).is_none() { return Err(self.fk_missing(l, v)); } continue; }
             let m = l.parent.pk()[shard].read().unwrap();
-            if l.parent.pk_slot_in(&m, v).is_none() { return Err(Abort::Fk(format!("foreign key violation: {}.{} = {} has no row in {}.{}", self.schema.name, self.schema.columns[l.col].name, l.parent.schema.key_text(v), l.parent.schema.name, l.parent.schema.columns[l.parent.schema.pk].name))); }
+            if l.parent.pk_slot_in(&m, v).is_none() { return Err(self.fk_missing(l, v)); }
             guards.push(m); held.push((pid, shard));
         }
         Ok(guards)
@@ -829,7 +833,7 @@ impl Table {
             let Some(ct) = c.table.upgrade() else { continue }; if ct.retired.load(Ordering::Relaxed) { continue; }
             let Some(ix) = ct.index_on(c.col) else { continue }; let n = ix.count(fold_key(pk)); if n == 0 { continue; }
             let n = if !matches!(ct.schema.columns[c.col].ty, ColType::Int | ColType::Timestamp) { ix.slots(fold_key(pk)).into_iter().filter(|&sl| ct.with_slot(sl, |_, r| col_key128(&ct.schema, r, c.col) == Some(pk)) == Some(true)).count() } else { n }; if n == 0 { continue; }
-            match c.on_delete { FkAction::Restrict => return Err(Abort::Fk(format!("delete from {} blocked: {n} row(s) in {}.{} reference {} = {}", self.schema.name, ct.schema.name, ct.schema.columns[c.col].name, self.schema.columns[self.schema.pk].name, self.schema.key_text(pk)))), _ => todo.push((ct.clone(), c.col, c.on_delete.clone())) }
+            match c.on_delete { FkAction::Restrict => return Err(self.fk_blocked(&ct, c.col, n, pk)), _ => todo.push((ct.clone(), c.col, c.on_delete.clone())) }
         }
         Ok(todo)
     }
@@ -840,6 +844,45 @@ impl Table {
             for cpk in cpks { match action { FkAction::Cascade => { match ct.delete_by_pk(cpk) { Ok(_) | Err(Abort::NotFound) => {}, Err(e) => return Err(e) } } FkAction::SetNull => { let sch = ct.schema.clone(); match ct.update_by_pk(cpk, |r| { let mut n = r.to_vec(); encode_col(&sch, &mut n, col, &Value::Null).map_err(Abort::Type)?; Ok(n) }) { Ok(_) | Err(Abort::NotFound) => {}, Err(e) => return Err(e) } } FkAction::Restrict => {} } }
         }
         Ok(())
+    }
+    /// The keys of this table's rows whose column `col` holds `pk`, as `txn` sees them: the committed rows the
+    /// transaction has not deleted or changed, and its own rows as it left them (the index holds committed rows alone).
+    fn txn_referencing(&self, col: usize, pk: Key, txn: &Txn) -> Vec<Key> {
+        let mut out = vec![]; let mut seen: Vec<Key> = vec![];
+        if let Some(ix) = self.index_on(col) {
+            self.index_lookup(&ix, pk, |r| { let k = self.pk_of(r); match txn.by_key.get(&(self.id, k)) { None => out.push(k), Some(&i) => { seen.push(k); if !matches!(txn.writes[i], TxnWrite::Delete { .. }) && col_key128(&self.schema, txn.writes[i].row(), col) == Some(pk) { out.push(k); } } } true });
+        }
+        for r in txn.own_rows(self) { let k = self.pk_of(r); if !seen.contains(&k) && col_key128(&self.schema, r, col) == Some(pk) { out.push(k); } }
+        out
+    }
+    /// The foreign keys of `row`, which `txn` is about to write, as the transaction sees them: a parent it deleted is
+    /// missing, as is one neither committed nor its own. A key `old` already holds is not checked again: if the
+    /// transaction deleted that parent, the delete dealt with this row then (`txn_delete`). The commit checks every key
+    /// again against the rows committed by then (`claim_insert`, `claim_update`).
+    fn txn_fk_check(&self, txn: &Txn, row: &[u8], old: Option<&[u8]>) -> Result<(), Abort> {
+        for l in self.fks.read().unwrap().iter() {
+            let Some(v) = col_key128(&self.schema, row, l.col) else { continue };
+            if old.is_some_and(|o| col_key128(&self.schema, o, l.col) == Some(v)) { continue; }
+            let present = match txn.by_key.get(&(l.parent.id, v)) { Some(&i) => !matches!(txn.writes[i], TxnWrite::Delete { .. }), None => l.parent.pk_slot(v).is_some() };
+            if !present { return Err(self.fk_missing(l, v)); }
+        }
+        Ok(())
+    }
+    /// Parent side of a delete inside `txn`, before the delete is recorded: the row's children as the transaction sees
+    /// them. RESTRICT refuses while any exist; CASCADE and SET NULL return the rows to delete or clear once the parent's
+    /// delete is recorded. Each child table counts as read other than by key (`Txn::scans`): a child row someone else
+    /// commits before this transaction does makes its commit fail, as does the check made again then (`claim_delete`).
+    fn txn_children(&self, txn: &mut Txn, pk: Key) -> Result<Vec<(Arc<Table>, usize, FkAction, Vec<Key>)>, Abort> {
+        let mut todo = vec![];
+        for c in self.children.read().unwrap().iter() {
+            let Some(ct) = c.table.upgrade() else { continue }; if ct.retired.load(Ordering::Relaxed) { continue; }
+            txn.scanned(&ct);
+            let keys = ct.txn_referencing(c.col, pk, txn);
+            if keys.is_empty() { continue; }
+            if c.on_delete == FkAction::Restrict { return Err(self.fk_blocked(&ct, c.col, keys.len(), pk)); }
+            todo.push((ct, c.col, c.on_delete.clone(), keys));
+        }
+        Ok(todo)
     }
     // ---- online ALTER TABLE: mirrored writes, background copy, swap ----
     fn shadow(&self) -> Option<Shadow> { self.shadow.read().unwrap().clone() }
@@ -953,6 +996,8 @@ impl Table {
         let stored: Option<Vec<u8>> = { let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride); let (v, _) = Self::hdr_at(d, off); if v == 0 || v >= seq || self.pk_of(&d[off + 16..off + self.stride]) != pk { None } else { let r = d[off + 16..off + self.stride].to_vec(); d[off..off + 16].copy_from_slice(&[0u8; 16]); Some(r) } };
         if let Some(r) = stored { self.unpublish(slot, &r); retire_replaced(&self.schema, &r, None); self.free_slot(slot); }
     }
+    /// Whether a delete here has `ON DELETE CASCADE` or `SET NULL` work to do in other tables.
+    pub fn cascades(&self) -> bool { self.children.read().unwrap().iter().any(|c| c.on_delete != FkAction::Restrict) }
     pub fn index_on(&self, col: usize) -> Option<Arc<SecIndex>> { self.indexes.read().unwrap().iter().find(|i| i.col == col).cloned() }
     /// Create a non-unique index on an INT, TIMESTAMP, UUID, TEXT or BYTES column: publish it first (writers maintain it from now on), then backfill.
     pub fn create_index(&self, name: &str, col: usize) -> Result<Arc<SecIndex>, String> {
@@ -1540,29 +1585,45 @@ impl Table {
         txn.reads.push((self.clone(), slot, v));
         Some(row)
     }
+    /// Delete inside a transaction. The row's children are settled first, as the transaction sees them: a RESTRICT
+    /// refusal leaves it as it was; CASCADE and SET NULL become its own writes, after the parent's (so a chain of
+    /// cascades that comes back to the parent finds it gone).
     pub fn txn_delete(self: &Arc<Self>, txn: &mut Txn, pk: impl Into<Key>) -> Result<(), Abort> {
         let pk: Key = pk.into();
+        let todo = if self.children.read().unwrap().is_empty() { vec![] } else { self.txn_children(txn, pk)? };
         if let Some(&i) = txn.by_key.get(&(self.id, pk)) {
             match &txn.writes[i] {
                 TxnWrite::Delete { .. } => return Err(Abort::NotFound),
-                TxnWrite::Insert { .. } => { txn.writes[i] = TxnWrite::Insert { table: self.clone(), row: vec![], slot: u32::MAX }; txn.by_key.remove(&(self.id, pk)); return Ok(()); } // tombstoned own insert (skipped at commit)
-                TxnWrite::Update { slot, base, .. } => { let (slot, base) = (*slot, *base); let old = self.with_slot(slot, |_, r| expand(&self.schema, r).into_owned()).ok_or(Abort::NotFound)?; txn.writes[i] = TxnWrite::Delete { table: self.clone(), slot, base, row: old }; return Ok(()); }
+                TxnWrite::Insert { .. } => { txn.writes[i] = TxnWrite::Insert { table: self.clone(), row: vec![], slot: u32::MAX }; txn.by_key.remove(&(self.id, pk)); } // tombstoned own insert (skipped at commit)
+                TxnWrite::Update { slot, base, .. } => { let (slot, base) = (*slot, *base); let old = self.with_slot(slot, |_, r| expand(&self.schema, r).into_owned()).ok_or(Abort::NotFound)?; txn.writes[i] = TxnWrite::Delete { table: self.clone(), slot, base, row: old }; }
+            }
+        } else {
+            let slot = match self.pk_slot(pk) { Some(s) => s, None => return Err(Abort::NotFound) };
+            let (ver, row) = self.with_slot(slot, |v, r| (v, expand(&self.schema, r).into_owned())).ok_or(Abort::NotFound)?;
+            if self.pk_of(&row) != pk { return Err(Abort::NotFound); }
+            txn.by_key.insert((self.id, pk), txn.writes.len());
+            txn.writes.push(TxnWrite::Delete { table: self.clone(), slot, base: ver, row });
+        }
+        for (ct, col, action, keys) in todo {
+            for k in keys {
+                let r = match action {
+                    FkAction::Cascade => ct.txn_delete(txn, k),
+                    FkAction::SetNull => { let sch = ct.schema.clone(); ct.txn_update(txn, k, |r| { let mut n = r.to_vec(); encode_col(&sch, &mut n, col, &Value::Null).map_err(Abort::Type)?; Ok(n) }) }
+                    FkAction::Restrict => Ok(()),
+                };
+                match r { Ok(()) | Err(Abort::NotFound) => {}, Err(e) => return Err(e) }
             }
         }
-        let slot = match self.pk_slot(pk) { Some(s) => s, None => return Err(Abort::NotFound) };
-        let (ver, row) = self.with_slot(slot, |v, r| (v, expand(&self.schema, r).into_owned())).ok_or(Abort::NotFound)?;
-        if self.pk_of(&row) != pk { return Err(Abort::NotFound); }
-        txn.by_key.insert((self.id, pk), txn.writes.len());
-        txn.writes.push(TxnWrite::Delete { table: self.clone(), slot, base: ver, row });
         Ok(())
     }
     pub fn txn_insert(self: &Arc<Self>, txn: &mut Txn, row: &[u8]) -> Result<(), Abort> {
         let pk = self.pk_of(row);
         if let Some(&i) = txn.by_key.get(&(self.id, pk)) {
-            if let TxnWrite::Delete { slot, base, row: old, .. } = &txn.writes[i] { let (slot, base, old_key) = (*slot, *base, self.unique_key(old).map(|k| k.to_vec())); txn.writes[i] = TxnWrite::Update { table: self.clone(), slot, base, row: expand(&self.schema, row).into_owned(), old_key }; return Ok(()); }
+            if let TxnWrite::Delete { slot, base, row: old, .. } = &txn.writes[i] { let (slot, base, old_key) = (*slot, *base, self.unique_key(old).map(|k| k.to_vec())); self.txn_fk_check(txn, row, None)?; txn.writes[i] = TxnWrite::Update { table: self.clone(), slot, base, row: expand(&self.schema, row).into_owned(), old_key }; return Ok(()); }
             return Err(Abort::Duplicate);
         }
         if self.pk_slot(pk).is_some() { return Err(Abort::Duplicate); }
+        self.txn_fk_check(txn, row, None)?;
         txn.by_key.insert((self.id, pk), txn.writes.len());
         txn.writes.push(TxnWrite::Insert { table: self.clone(), row: expand(&self.schema, row).into_owned(), slot: 0 });
         Ok(())
@@ -1573,6 +1634,7 @@ impl Table {
             if matches!(txn.writes[i], TxnWrite::Delete { .. }) { return Err(Abort::NotFound); }
             let new = f(txn.writes[i].row())?;
             if new.len() < self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+            self.txn_fk_check(txn, &new, Some(txn.writes[i].row()))?;
             let new = expand(&self.schema, &new).into_owned();
             match &mut txn.writes[i] { TxnWrite::Insert { row, .. } | TxnWrite::Update { row, .. } => *row = new, TxnWrite::Delete { .. } => unreachable!() }
             return Ok(());
@@ -1582,6 +1644,7 @@ impl Table {
         if self.pk_of(&row) != pk { return Err(Abort::NotFound); }
         let new = f(&row)?;
         if new.len() < self.schema.row_size || self.pk_of(&new) != pk { return Err(Abort::Type("row shape or primary key changed".into())); }
+        self.txn_fk_check(txn, &new, Some(&row))?;
         let new = expand(&self.schema, &new).into_owned();
         let old_key = self.unique_key(&row).map(|k| k.to_vec());
         txn.by_key.insert((self.id, pk), txn.writes.len());
@@ -1638,8 +1701,18 @@ impl Table {
         let new_key = self.unique_key(new);
         if new_key != old_key { if let Some(k) = new_key { self.uniq_remove(k, slot); } }
     }
-    fn claim_delete(&self, slot: u32, base: u64, mark: u64) -> Result<(), Abort> {
-        if !self.children.read().unwrap().is_empty() { let pk = self.with_slot(slot, |_, r| self.pk_of(r)).ok_or(Abort::NotFound)?; let todo = self.fk_children_check(pk)?; if !todo.is_empty() { return Err(Abort::Fk(format!("ON DELETE CASCADE / SET NULL from {} is only supported outside transactions (for now)", self.schema.name))); } }
+    fn claim_delete(&self, slot: u32, base: u64, mark: u64, txn: &Txn) -> Result<(), Abort> {
+        if !self.children.read().unwrap().is_empty() {
+            // the children as the transaction leaves them: one left is a row it never saw, committed since its delete
+            // ran (`txn_delete` dealt with every row it saw). RESTRICT reports it; a CASCADE or SET NULL it would have
+            // applied has the transaction run again and see it.
+            let pk = self.with_slot(slot, |_, r| self.pk_of(r)).ok_or(Abort::NotFound)?;
+            for c in self.children.read().unwrap().iter() {
+                let Some(ct) = c.table.upgrade() else { continue }; if ct.retired.load(Ordering::Relaxed) { continue; }
+                let n = ct.txn_referencing(c.col, pk, txn).len(); if n == 0 { continue; }
+                return Err(if c.on_delete == FkAction::Restrict { self.fk_blocked(&ct, c.col, n, pk) } else { Abort::Conflict });
+            }
+        }
         let (ck, off) = (slot as usize / CHUNK_ROWS, (slot as usize % CHUNK_ROWS) * self.stride);
         let mut c = self.chunks()[ck].write().unwrap(); let d = Self::alloc(&mut c, self.stride);
         let (v, p) = Self::hdr_at(d, off); if p != 0 || v != base { return Err(Abort::Conflict); }
@@ -1655,8 +1728,11 @@ impl Database {
     /// Commit: claim every write (undo all on failure), lock all touched chunks in a canonical order, validate reads,
     /// append ONE atomic log record, mark pending with the commit sequence, wait for durability, publish.
     pub fn commit(&self, mut txn: Txn) -> Result<u64, Abort> {
+        let before = txn.writes.len();
         txn.writes.retain(|w| !matches!(w, TxnWrite::Insert { slot: u32::MAX, .. }));
         if txn.writes.is_empty() { return Ok(0); }
+        // the claims below look rows up by key (`claim_delete`): the map follows the writes that moved
+        if txn.writes.len() != before { txn.by_key.clear(); for (i, w) in txn.writes.iter().enumerate() { txn.by_key.insert((w.table().id, w.table().pk_of(w.row())), i); } }
         let mark = TXN_MARK | txn.id;
         let mut claimed = 0; let mut err = None;
         // the rows whose UNIQUE value this transaction gives up, by table: deleted, or updated to another value
@@ -1664,11 +1740,11 @@ impl Database {
         for w in &txn.writes { match w { TxnWrite::Delete { table, slot, .. } => { freed.entry(table.id).or_default().insert(*slot); } TxnWrite::Update { table, slot, row, old_key, .. } if table.unique_key(row) != old_key.as_deref() => { freed.entry(table.id).or_default().insert(*slot); } _ => {} } }
         let none = HashSet::new();
         for i in 0..txn.writes.len() {
-            let r = match &mut txn.writes[i] {
+            let r = if let TxnWrite::Delete { table, slot, base, .. } = &txn.writes[i] { table.claim_delete(*slot, *base, mark, &txn) } else { match &mut txn.writes[i] {
                 TxnWrite::Insert { table, row, slot } => { let f = freed.get(&table.id).unwrap_or(&none); table.claim_insert(row, slot, mark, f) }
                 TxnWrite::Update { table, slot, base, row, old_key } => { let f = freed.get(&table.id).unwrap_or(&none); table.claim_update(*slot, *base, row, old_key.as_deref(), mark, f) }
-                TxnWrite::Delete { table, slot, base, .. } => table.claim_delete(*slot, *base, mark),
-            };
+                TxnWrite::Delete { .. } => unreachable!(),
+            } };
             if let Err(e) = r { err = Some(e); break; }
             claimed += 1;
         }

@@ -1,6 +1,6 @@
 {
   "name": "@sqzdb/client",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "The browser client for a sqzdb app API: sign in, run SQL as the signed-in user, keep live queries current, call the app's functions",
   "type": "module",
   "main": "index.js",
